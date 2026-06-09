@@ -57,8 +57,14 @@ impl App {
                 .collect();
             // Pick the best fitting variant; when nothing fits at all, fall
             // back to the smallest variant so --all can still show the model.
+            // Pointer identity, not quant-label equality: two variants can
+            // share the same quant string, and `bv` borrows from `mvs`.
             let picked = best_variant(&mvs, &self.budget)
-                .map(|bv| mvs.iter().position(|v| v.quant == bv.quant).unwrap())
+                .map(|bv| {
+                    mvs.iter()
+                        .position(|v| std::ptr::eq(v, bv))
+                        .expect("best_variant borrows from mvs")
+                })
                 .or_else(|| {
                     if include_unfit {
                         mvs.iter()
@@ -89,12 +95,8 @@ impl App {
                 score,
             });
         }
-        rows.sort_by(|a, b| {
-            b.score
-                .total
-                .partial_cmp(&a.score.total)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // total_cmp: deterministic descending order even if a score is NaN.
+        rows.sort_by(|a, b| b.score.total.total_cmp(&a.score.total));
         Ok(rows)
     }
 }

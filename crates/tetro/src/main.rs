@@ -123,14 +123,17 @@ fn run_model(app: &App, query: &str, json: bool) -> Result<()> {
         bail!(
             "no quantization of `{}` fits this machine ({} RAM); try a smaller model from `tetro fit`",
             model.name,
-            output::gb(app.budget.ram_total_bytes)
+            output::gib(app.budget.ram_total_bytes)
         );
     };
-    let variant = model
-        .variants
+    // Pointer identity, not quant-label equality: two variants can share the
+    // same quant string, and `best` borrows from `mvs` (same order as
+    // `model.variants`).
+    let best_idx = mvs
         .iter()
-        .find(|v| v.quant == best.quant)
-        .expect("best_variant returns a quant present in the input");
+        .position(|v| std::ptr::eq(v, best))
+        .expect("best_variant borrows from mvs");
+    let variant = &model.variants[best_idx];
 
     // API delta vs the original plan: plan_run is fallible (repo-less HF/MLX
     // models, non-GGUF quants). Surface the actionable error and exit non-zero.
@@ -150,14 +153,23 @@ fn run_model(app: &App, query: &str, json: bool) -> Result<()> {
 }
 
 fn confirm_and_install(install: &InstallPlan) -> Result<()> {
+    use std::io::IsTerminal;
+
     let cmd = install
         .argv
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join(" ");
-    print!("required runtime is not installed. install with `{cmd}`? [y/N] ");
-    std::io::stdout().flush()?;
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "required runtime is not installed and stdin is not a terminal — \
+             re-run interactively to confirm install (`{cmd}`)."
+        );
+        std::process::exit(1);
+    }
+    eprint!("required runtime is not installed. install with `{cmd}`? [y/N] ");
+    std::io::stderr().flush()?;
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
     let answer = answer.trim().to_ascii_lowercase();
@@ -205,12 +217,16 @@ enum Lookup<'a> {
     NotFound,
 }
 
-/// Exact name match first, then case-insensitive contains.
+/// Exact name match first, then case-insensitive exact, then
+/// case-insensitive contains.
 fn find_model<'a>(models: &'a [CatalogModel], query: &str) -> Lookup<'a> {
     if let Some(m) = models.iter().find(|m| m.name == query) {
         return Lookup::Found(m);
     }
     let q = query.to_lowercase();
+    if let Some(m) = models.iter().find(|m| m.name.to_lowercase() == q) {
+        return Lookup::Found(m);
+    }
     let matches: Vec<&CatalogModel> = models
         .iter()
         .filter(|m| m.name.to_lowercase().contains(&q))
@@ -230,4 +246,73 @@ pub(crate) fn exec(argv: &[String]) -> Result<()> {
         "failed to launch {}: {err}. Is it in PATH?",
         argv[0]
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(name: &str) -> CatalogModel {
+        CatalogModel {
+            id: 0,
+            name: name.to_string(),
+            family: None,
+            source: tetro_core::catalog::Source::HuggingFace,
+            repo: None,
+            params_total: 8_000_000_000,
+            params_active: 8_000_000_000,
+            architecture: None,
+            context_max: 8192,
+            variants: vec![],
+        }
+    }
+
+    #[test]
+    fn exact_match_wins_over_contains() {
+        let models = vec![model("Llama3"), model("Llama3-70B")];
+        match find_model(&models, "Llama3") {
+            Lookup::Found(m) => assert_eq!(m.name, "Llama3"),
+            _ => panic!("expected exact match"),
+        }
+    }
+
+    #[test]
+    fn case_insensitive_exact_match_beats_ambiguous_contains() {
+        let models = vec![model("Llama3"), model("Llama3-70B")];
+        match find_model(&models, "llama3") {
+            Lookup::Found(m) => assert_eq!(m.name, "Llama3"),
+            other => panic!(
+                "expected case-insensitive exact match, got {}",
+                match other {
+                    Lookup::Ambiguous(_) => "Ambiguous",
+                    Lookup::NotFound => "NotFound",
+                    Lookup::Found(_) => unreachable!(),
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn contains_still_resolves_unique_substring() {
+        let models = vec![model("Llama3-70B"), model("Qwen2.5-Coder")];
+        match find_model(&models, "qwen") {
+            Lookup::Found(m) => assert_eq!(m.name, "Qwen2.5-Coder"),
+            _ => panic!("expected contains match"),
+        }
+    }
+
+    #[test]
+    fn ambiguous_when_no_exact_and_multiple_contains() {
+        let models = vec![model("Llama3-8B"), model("Llama3-70B")];
+        match find_model(&models, "llama3") {
+            Lookup::Ambiguous(names) => assert_eq!(names.len(), 2),
+            _ => panic!("expected ambiguous"),
+        }
+    }
+
+    #[test]
+    fn not_found_when_nothing_matches() {
+        let models = vec![model("Llama3")];
+        assert!(matches!(find_model(&models, "mistral"), Lookup::NotFound));
+    }
 }

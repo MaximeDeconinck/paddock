@@ -5,8 +5,9 @@ use tetro_core::hardware::HardwareProfile;
 
 use crate::app::ScoredModel;
 
-pub fn gb(bytes: u64) -> String {
-    format!("{:.1} GB", bytes as f64 / 1e9)
+/// Binary gibibytes, matching what macOS reports for RAM sizes.
+pub fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
 pub fn verdict_label(v: FitVerdict) -> &'static str {
@@ -20,7 +21,7 @@ pub fn verdict_label(v: FitVerdict) -> &'static str {
 
 pub fn print_profile(p: &HardwareProfile) {
     println!("chip        {}", p.chip_name);
-    println!("ram         {}", gb(p.ram_total_bytes));
+    println!("ram         {}", gib(p.ram_total_bytes));
     println!("cores       {}P + {}E", p.perf_cores, p.efficiency_cores);
     println!(
         "bandwidth   {:.0} GB/s{}",
@@ -32,10 +33,13 @@ pub fn print_profile(p: &HardwareProfile) {
         }
     );
     match p.gpu.metal_limit_bytes {
-        Some(b) => println!("gpu limit   {} (Metal recommendedMaxWorkingSetSize)", gb(b)),
+        Some(b) => println!(
+            "gpu limit   {} (Metal recommendedMaxWorkingSetSize)",
+            gib(b)
+        ),
         None => println!(
             "gpu limit   {} (fallback: 75% of RAM)",
-            gb(p.gpu.effective_limit_bytes)
+            gib(p.gpu.effective_limit_bytes)
         ),
     }
     let rt = |s: &tetro_core::hardware::RuntimeStatus, name: &str| {
@@ -65,7 +69,7 @@ pub fn print_fit_table(rows: &[ScoredModel]) {
             "{:<32} {:<9} {:>9} {:>9.0}  {:<12} {:>5.0}",
             truncate(&r.model.name, 32),
             v.quant,
-            gb(r.memory.total_bytes),
+            gib(r.memory.total_bytes),
             r.speed.generation_tps,
             verdict_label(r.memory.verdict),
             r.score.total
@@ -98,12 +102,13 @@ pub fn print_fit_json(rows: &[ScoredModel]) -> anyhow::Result<()> {
 }
 
 /// The part after the colon in a recommendation line, e.g.
-/// "fits GPU with 14.2 GB to spare, ~34 tok/s (instant), 128k context".
+/// "fits GPU with 14.2 GiB to spare, ~34 tok/s (instant), 128k context".
 pub fn justification(r: &ScoredModel) -> String {
     let fit = match r.memory.verdict {
         FitVerdict::FitsGpu => format!(
             "fits GPU with {} to spare",
-            gb(r.memory
+            gib(r
+                .memory
                 .gpu_limit_bytes
                 .saturating_sub(r.memory.total_bytes))
         ),
@@ -166,7 +171,7 @@ fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
     } else {
-        let cut: String = s.chars().take(n - 1).collect();
+        let cut: String = s.chars().take(n.saturating_sub(1)).collect();
         format!("{cut}…")
     }
 }
