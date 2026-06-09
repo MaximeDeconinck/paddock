@@ -37,11 +37,15 @@ pub fn scan(probe: &dyn SystemProbe) -> HardwareProfile {
         .unwrap_or_else(|| "unknown".to_string());
     let (family, variant) = chip::parse_brand_string(&chip_name);
     let ram_total_bytes = probe.sysctl_u64("hw.memsize").unwrap_or(0);
+    // macOS renamed OID: current is `hw.perflevelN.physicalcpu`,
+    // older releases used `hw.perflevelN.physicalcpucount`. Try new, fall back.
     let perf_cores = probe
-        .sysctl_u64("hw.perflevel0.physicalcpucount")
+        .sysctl_u64("hw.perflevel0.physicalcpu")
+        .or_else(|| probe.sysctl_u64("hw.perflevel0.physicalcpucount"))
         .unwrap_or(0) as u32;
     let efficiency_cores = probe
-        .sysctl_u64("hw.perflevel1.physicalcpucount")
+        .sysctl_u64("hw.perflevel1.physicalcpu")
+        .or_else(|| probe.sysctl_u64("hw.perflevel1.physicalcpucount"))
         .unwrap_or(0) as u32;
     let (bandwidth_gbps, bandwidth_estimated) = chip::bandwidth_gbps(family, variant, perf_cores);
 
@@ -82,8 +86,8 @@ mod tests {
         p.strings
             .insert("machdep.cpu.brand_string".into(), "Apple M2 Max".into());
         p.u64s.insert("hw.memsize".into(), 36u64 * (1 << 30));
-        p.u64s.insert("hw.perflevel0.physicalcpucount".into(), 8);
-        p.u64s.insert("hw.perflevel1.physicalcpucount".into(), 4);
+        p.u64s.insert("hw.perflevel0.physicalcpu".into(), 8);
+        p.u64s.insert("hw.perflevel1.physicalcpu".into(), 4);
         p.gpu_working_set = Some(27u64 * (1 << 30));
         p
     }
