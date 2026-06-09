@@ -1640,6 +1640,7 @@ dependencies = [
  "crossterm",
  "predicates",
  "ratatui",
+ "serde",
  "serde_json",
  "tempfile",
  "tetro-core",
