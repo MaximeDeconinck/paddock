@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 use tetro_core::estimate::FitVerdict;
 use tetro_core::hardware::{HardwareProfile, RuntimeStatus};
-use tetro_core::runtime::plan_run;
+use tetro_core::runtime::RunPlan;
 
 use crate::app::ScoredModel;
 use crate::output::{gib, verdict_label};
@@ -161,20 +161,21 @@ fn draw_detail(frame: &mut Frame, state: &TuiState) {
     let Some(r) = state.rows.get(state.selected) else {
         return;
     };
-    let area = centered(frame.area(), 70, 70);
+    let lines = detail_lines(r, state.detail_plan.as_ref());
+    // +2 for the borders: the popup grows to fit its content (clipped only
+    // when the terminal itself is too small).
+    let content_height = (lines.len() as u16).saturating_add(2);
+    let area = centered(frame.area(), 70, content_height);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
         .border_style(Style::new().fg(Color::DarkGray))
         .title(Span::styled(" detail ", Style::new().fg(ACCENT)));
-    frame.render_widget(
-        Paragraph::new(detail_lines(r, &state.runtimes)).block(block),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn detail_lines<'a>(
     r: &'a ScoredModel,
-    runtimes: &tetro_core::hardware::RuntimesStatus,
+    plan: Option<&'a Result<RunPlan, String>>,
 ) -> Vec<Line<'a>> {
     let v = &r.model.variants[r.variant_idx];
     let section = |s: &'a str| {
@@ -244,17 +245,18 @@ fn detail_lines<'a>(
         Line::default(),
         section("run"),
     ];
-    match plan_run(&r.model, v, runtimes) {
-        Ok(plan) => lines.push(Line::from(vec![
+    match plan {
+        Some(Ok(plan)) => lines.push(Line::from(vec![
             Span::styled("  $ ", Style::new().fg(Color::DarkGray)),
             Span::styled(plan.display(), Style::new().fg(ACCENT)),
         ])),
-        Err(e) => lines.push(Line::from(Span::styled(
+        Some(Err(e)) => lines.push(Line::from(Span::styled(
             format!("  {e}"),
             Style::new()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
         ))),
+        None => {}
     }
     if r.memory.verdict == FitVerdict::FitsWithSysctlTuning {
         let mb = r.memory.total_bytes / (1024 * 1024) + 1024;
@@ -265,19 +267,16 @@ fn detail_lines<'a>(
     lines
 }
 
-/// Centered popup occupying `pw`% × `ph`% of `area`.
-fn centered(area: Rect, pw: u16, ph: u16) -> Rect {
-    let [_, mid, _] = Layout::vertical([
-        Constraint::Percentage((100 - ph) / 2),
-        Constraint::Percentage(ph),
-        Constraint::Percentage((100 - ph) / 2),
-    ])
-    .areas(area);
-    let [_, mid, _] = Layout::horizontal([
-        Constraint::Percentage((100 - pw) / 2),
-        Constraint::Percentage(pw),
-        Constraint::Percentage((100 - pw) / 2),
-    ])
-    .areas(mid);
-    mid
+/// Centered popup: `pw`% of the width (min 40 cols) × exactly `height` rows,
+/// both clamped to `area` so small terminals clip instead of panicking.
+fn centered(area: Rect, pw: u16, height: u16) -> Rect {
+    let width = (u32::from(area.width) * u32::from(pw) / 100) as u16;
+    let width = width.max(40).min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
 }

@@ -1,6 +1,6 @@
 //! Pure TUI state machine — no terminal IO, fully unit-testable.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tetro_core::hardware::RuntimesStatus;
 use tetro_core::runtime::{plan_run, RunPlan};
 use tetro_core::score::UseCase;
@@ -38,6 +38,9 @@ pub struct TuiState {
     pub runtimes: RuntimesStatus,
     /// Last plan_run failure, surfaced in the footer instead of crashing.
     pub last_error: Option<String>,
+    /// Run plan for the selected row, computed once on Detail entry so the
+    /// render path never calls plan_run. Cleared when Detail closes.
+    pub detail_plan: Option<Result<RunPlan, String>>,
 }
 
 impl TuiState {
@@ -51,20 +54,28 @@ impl TuiState {
             query: String::new(),
             runtimes,
             last_error: None,
+            detail_plan: None,
         }
     }
 
-    /// Replace rows after a re-score (use-case switch); keeps the active filter.
+    /// Replace rows after a re-score (use-case switch); keeps the active
+    /// filter and the cursor position (clamped to the new row count).
     pub fn set_rows(&mut self, rows: Vec<ScoredModel>, use_case: UseCase) {
         self.all_rows = rows;
         self.use_case = use_case;
         let q = self.query.clone();
+        let cursor = self.selected;
         self.apply_search(&q);
+        self.selected = cursor.min(self.rows.len().saturating_sub(1));
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         use KeyCode as K;
         self.last_error = None;
+        // Ctrl-C quits from any mode — never swallowed by search input.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == K::Char('c') {
+            return Action::Quit;
+        }
         match &mut self.mode {
             Mode::Search { query } => match key.code {
                 K::Esc => {
@@ -81,7 +92,12 @@ impl TuiState {
                     let q = query.clone();
                     self.apply_search(&q);
                 }
-                K::Char(c) => {
+                // Modified chars (ctrl/alt chords) are commands, not input.
+                K::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     query.push(c);
                     let q = query.clone();
                     self.apply_search(&q);
@@ -89,7 +105,10 @@ impl TuiState {
                 _ => {}
             },
             Mode::Detail => match key.code {
-                K::Esc | K::Char('q') | K::Enter => self.mode = Mode::List,
+                K::Esc | K::Char('q') | K::Enter => {
+                    self.mode = Mode::List;
+                    self.detail_plan = None;
+                }
                 K::Char('x') => return self.run_selected(),
                 _ => {}
             },
@@ -101,6 +120,7 @@ impl TuiState {
                 }
                 K::Enter => {
                     if !self.rows.is_empty() {
+                        self.detail_plan = self.plan_for_selected();
                         self.mode = Mode::Detail;
                     }
                 }
@@ -141,19 +161,24 @@ impl TuiState {
         Action::Rescore(uc)
     }
 
+    /// Single source for run-plan computation (Detail entry and `x` both use
+    /// it), so the render path never calls plan_run.
+    fn plan_for_selected(&self) -> Option<Result<RunPlan, String>> {
+        let row = self.rows.get(self.selected)?;
+        let variant = &row.model.variants[row.variant_idx];
+        Some(plan_run(&row.model, variant, &self.runtimes).map_err(|e| e.to_string()))
+    }
+
     /// Build the run plan for the selected row. A plan_run failure must not
     /// crash the TUI: it is stored and rendered in the footer.
     fn run_selected(&mut self) -> Action {
-        let Some(row) = self.rows.get(self.selected) else {
-            return Action::None;
-        };
-        let variant = &row.model.variants[row.variant_idx];
-        match plan_run(&row.model, variant, &self.runtimes) {
-            Ok(plan) => Action::Run(plan),
-            Err(e) => {
-                self.last_error = Some(e.to_string());
+        match self.plan_for_selected() {
+            Some(Ok(plan)) => Action::Run(plan),
+            Some(Err(e)) => {
+                self.last_error = Some(e);
                 Action::None
             }
+            None => Action::None,
         }
     }
 }
@@ -283,6 +308,69 @@ mod tests {
             }
             other => panic!("expected Action::Run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_all_modes() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        // List
+        let mut s = state();
+        assert!(matches!(s.handle_key(ctrl_c), Action::Quit));
+        // Detail
+        let mut s = state();
+        s.handle_key(key(KeyCode::Enter));
+        assert_eq!(s.mode, Mode::Detail);
+        assert!(matches!(s.handle_key(ctrl_c), Action::Quit));
+        // Search — and the 'c' must not land in the query
+        let mut s = state();
+        s.handle_key(key(KeyCode::Char('/')));
+        assert!(matches!(s.handle_key(ctrl_c), Action::Quit));
+        assert!(matches!(&s.mode, Mode::Search { query } if query.is_empty()));
+    }
+
+    #[test]
+    fn search_ignores_modified_chars() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Char('/')));
+        s.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT));
+        assert!(matches!(&s.mode, Mode::Search { query } if query.is_empty()));
+        assert_eq!(s.rows.len(), 3);
+    }
+
+    #[test]
+    fn detail_entry_computes_plan_and_exit_clears_it() {
+        let mut s = state();
+        assert!(s.detail_plan.is_none());
+        s.handle_key(key(KeyCode::Enter));
+        assert_eq!(s.mode, Mode::Detail);
+        match &s.detail_plan {
+            Some(Ok(plan)) => assert_eq!(plan.argv[0], "ollama"),
+            other => panic!("expected Some(Ok(plan)), got {other:?}"),
+        }
+        s.handle_key(key(KeyCode::Esc));
+        assert_eq!(s.mode, Mode::List);
+        assert!(s.detail_plan.is_none());
+    }
+
+    #[test]
+    fn rescore_preserves_cursor_clamped() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Char('j')));
+        s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(s.selected, 2);
+        // Same query, new rows: cursor kept.
+        s.set_rows(
+            vec![
+                fake_row("Llama3-8B"),
+                fake_row("Qwen2.5-Coder"),
+                fake_row("Mistral-7B"),
+            ],
+            UseCase::Coding,
+        );
+        assert_eq!(s.selected, 2);
+        // Fewer rows: cursor clamped to the last one.
+        s.set_rows(vec![fake_row("Llama3-8B")], UseCase::Chat);
+        assert_eq!(s.selected, 0);
     }
 
     #[test]
