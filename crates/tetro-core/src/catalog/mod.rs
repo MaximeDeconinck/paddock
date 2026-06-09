@@ -97,3 +97,124 @@ pub fn quant_from_filename(name: &str) -> Option<String> {
         .find(|q| upper.contains(*q))
         .map(|q| q.to_string())
 }
+
+/// Options for `sync`. Limits keep first sync fast; raise via CLI later if wanted.
+pub struct SyncOptions {
+    pub hf_limit: usize,
+    pub mlx_limit: usize,
+}
+
+impl Default for SyncOptions {
+    fn default() -> Self {
+        Self {
+            hf_limit: 30,
+            mlx_limit: 30,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct SyncReport {
+    pub curated: usize,
+    pub huggingface: usize,
+    pub mlx: usize,
+    pub errors: Vec<String>,
+}
+
+/// Idempotent catalog sync: curated list always, network sources best-effort.
+pub async fn sync(
+    http: &dyn hf::HttpClient,
+    db: &db::Db,
+    opts: &SyncOptions,
+) -> Result<SyncReport, crate::TetroError> {
+    let mut report = SyncReport::default();
+    for m in curated::curated_ollama_models() {
+        db.upsert_model(&m)?;
+        report.curated += 1;
+    }
+    match hf::fetch_hf_gguf(http, opts.hf_limit).await {
+        Ok(models) => {
+            for m in models {
+                db.upsert_model(&m)?;
+                report.huggingface += 1;
+            }
+        }
+        Err(e) => report.errors.push(format!("huggingface: {e}")),
+    }
+    match hf::fetch_mlx(http, opts.mlx_limit).await {
+        Ok(models) => {
+            for m in models {
+                db.upsert_model(&m)?;
+                report.mlx += 1;
+            }
+        }
+        Err(e) => report.errors.push(format!("mlx: {e}")),
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    db.set_last_sync(now)?;
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use serde_json::Value;
+
+    use super::*;
+    use crate::TetroError;
+
+    /// MockHttp that always fails.
+    struct FailingHttp;
+
+    #[async_trait]
+    impl hf::HttpClient for FailingHttp {
+        async fn get_json(&self, url: &str) -> Result<Value, TetroError> {
+            Err(TetroError::Network(format!("mock failure: {url}")))
+        }
+
+        async fn get_range(
+            &self,
+            url: &str,
+            _start: u64,
+            _end: u64,
+        ) -> Result<Vec<u8>, TetroError> {
+            Err(TetroError::Network(format!("mock failure: {url}")))
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_failing_http_still_persists_curated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::Db::open(dir.path().join("catalog.db")).unwrap();
+        let http = FailingHttp;
+
+        let report = sync(&http, &db, &SyncOptions::default()).await.unwrap();
+
+        // Curated always inserted regardless of network
+        assert!(
+            report.curated >= 35,
+            "expected >= 35 curated, got {}",
+            report.curated
+        );
+        // Network sources failed
+        assert_eq!(
+            report.errors.len(),
+            2,
+            "expected 2 network errors, got {:?}",
+            report.errors
+        );
+        assert!(report.errors[0].contains("huggingface"));
+        assert!(report.errors[1].contains("mlx"));
+        // last_sync set even on network failure
+        let ts = db.last_sync().unwrap();
+        assert!(ts.is_some(), "last_sync should be set");
+        assert!(ts.unwrap() > 0);
+
+        // Curated models actually in DB
+        let models = db.list_models().unwrap();
+        assert!(models.len() >= 35, "expected >= 35 models in DB");
+    }
+}
