@@ -28,6 +28,7 @@ pub struct ModelVariant {
     pub model_name: String,
     pub quant: String,
     /// Effective bits per weight (K-quants carry metadata overhead).
+    /// Must be finite and > 0; out-of-domain values degrade to zero-weight/zero-speed estimates rather than panicking.
     pub bpw: f64,
     pub params_total: u64,
     /// == params_total for dense models; active params for MoE.
@@ -76,6 +77,9 @@ pub enum SpeedTier {
 }
 
 impl SpeedTier {
+    /// Classify tps into a tier.
+    /// Boundary semantics: exactly 30.0 → Smooth, exactly 15.0 → Smooth, exactly 5.0 → Usable.
+    /// Matches spec: >30 instant, 15–30 smooth, 5–15 usable, <5 slow.
     pub fn from_tps(tps: f64) -> Self {
         if tps > 30.0 {
             Self::Instant
@@ -111,12 +115,23 @@ pub fn estimate_memory(
     context_len: u32,
     budget: &MemoryBudget,
 ) -> MemoryEstimate {
-    let weights_bytes = (v.params_total as f64 * v.bpw / 8.0) as u64;
-    let kv_cache_bytes =
-        2 * v.layers as u64 * v.kv_heads as u64 * v.head_dim as u64 * context_len as u64 * 2;
+    let bpw = if v.bpw.is_finite() && v.bpw > 0.0 {
+        v.bpw
+    } else {
+        0.0
+    };
+    let weights_bytes = (v.params_total as f64 * bpw / 8.0) as u64;
+    let kv_cache_bytes = 2u64
+        .saturating_mul(v.layers as u64)
+        .saturating_mul(v.kv_heads as u64)
+        .saturating_mul(v.head_dim as u64)
+        .saturating_mul(context_len as u64)
+        .saturating_mul(2);
     let overhead_bytes =
         OVERHEAD_BASE_BYTES + (weights_bytes as f64 * OVERHEAD_WEIGHTS_FRACTION) as u64;
-    let total_bytes = weights_bytes + kv_cache_bytes + overhead_bytes;
+    let total_bytes = weights_bytes
+        .saturating_add(kv_cache_bytes)
+        .saturating_add(overhead_bytes);
 
     let tunable_max = budget
         .ram_total_bytes
@@ -141,10 +156,22 @@ pub fn estimate_memory(
     }
 }
 
+/// Estimate generation speed given memory bandwidth.
+/// `bandwidth_gbps`: must be finite and ≥ 0; non-finite/negative values are treated as 0.0.
 pub fn estimate_speed(v: &ModelVariant, bandwidth_gbps: f64) -> SpeedEstimate {
-    let bytes_per_token = v.params_active as f64 * v.bpw / 8.0;
+    let bpw = if v.bpw.is_finite() && v.bpw > 0.0 {
+        v.bpw
+    } else {
+        0.0
+    };
+    let safe_bw = if bandwidth_gbps.is_finite() && bandwidth_gbps >= 0.0 {
+        bandwidth_gbps
+    } else {
+        0.0
+    };
+    let bytes_per_token = v.params_active as f64 * bpw / 8.0;
     let generation_tps = if bytes_per_token > 0.0 {
-        bandwidth_gbps * 1e9 / bytes_per_token * SPEED_EFFICIENCY
+        safe_bw * 1e9 / bytes_per_token * SPEED_EFFICIENCY
     } else {
         0.0
     };
@@ -290,5 +317,29 @@ mod tests {
         assert_eq!(SpeedTier::from_tps(20.0), SpeedTier::Smooth);
         assert_eq!(SpeedTier::from_tps(8.0), SpeedTier::Usable);
         assert_eq!(SpeedTier::from_tps(2.0), SpeedTier::Slow);
+    }
+
+    #[test]
+    fn hostile_inputs_degrade_gracefully() {
+        let mut bad = llama31_8b_q4km();
+        bad.bpw = f64::NAN;
+        let m = estimate_memory(&bad, 8192, &m2_max_36gb());
+        assert_eq!(m.weights_bytes, 0);
+        let s = estimate_speed(&bad, 400.0);
+        assert_eq!(s.generation_tps, 0.0);
+        assert_eq!(s.tier, SpeedTier::Slow);
+        let s2 = estimate_speed(&llama31_8b_q4km(), f64::NAN);
+        assert!(s2.generation_tps == 0.0);
+    }
+
+    #[test]
+    fn kv_cache_saturates_instead_of_wrapping() {
+        let mut huge = llama31_8b_q4km();
+        huge.layers = u32::MAX;
+        huge.kv_heads = u32::MAX;
+        huge.head_dim = u32::MAX;
+        let m = estimate_memory(&huge, u32::MAX, &m2_max_36gb());
+        assert_eq!(m.kv_cache_bytes, u64::MAX);
+        assert_eq!(m.verdict, FitVerdict::DoesNotFit);
     }
 }
