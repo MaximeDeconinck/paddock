@@ -78,13 +78,110 @@ fn scalar_size(ty: u32) -> Result<usize, TetroError> {
     }
 }
 
+/// Decode a scalar value as a non-negative integer per its GGUF type.
+/// Returns None when the value cannot represent a tracked count (negative
+/// signed integer, non-finite or non-integer float).
+fn decode_scalar_u64(ty: u32, raw: &[u8]) -> Option<u64> {
+    fn float_to_u64(v: f64) -> Option<u64> {
+        (v.is_finite() && v >= 0.0 && v.fract() == 0.0 && v <= u64::MAX as f64).then_some(v as u64)
+    }
+    fn signed_to_u64(v: i64) -> Option<u64> {
+        u64::try_from(v).ok()
+    }
+    match ty {
+        0 => Some(raw[0] as u64),                                            // u8
+        1 => signed_to_u64(raw[0] as i8 as i64),                             // i8
+        2 => Some(u16::from_le_bytes(raw.try_into().ok()?) as u64),          // u16
+        3 => signed_to_u64(i16::from_le_bytes(raw.try_into().ok()?) as i64), // i16
+        4 => Some(u32::from_le_bytes(raw.try_into().ok()?) as u64),          // u32
+        5 => signed_to_u64(i32::from_le_bytes(raw.try_into().ok()?) as i64), // i32
+        6 => float_to_u64(f32::from_le_bytes(raw.try_into().ok()?) as f64),  // f32
+        7 => Some((raw[0] != 0) as u64),                                     // bool
+        10 => Some(u64::from_le_bytes(raw.try_into().ok()?)),                // u64
+        11 => signed_to_u64(i64::from_le_bytes(raw.try_into().ok()?)),       // i64
+        12 => float_to_u64(f64::from_le_bytes(raw.try_into().ok()?)),        // f64
+        _ => None,
+    }
+}
+
+fn all_tracked_filled(m: &GgufMeta) -> bool {
+    m.architecture.is_some()
+        && m.name.is_some()
+        && m.block_count.is_some()
+        && m.head_count.is_some()
+        && m.head_count_kv.is_some()
+        && m.embedding_length.is_some()
+        && m.context_length.is_some()
+}
+
+/// Parse one key/value pair, updating `meta` for tracked keys.
+fn parse_kv(r: &mut Reader, meta: &mut GgufMeta) -> Result<(), TetroError> {
+    let key = r.string()?;
+    let ty = r.u32()?;
+    let value_u64: Option<u64>;
+    let value_str: Option<String>;
+    match ty {
+        8 => {
+            value_str = Some(r.string()?);
+            value_u64 = None;
+        }
+        9 => {
+            let elem_ty = r.u32()?;
+            let len = r.u64()?;
+            if len > MAX_ARRAY_LEN {
+                return Err(err("array length out of bounds"));
+            }
+            if elem_ty == 8 {
+                for _ in 0..len {
+                    r.string()?;
+                }
+            } else {
+                let sz = scalar_size(elem_ty)?;
+                r.take(
+                    (len as usize)
+                        .checked_mul(sz)
+                        .ok_or_else(|| err("array size overflow"))?,
+                )?;
+            }
+            value_str = None;
+            value_u64 = None;
+        }
+        _ => {
+            let sz = scalar_size(ty)?;
+            let raw = r.take(sz)?;
+            value_u64 = decode_scalar_u64(ty, raw);
+            value_str = None;
+        }
+    }
+
+    if key == "general.architecture" {
+        meta.architecture = value_str.clone();
+    } else if key == "general.name" {
+        meta.name = value_str.clone();
+    } else if key.ends_with(".block_count") {
+        meta.block_count = value_u64;
+    } else if key.ends_with(".attention.head_count") {
+        meta.head_count = value_u64;
+    } else if key.ends_with(".attention.head_count_kv") {
+        meta.head_count_kv = value_u64;
+    } else if key.ends_with(".embedding_length") {
+        meta.embedding_length = value_u64;
+    } else if key.ends_with(".context_length") {
+        meta.context_length = value_u64;
+    }
+    let _ = value_str; // keys we don't track are simply skipped
+    Ok(())
+}
+
 pub fn parse_gguf_header(bytes: &[u8]) -> Result<GgufMeta, TetroError> {
     let mut r = Reader { buf: bytes, pos: 0 };
     if r.take(4)? != b"GGUF" {
         return Err(err("bad magic, not a GGUF file"));
     }
     let version = r.u32()?;
-    if !(1..=3).contains(&version) {
+    // v1 uses u32 counts/string lengths; parsing it with the v2/v3 layout
+    // would silently misparse, so it is rejected outright.
+    if !(2..=3).contains(&version) {
         return Err(err("unsupported GGUF version"));
     }
     let _tensor_count = r.u64()?;
@@ -95,62 +192,19 @@ pub fn parse_gguf_header(bytes: &[u8]) -> Result<GgufMeta, TetroError> {
 
     let mut meta = GgufMeta::default();
     for _ in 0..kv_count {
-        let key = r.string()?;
-        let ty = r.u32()?;
-        let value_u64: Option<u64>;
-        let value_str: Option<String>;
-        match ty {
-            8 => {
-                value_str = Some(r.string()?);
-                value_u64 = None;
+        if let Err(e) = parse_kv(&mut r, &mut meta) {
+            // HTTP probes only fetch the first ~2 MiB: real headers place
+            // huge tokenizer arrays after the arch keys, so a truncation
+            // after useful keys were parsed still yields usable metadata.
+            let truncated = matches!(&e, TetroError::Gguf(m) if m == "truncated header");
+            if truncated && (meta.architecture.is_some() || meta.block_count.is_some()) {
+                return Ok(meta);
             }
-            9 => {
-                let elem_ty = r.u32()?;
-                let len = r.u64()?;
-                if len > MAX_ARRAY_LEN {
-                    return Err(err("array length out of bounds"));
-                }
-                if elem_ty == 8 {
-                    for _ in 0..len {
-                        r.string()?;
-                    }
-                } else {
-                    let sz = scalar_size(elem_ty)?;
-                    r.take(
-                        (len as usize)
-                            .checked_mul(sz)
-                            .ok_or_else(|| err("array size overflow"))?,
-                    )?;
-                }
-                value_str = None;
-                value_u64 = None;
-            }
-            _ => {
-                let sz = scalar_size(ty)?;
-                let raw = r.take(sz)?;
-                let mut padded = [0u8; 8];
-                padded[..sz].copy_from_slice(raw);
-                value_u64 = Some(u64::from_le_bytes(padded));
-                value_str = None;
-            }
+            return Err(e);
         }
-
-        if key == "general.architecture" {
-            meta.architecture = value_str.clone();
-        } else if key == "general.name" {
-            meta.name = value_str.clone();
-        } else if key.ends_with(".block_count") {
-            meta.block_count = value_u64;
-        } else if key.ends_with(".attention.head_count") {
-            meta.head_count = value_u64;
-        } else if key.ends_with(".attention.head_count_kv") {
-            meta.head_count_kv = value_u64;
-        } else if key.ends_with(".embedding_length") {
-            meta.embedding_length = value_u64;
-        } else if key.ends_with(".context_length") {
-            meta.context_length = value_u64;
+        if all_tracked_filled(&meta) {
+            return Ok(meta); // no need to scan the (often huge) remainder
         }
-        let _ = value_str; // keys we don't track are simply skipped
     }
     Ok(meta)
 }
@@ -198,6 +252,14 @@ pub(crate) mod tests {
         pub(crate) fn f32(mut self, key: &str, val: f32) -> Self {
             self.push_key(key);
             self.kvs.extend(6u32.to_le_bytes()); // type 6 = f32
+            self.kvs.extend(val.to_le_bytes());
+            self.count += 1;
+            self
+        }
+
+        pub(crate) fn i32(mut self, key: &str, val: i32) -> Self {
+            self.push_key(key);
+            self.kvs.extend(5u32.to_le_bytes()); // type 5 = i32
             self.kvs.extend(val.to_le_bytes());
             self.count += 1;
             self
@@ -257,11 +319,94 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn rejects_v1_header() {
+        // v1 uses u32 counts/lengths; we only support v2/v3 layout.
+        let mut bytes = llama_header();
+        bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+        assert!(parse_gguf_header(&bytes).is_err());
+    }
+
+    #[test]
+    fn block_count_as_f32_decodes_as_integer() {
+        let bytes = GgufBuilder::new()
+            .string("general.architecture", "llama")
+            .f32("llama.block_count", 32.0)
+            .build();
+        let m = parse_gguf_header(&bytes).unwrap();
+        assert_eq!(m.block_count, Some(32));
+    }
+
+    #[test]
+    fn block_count_negative_i32_is_none() {
+        let bytes = GgufBuilder::new()
+            .string("general.architecture", "llama")
+            .i32("llama.block_count", -5)
+            .build();
+        let m = parse_gguf_header(&bytes).unwrap();
+        assert_eq!(m.block_count, None, "negative i32 must not become huge u64");
+    }
+
+    #[test]
+    fn non_integer_f32_is_none() {
+        let bytes = GgufBuilder::new()
+            .string("general.architecture", "llama")
+            .f32("llama.block_count", 32.5)
+            .build();
+        let m = parse_gguf_header(&bytes).unwrap();
+        assert_eq!(m.block_count, None);
+    }
+
+    #[test]
     fn truncated_header_is_error_not_panic() {
         let full = llama_header();
-        for cut in [0, 3, 4, 11, 25, full.len() - 1] {
+        // Cuts before any tracked key completes must stay Err.
+        for cut in [0, 3, 4, 11, 25] {
             assert!(parse_gguf_header(&full[..cut]).is_err(), "cut at {cut}");
         }
+        // A cut inside the trailing array happens AFTER architecture and
+        // block_count were parsed: partial meta is returned instead of Err.
+        let m = parse_gguf_header(&full[..full.len() - 1]).unwrap();
+        assert_eq!(m.architecture.as_deref(), Some("llama"));
+        assert_eq!(m.block_count, Some(32));
+    }
+
+    #[test]
+    fn truncated_mid_giant_array_returns_partial_meta() {
+        // Simulates a 2 MiB probe cutting inside a huge tokenizer array.
+        let full = GgufBuilder::new()
+            .string("general.architecture", "llama")
+            .u32("llama.block_count", 32)
+            .u32_array("tokenizer.ggml.token_ids", &vec![7u32; 100_000])
+            .build();
+        let cut = full.len() - 50_000; // well inside the array data
+        let m = parse_gguf_header(&full[..cut]).unwrap();
+        assert_eq!(m.architecture.as_deref(), Some("llama"));
+        assert_eq!(m.block_count, Some(32));
+    }
+
+    #[test]
+    fn early_exit_once_all_tracked_fields_filled() {
+        // All seven tracked fields appear before a giant array; the parser
+        // must return without needing the array bytes at all.
+        let full = GgufBuilder::new()
+            .string("general.architecture", "llama")
+            .string("general.name", "Llama Test")
+            .u32("llama.block_count", 32)
+            .u32("llama.attention.head_count", 32)
+            .u32("llama.attention.head_count_kv", 8)
+            .u32("llama.embedding_length", 4096)
+            .u32("llama.context_length", 131072)
+            .u32_array("tokenizer.ggml.token_ids", &vec![7u32; 100_000])
+            .build();
+        let cut = full.len() - 200_000; // cut deep inside the array
+        let m = parse_gguf_header(&full[..cut]).unwrap();
+        assert_eq!(m.architecture.as_deref(), Some("llama"));
+        assert_eq!(m.name.as_deref(), Some("Llama Test"));
+        assert_eq!(m.block_count, Some(32));
+        assert_eq!(m.head_count, Some(32));
+        assert_eq!(m.head_count_kv, Some(8));
+        assert_eq!(m.embedding_length, Some(4096));
+        assert_eq!(m.context_length, Some(131072));
     }
 
     #[test]

@@ -67,6 +67,18 @@ mod tests {
             assert!(v.kv_heads > 0, "model {} has kv_heads=0", m.name);
             assert!(v.bpw > 0.0, "model {} has bpw=0", m.name);
         }
+        // Every raw entry must use a known quant: a typo'd quant must fail
+        // here instead of silently falling back to the runtime default bpw.
+        let entries: Vec<Entry> =
+            serde_json::from_str(include_str!("curated_ollama.json")).unwrap();
+        for e in &entries {
+            assert!(
+                quant_bpw(&e.quant).is_some(),
+                "model {} has unknown quant {}",
+                e.name,
+                e.quant
+            );
+        }
     }
 
     #[test]

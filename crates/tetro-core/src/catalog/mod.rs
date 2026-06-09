@@ -135,8 +135,12 @@ pub async fn sync(
     match hf::fetch_hf_gguf(http, opts.hf_limit).await {
         Ok(models) => {
             for m in models {
-                db.upsert_model(&m)?;
-                report.huggingface += 1;
+                match db.upsert_model(&m) {
+                    Ok(_) => report.huggingface += 1,
+                    Err(e) => report
+                        .errors
+                        .push(format!("huggingface upsert {}: {e}", m.name)),
+                }
             }
         }
         Err(e) => report.errors.push(format!("huggingface: {e}")),
@@ -144,8 +148,10 @@ pub async fn sync(
     match hf::fetch_mlx(http, opts.mlx_limit).await {
         Ok(models) => {
             for m in models {
-                db.upsert_model(&m)?;
-                report.mlx += 1;
+                match db.upsert_model(&m) {
+                    Ok(_) => report.mlx += 1,
+                    Err(e) => report.errors.push(format!("mlx upsert {}: {e}", m.name)),
+                }
             }
         }
         Err(e) => report.errors.push(format!("mlx: {e}")),

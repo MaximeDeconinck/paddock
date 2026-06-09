@@ -60,7 +60,8 @@ impl Db {
     }
 
     pub fn upsert_model(&self, m: &CatalogModel) -> Result<i64, TetroError> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO models (name, family, source, repo, params_total, params_active, architecture, context_max)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(source, name) DO UPDATE SET
@@ -78,7 +79,7 @@ impl Db {
                 m.context_max,
             ],
         )?;
-        let id: i64 = self.conn.query_row(
+        let id: i64 = tx.query_row(
             "SELECT id FROM models WHERE source = ?1 AND name = ?2",
             params![source_str(m.source), m.name],
             |r| r.get(0),
@@ -86,7 +87,7 @@ impl Db {
         for v in &m.variants {
             let compat = serde_json::to_string(&v.runtime_compat)
                 .map_err(|e| TetroError::Other(e.to_string()))?;
-            self.conn.execute(
+            tx.execute(
                 "INSERT INTO variants (model_id, quant, bpw, file_size_bytes, layers, kv_heads, head_dim, embedding_dim, runtime_compat)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(model_id, quant) DO UPDATE SET
@@ -107,6 +108,24 @@ impl Db {
                 ],
             )?;
         }
+        // Prune variants that no longer exist upstream.
+        if m.variants.is_empty() {
+            tx.execute("DELETE FROM variants WHERE model_id = ?1", params![id])?;
+        } else {
+            let placeholders = (0..m.variants.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "DELETE FROM variants WHERE model_id = ?1 AND quant NOT IN ({placeholders})"
+            );
+            let mut args: Vec<&dyn rusqlite::ToSql> = vec![&id];
+            for v in &m.variants {
+                args.push(&v.quant);
+            }
+            tx.execute(&sql, args.as_slice())?;
+        }
+        tx.commit()?;
         Ok(id)
     }
 
@@ -158,13 +177,15 @@ impl Db {
     }
 
     pub fn last_sync(&self) -> Result<Option<i64>, TetroError> {
-        let v: Option<String> = self
+        match self
             .conn
             .query_row("SELECT value FROM meta WHERE key = 'last_sync'", [], |r| {
-                r.get(0)
-            })
-            .ok();
-        Ok(v.and_then(|s| s.parse().ok()))
+                r.get::<_, String>(0)
+            }) {
+            Ok(v) => Ok(v.parse().ok()),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn set_last_sync(&self, unix_ts: i64) -> Result<(), TetroError> {
@@ -228,6 +249,33 @@ mod tests {
         let db = Db::open(dir.path().join("catalog.db")).unwrap();
         db.upsert_model(&sample_model()).unwrap();
         db.upsert_model(&sample_model()).unwrap(); // idempotent
+        let models = db.list_models().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].variants.len(), 1);
+        assert_eq!(models[0].variants[0].quant, "Q4_K_M");
+    }
+
+    #[test]
+    fn stale_variants_pruned_on_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("catalog.db")).unwrap();
+        let mut m = sample_model();
+        m.variants.push(CatalogVariant {
+            quant: "Q8_0".into(),
+            bpw: 8.5,
+            file_size_bytes: Some(8_540_000_000),
+            layers: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            embedding_dim: 4096,
+            runtime_compat: vec![RuntimeKind::Ollama],
+        });
+        db.upsert_model(&m).unwrap();
+        let models = db.list_models().unwrap();
+        assert_eq!(models[0].variants.len(), 2);
+
+        // Re-upsert with only Q4_K_M: Q8_0 must be pruned.
+        db.upsert_model(&sample_model()).unwrap();
         let models = db.list_models().unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].variants.len(), 1);

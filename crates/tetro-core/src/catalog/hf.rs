@@ -49,9 +49,12 @@ impl HttpClient for ReqwestClient {
             .send()
             .await
             .map_err(net)?;
-        if !resp.status().is_success() {
+        // Only 206 Partial Content is acceptable: a 200 means the server
+        // ignored the Range header and would stream the whole multi-GB file
+        // into memory via `bytes()`.
+        if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
             return Err(TetroError::Network(format!(
-                "{url}: HTTP {}",
+                "{url}: server ignored Range request (status {})",
                 resp.status()
             )));
         }
@@ -196,8 +199,9 @@ fn moe_active_params(repo: &str, params_total: u64) -> u64 {
             return *active;
         }
     }
-    // Generic "aXb" suffix pattern, e.g. "...-30B-A3B...".
-    if let Some(idx) = r.find("-a") {
+    // Generic "aXb" suffix pattern, e.g. "...-30B-A3B...". Check every "-a"
+    // occurrence: org names may contain "-a" before the real suffix.
+    for (idx, _) in r.match_indices("-a") {
         let tail = &r[idx + 2..];
         let digits: String = tail
             .chars()
@@ -296,7 +300,22 @@ fn params_from_name(repo: &str) -> Option<u64> {
                 && (i + 1 == bytes.len() || !bytes[i + 1].is_ascii_alphanumeric())
             {
                 if let Ok(v) = lower[start..i].parse::<f64>() {
-                    best = Some(best.map_or(v, |b: f64| b.max(v)));
+                    // MoE "NxMb" pattern (e.g. "8x7b"): the token is preceded
+                    // by "<digits>x", total params are N * M billions.
+                    let mut val = v;
+                    if start >= 2 && bytes[start - 1] == b'x' {
+                        let x = start - 1;
+                        let mut k = x;
+                        while k > 0 && bytes[k - 1].is_ascii_digit() {
+                            k -= 1;
+                        }
+                        if k < x {
+                            if let Ok(n) = lower[k..x].parse::<f64>() {
+                                val = n * v;
+                            }
+                        }
+                    }
+                    best = Some(best.map_or(val, |b: f64| b.max(val)));
                 }
             }
         } else {
@@ -427,6 +446,15 @@ mod tests {
     }
 
     #[test]
+    fn params_from_name_moe_nxmb() {
+        // 8x7B is 56B total, not 7B.
+        assert_eq!(
+            params_from_name("mlx-community/Mixtral-8x7B-Instruct-4bit"),
+            Some(56_000_000_000)
+        );
+    }
+
+    #[test]
     fn moe_active_params_known_table() {
         // Qwen3-30B-A3B hits the known table
         let repo = "Qwen/Qwen3-30B-A3B-GGUF";
@@ -439,6 +467,15 @@ mod tests {
     fn moe_active_params_generic_suffix() {
         // Generic "-a3b" style not in known table
         let repo = "some-org/SomeMoE-20B-A3B-GGUF";
+        let total = 20_000_000_000u64;
+        let active = moe_active_params(repo, total);
+        assert_eq!(active, 3_000_000_000);
+    }
+
+    #[test]
+    fn moe_active_params_org_name_containing_a_dash() {
+        // "-a" in the org name must not shadow the real "-A3B" suffix.
+        let repo = "meta-ai/SomeMoE-20B-A3B-GGUF";
         let total = 20_000_000_000u64;
         let active = moe_active_params(repo, total);
         assert_eq!(active, 3_000_000_000);
