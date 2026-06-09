@@ -3,7 +3,8 @@
 
 use serde::Serialize;
 
-use crate::catalog::{CatalogModel, CatalogVariant, RuntimeKind, Source};
+use crate::catalog::{self, CatalogModel, CatalogVariant, RuntimeKind, Source};
+use crate::error::TetroError;
 use crate::hardware::RuntimesStatus;
 
 #[derive(Debug, Clone, Serialize)]
@@ -22,7 +23,24 @@ pub struct RunPlan {
 
 impl RunPlan {
     pub fn display(&self) -> String {
-        self.argv.join(" ")
+        self.argv
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Single-quote an argv element unless every char is shell-safe (POSIX style).
+fn shell_quote(arg: &str) -> String {
+    let safe = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._:/=@,+-".contains(c));
+    if safe {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
     }
 }
 
@@ -32,33 +50,47 @@ fn s(v: &[&str]) -> Vec<String> {
 
 /// Hybrid run strategy (see README): prefer Ollama for GGUF, mlx_lm for MLX.
 /// mlx-lm chat command verified against ml-explore/mlx-lm README (2026-06).
-pub fn plan_run(model: &CatalogModel, variant: &CatalogVariant, rt: &RuntimesStatus) -> RunPlan {
+pub fn plan_run(
+    model: &CatalogModel,
+    variant: &CatalogVariant,
+    rt: &RuntimesStatus,
+) -> Result<RunPlan, TetroError> {
     match model.source {
         Source::Mlx => {
-            let repo = model.repo.clone().unwrap_or_else(|| model.name.clone());
-            RunPlan {
-                argv: s(&["mlx_lm.chat", "--model", &repo]),
+            let repo = model.repo.as_deref().ok_or_else(|| no_repo(&model.name))?;
+            Ok(RunPlan {
+                argv: s(&["mlx_lm.chat", "--model", repo]),
                 install: (!rt.mlx.installed).then(|| InstallPlan {
                     kind: RuntimeKind::MlxLm,
                     argv: s(&["uv", "tool", "install", "mlx-lm"]),
                 }),
-            }
+            })
         }
-        Source::Ollama => RunPlan {
+        Source::Ollama => Ok(RunPlan {
             argv: s(&["ollama", "run", &model.name]),
             install: (!rt.ollama.installed).then(ollama_install),
-        },
+        }),
         Source::HuggingFace => {
-            let model_ref = match &model.repo {
-                Some(repo) => format!("hf.co/{repo}:{}", variant.quant),
-                None => model.name.clone(),
-            };
-            RunPlan {
+            let repo = model.repo.as_deref().ok_or_else(|| no_repo(&model.name))?;
+            if catalog::quant_bpw(&variant.quant).is_none() || variant.quant.starts_with("MLX_") {
+                return Err(TetroError::Other(format!(
+                    "variant `{}` of `{}` is not a valid GGUF tag for `ollama run hf.co/...`",
+                    variant.quant, model.name
+                )));
+            }
+            let model_ref = format!("hf.co/{repo}:{}", variant.quant);
+            Ok(RunPlan {
                 argv: s(&["ollama", "run", &model_ref]),
                 install: (!rt.ollama.installed).then(ollama_install),
-            }
+            })
         }
     }
+}
+
+fn no_repo(name: &str) -> TetroError {
+    TetroError::Other(format!(
+        "model `{name}` has no HuggingFace repo reference; re-run `tetro sync`"
+    ))
 }
 
 fn ollama_install() -> InstallPlan {
@@ -119,7 +151,7 @@ mod tests {
     #[test]
     fn hf_gguf_with_ollama_uses_hf_co_ref() {
         let m = hf_model();
-        let plan = plan_run(&m, &m.variants[0], &with_ollama());
+        let plan = plan_run(&m, &m.variants[0], &with_ollama()).unwrap();
         assert_eq!(
             plan.argv,
             vec![
@@ -137,7 +169,7 @@ mod tests {
         m.source = Source::Ollama;
         m.repo = None;
         m.name = "llama3.1:8b".into();
-        let plan = plan_run(&m, &m.variants[0], &with_ollama());
+        let plan = plan_run(&m, &m.variants[0], &with_ollama()).unwrap();
         assert_eq!(plan.argv, vec!["ollama", "run", "llama3.1:8b"]);
     }
 
@@ -155,7 +187,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let plan = plan_run(&m, &m.variants[0], &rt);
+        let plan = plan_run(&m, &m.variants[0], &rt).unwrap();
         assert_eq!(
             plan.argv,
             vec![
@@ -169,10 +201,56 @@ mod tests {
     #[test]
     fn no_runtime_yields_install_plan_never_auto_runs() {
         let m = hf_model();
-        let plan = plan_run(&m, &m.variants[0], &RuntimesStatus::default());
+        let plan = plan_run(&m, &m.variants[0], &RuntimesStatus::default()).unwrap();
         let install = plan.install.expect("must propose an install");
         assert_eq!(install.argv, vec!["brew", "install", "ollama"]);
         // run command still present so the UI can show what WILL run after install
         assert_eq!(plan.argv[0], "ollama");
+    }
+
+    #[test]
+    fn mlx_without_repo_errors() {
+        let mut m = hf_model();
+        m.source = Source::Mlx;
+        m.repo = None;
+        m.variants = vec![variant("MLX_4BIT", vec![RuntimeKind::MlxLm])];
+        let err = plan_run(&m, &m.variants[0], &RuntimesStatus::default()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no HuggingFace repo reference"), "{msg}");
+        assert!(msg.contains("tetro sync"), "{msg}");
+    }
+
+    #[test]
+    fn hf_without_repo_errors() {
+        let mut m = hf_model();
+        m.repo = None;
+        let err = plan_run(&m, &m.variants[0], &with_ollama()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no HuggingFace repo reference"), "{msg}");
+        assert!(msg.contains("tetro sync"), "{msg}");
+    }
+
+    #[test]
+    fn hf_with_mlx_quant_errors() {
+        let mut m = hf_model();
+        m.variants = vec![variant("MLX_4BIT", vec![RuntimeKind::MlxLm])];
+        let err = plan_run(&m, &m.variants[0], &with_ollama()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not a valid GGUF tag"), "{msg}");
+        assert!(msg.contains("MLX_4BIT"), "{msg}");
+
+        // DB-roundtripped garbage (unknown quant) must also be refused
+        m.variants = vec![variant("Q4_BOGUS", vec![RuntimeKind::Ollama])];
+        let err = plan_run(&m, &m.variants[0], &with_ollama()).unwrap_err();
+        assert!(err.to_string().contains("not a valid GGUF tag"));
+    }
+
+    #[test]
+    fn display_shell_quotes_unsafe_elements() {
+        let plan = RunPlan {
+            argv: vec!["ollama".into(), "run".into(), "weird name".into()],
+            install: None,
+        };
+        assert_eq!(plan.display(), "ollama run 'weird name'");
     }
 }
