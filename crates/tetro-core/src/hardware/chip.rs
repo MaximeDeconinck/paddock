@@ -6,6 +6,7 @@ pub enum ChipFamily {
     M2,
     M3,
     M4,
+    M5,
     Unknown,
 }
 
@@ -19,7 +20,9 @@ pub enum ChipVariant {
 
 /// Parse `machdep.cpu.brand_string`, e.g. "Apple M2 Max".
 pub fn parse_brand_string(s: &str) -> (ChipFamily, ChipVariant) {
-    let family = if s.contains("M4") {
+    let family = if s.contains("M5") {
+        ChipFamily::M5
+    } else if s.contains("M4") {
         ChipFamily::M4
     } else if s.contains("M3") {
         ChipFamily::M3
@@ -54,10 +57,16 @@ pub fn parse_brand_string(s: &str) -> (ChipFamily, ChipVariant) {
 ///   - M4 series: apple.com/newsroom "Apple introduces M4 Pro and M4 Max" (Oct 2024).
 ///     M4 Pro: 273 GB/s. M4 Max: 410 GB/s (14-core, 10P) or 546 GB/s (16-core, 12P).
 ///     Sources confirmed via support.apple.com/en-us/121553 and /en-us/121554.
+///   - M5 series: apple.com/newsroom "Apple unleashes M5" (Oct 2025, LPDDR5X-9600).
+///     M5 Base: 153.6 GB/s.
+///     apple.com/newsroom "Apple debuts M5 Pro and M5 Max" (Mar 2026).
+///     M5 Pro: 307.0 GB/s. M5 Max: 460.0 GB/s (10P) or 614.0 GB/s (12P).
+///     M5 Ultra: not yet shipped at time of writing.
 ///
 /// Max-tier chips ship in two memory configs distinguished by CPU perf-core count:
 ///   M3 Max: 10P=300 GB/s / 12P=400 GB/s
 ///   M4 Max: 10P=410 GB/s / 12P=546 GB/s
+///   M5 Max: 10P=460 GB/s / 12P=614 GB/s
 pub fn bandwidth_gbps(family: ChipFamily, variant: ChipVariant, perf_cores: u32) -> (f64, bool) {
     use ChipFamily as F;
     use ChipVariant as V;
@@ -79,6 +88,11 @@ pub fn bandwidth_gbps(family: ChipFamily, variant: ChipVariant, perf_cores: u32)
         (F::M4, V::Max) => Some(if perf_cores >= 12 { 546.0 } else { 410.0 }),
         // No M4 Ultra shipped at time of writing; conservative guess from M2/M3 Ultra pattern.
         (F::M4, V::Ultra) => None,
+        (F::M5, V::Base) => Some(153.6),
+        (F::M5, V::Pro) => Some(307.0),
+        (F::M5, V::Max) => Some(if perf_cores >= 12 { 614.0 } else { 460.0 }),
+        // No M5 Ultra shipped at time of writing; conservative guess from prior Ultra pattern.
+        (F::M5, V::Ultra) => None,
         (F::Unknown, _) => None,
     };
     match known {
@@ -125,6 +139,10 @@ mod tests {
             (ChipFamily::M4, ChipVariant::Ultra)
         );
         assert_eq!(
+            parse_brand_string("Apple M5"),
+            (ChipFamily::M5, ChipVariant::Base)
+        );
+        assert_eq!(
             parse_brand_string("Intel(R) Core(TM) i7"),
             (ChipFamily::Unknown, ChipVariant::Base)
         );
@@ -143,6 +161,14 @@ mod tests {
         assert_eq!(
             bandwidth_gbps(ChipFamily::M4, ChipVariant::Pro, 10),
             (273.0, false)
+        );
+        assert_eq!(
+            bandwidth_gbps(ChipFamily::M5, ChipVariant::Base, 4),
+            (153.6, false)
+        );
+        assert_eq!(
+            bandwidth_gbps(ChipFamily::M5, ChipVariant::Pro, 12),
+            (307.0, false)
         );
     }
 
@@ -165,6 +191,15 @@ mod tests {
         assert_eq!(
             bandwidth_gbps(ChipFamily::M4, ChipVariant::Max, 12),
             (546.0, false)
+        );
+        // M5 Max 14-core (10P) = 460, 16-core (12P) = 614
+        assert_eq!(
+            bandwidth_gbps(ChipFamily::M5, ChipVariant::Max, 10),
+            (460.0, false)
+        );
+        assert_eq!(
+            bandwidth_gbps(ChipFamily::M5, ChipVariant::Max, 12),
+            (614.0, false)
         );
     }
 

@@ -49,7 +49,7 @@ pub fn scan(probe: &dyn SystemProbe) -> HardwareProfile {
     let sysctl_wired_limit_bytes = probe
         .sysctl_u64("iogpu.wired_limit_mb")
         .filter(|&v| v > 0)
-        .map(|mb| mb * 1024 * 1024);
+        .map(|mb| mb.saturating_mul(1024 * 1024));
     let effective_limit_bytes = metal_limit_bytes
         .or(sysctl_wired_limit_bytes)
         .unwrap_or(ram_total_bytes * 3 / 4);
@@ -138,13 +138,19 @@ mod tests {
         );
         // Bandwidth should be non-zero and not flagged as estimated on a known chip.
         assert!(hw.bandwidth_gbps > 0.0);
+        assert!(
+            !hw.bandwidth_estimated,
+            "expected exact bandwidth on a known chip, got estimate (family={:?})",
+            hw.family
+        );
         println!(
-            "chip={} family={:?} variant={:?} ram={}GiB bw={}GB/s metal_limit={:?}GiB runtimes={:?}",
+            "chip={} family={:?} variant={:?} ram={}GiB bw={}GB/s bw_estimated={} metal_limit={:?}GiB runtimes={:?}",
             hw.chip_name,
             hw.family,
             hw.variant,
             hw.ram_total_bytes / (1 << 30),
             hw.bandwidth_gbps,
+            hw.bandwidth_estimated,
             hw.gpu.metal_limit_bytes.map(|b| b / (1 << 30)),
             hw.runtimes,
         );

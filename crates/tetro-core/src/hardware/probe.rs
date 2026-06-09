@@ -83,9 +83,9 @@ impl SystemProbe for RealSystemProbe {
 #[cfg(target_os = "macos")]
 fn metal_working_set() -> Option<u64> {
     use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
-    // MTLCreateSystemDefaultDevice is a safe public wrapper; calling
-    // recommendedMaxWorkingSetSize requires unsafe because MTLDevice is an
-    // unsafe trait (objc2-metal 0.3).
+    // Both MTLCreateSystemDefaultDevice and recommendedMaxWorkingSetSize are
+    // safe in objc2-metal 0.3: the crate exposes them as safe Rust functions
+    // with no unsafe block required at the call site.
     let device = MTLCreateSystemDefaultDevice()?;
     Some(device.recommendedMaxWorkingSetSize())
 }
