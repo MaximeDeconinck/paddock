@@ -80,8 +80,9 @@ pub fn score_variant(
     let quality = quality_subscore(v);
     let context = context_subscore(v.context_max);
     let w = weights(uc);
-    let total =
-        (w.fit * fit + w.speed * speed_s + w.quality * quality + w.context * context) / 100.0;
+    let total = ((w.fit * fit + w.speed * speed_s + w.quality * quality + w.context * context)
+        / 100.0)
+        .clamp(0.0, 100.0);
     Score {
         total,
         fit,
@@ -110,6 +111,7 @@ fn fit_subscore(mem: &MemoryEstimate) -> f64 {
 
 /// Piecewise-linear over experience tiers: (0,0) (5,25) (15,55) (30,85) (60,100).
 fn speed_subscore(tps: f64) -> f64 {
+    let tps = tps.max(0.0);
     let points = [
         (0.0f64, 0.0f64),
         (5.0, 25.0),
@@ -168,11 +170,14 @@ pub fn best_variant<'a>(
     };
     let mut ordered: Vec<&ModelVariant> = variants.iter().collect();
     ordered.sort_by(|a, b| {
-        rank(a).cmp(&rank(b)).then(
-            b.bpw
-                .partial_cmp(&a.bpw)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
+        rank(a)
+            .cmp(&rank(b))
+            .then(
+                b.bpw
+                    .partial_cmp(&a.bpw)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then_with(|| a.quant.cmp(&b.quant))
     });
     for accept in [
         FitVerdict::FitsGpu,
@@ -278,6 +283,12 @@ mod tests {
         let tunable = vec![variant("Q4_K_M", 4.83, 45_000_000_000)]; // ~30.1GB total < 34.4GB tunable
         let b2 = best_variant(&tunable, &budget());
         assert!(b2.is_some());
+    }
+
+    #[test]
+    fn negative_tps_clamps_to_zero_subscore() {
+        let s = speed_subscore(-10.0);
+        assert_eq!(s, 0.0);
     }
 
     #[test]
