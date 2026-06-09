@@ -1,13 +1,7 @@
 mod app;
 mod cli;
 mod output;
-
-// Temporary stub — the real TUI lands in Task 7.
-mod tui {
-    pub fn run(_app: crate::app::App) -> anyhow::Result<()> {
-        anyhow::bail!("TUI lands in Task 7; use --cli")
-    }
-}
+mod tui;
 
 use std::io::Write;
 
@@ -146,6 +140,13 @@ fn run_model(app: &App, query: &str, json: bool) -> Result<()> {
     }
 
     println!("$ {}", plan.display());
+    launch(plan)
+}
+
+/// Shared launch path for `tetro run` and the TUI: confirm any required
+/// runtime install (never auto-install), then replace this process with the
+/// run command. Keeping confirmation here keeps the guarantee in one place.
+pub(crate) fn launch(plan: RunPlan) -> Result<()> {
     if let Some(install) = &plan.install {
         confirm_and_install(install)?;
     }

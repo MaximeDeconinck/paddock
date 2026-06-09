@@ -11,6 +11,7 @@ use tetro_core::estimate::{
 use tetro_core::hardware::{scan, HardwareProfile, RealSystemProbe};
 use tetro_core::score::{best_variant, score_variant, Score, UseCase};
 
+#[derive(Clone)]
 pub struct ScoredModel {
     pub model: CatalogModel,
     /// Index into model.variants of the picked "best quant that fits".
