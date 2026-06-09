@@ -81,10 +81,10 @@ fn main() -> Result<()> {
 fn fit(app: &App, all: bool, use_case: UseCase, limit: usize, json: bool) -> Result<()> {
     let db = app.open_db()?;
     let mut rows = app.scored_models(&db, use_case, all)?;
-    rows.truncate(limit);
     if rows.is_empty() {
         eprintln!("catalog is empty — run `tetro sync` first");
     }
+    rows.truncate(limit);
     if json {
         output::print_fit_json(&rows)?;
     } else {

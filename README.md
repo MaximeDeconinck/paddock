@@ -91,7 +91,7 @@ $ ollama run llama3.2:3b
 >>>
 ```
 
-tetro picks the best available runtime for the chosen variant (Ollama → llama.cpp → mlx-lm), prints the exact command, and execs it. If no capable runtime is installed it proposes the install command and asks for confirmation before doing anything. Unknown names produce a real error, not a shrug:
+tetro picks the runtime based on the variant's source — GGUF models (Hugging Face or the Ollama library) launch via Ollama, MLX models via mlx-lm (llama.cpp is detected and displayed but never auto-selected in v0.1) — prints the exact command, and execs it. If no capable runtime is installed it proposes the install command and asks for confirmation before doing anything. Unknown names produce a real error, not a shrug:
 
 ```text
 $ tetro run definitely-not-a-model
