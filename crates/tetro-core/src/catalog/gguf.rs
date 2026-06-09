@@ -47,10 +47,12 @@ impl<'a> Reader<'a> {
     }
 
     fn u32(&mut self) -> Result<u32, TetroError> {
+        // Infallible: take(4) returns exactly 4 bytes or errors out first.
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
     fn u64(&mut self) -> Result<u64, TetroError> {
+        // Infallible: take(8) returns exactly 8 bytes or errors out first.
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
 

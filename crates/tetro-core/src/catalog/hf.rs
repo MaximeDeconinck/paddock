@@ -130,6 +130,7 @@ async fn fetch_hf_repo(
     let mut kv_heads = 0u32;
     let mut head_dim = 0u32;
     let mut embedding_dim = 0u32;
+    // Infallible: `files.is_empty()` returned `Ok(None)` above.
     let probe_file = &files.iter().min_by_key(|f| f.2).unwrap().0.clone();
     let url = format!("https://huggingface.co/{repo}/resolve/main/{probe_file}");
     if let Ok(bytes) = http.get_range(&url, 0, GGUF_HEADER_PROBE_BYTES - 1).await {
