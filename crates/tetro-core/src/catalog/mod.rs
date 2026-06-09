@@ -1,6 +1,7 @@
+pub mod curated;
 pub mod db;
 pub mod gguf;
-// curated and hf added in later sub-tasks
+// hf added in next sub-task
 
 use serde::{Deserialize, Serialize};
 
