@@ -6,10 +6,11 @@
 
 **Architecture:** The curated JSON becomes a NAME + arch-params seed; at sync time, `registry.ollama.ai` (OCI distribution spec) provides the live tag list per model → one CatalogVariant per recognized quant tag, each carrying its exact `source_tag` so run/serve commands reference the real Ollama tag. All HTTP stays behind the existing `HttpClient` trait. Offline fallback = today's behavior (default-tag variant from the embedded JSON).
 
-**Verified-during-implementation facts (WebSearch/live curl, cite in code):**
-1. `GET https://registry.ollama.ai/v2/library/{name}/tags/list` response shape + whether anonymous access needs the Docker token dance (401 + WWW-Authenticate → token endpoint). Implement minimal token flow only if required.
-2. Real tag naming patterns (e.g. `8b`, `8b-instruct-q4_K_M`, `4b-it-q8_0`, `-text-` for base models) across llama3.1, qwen2.5, gemma3.
-3. Decision recorded in code comment: per-tag manifests NOT fetched in v1 (would be ~600 extra requests); `file_size_bytes: None` for enriched variants, estimates derive from params×bpw anyway.
+**PRE-VERIFIED facts (live curl, 2026-06-10 — cite in code comments):**
+1. OCI `tags/list` is NOT exposed: `GET https://registry.ollama.ai/v2/library/llama3.1/tags/list` → 404. Tag ENUMERATION therefore uses `GET https://ollama.com/library/{base}/tags` (HTML, 200) extracting tag names from the URL scheme `href="/library/{base}:{tag}"` — URL patterns are far more stable than DOM structure; treat as semi-stable, best-effort, errors reported not fatal.
+2. `GET https://registry.ollama.ai/v2/library/{base}/manifests/{tag}` (Accept: application/vnd.docker.distribution.manifest.v2+json) works anonymously and returns layer sizes — NOT used in v1 (one request per kept tag ≈ 450; sizes stay None, estimates derive from params×bpw). Recorded as the future size-enrichment path.
+3. `HttpClient` trait gains `async fn get_text(&self, url) -> Result<String, TetroError>` (HTML page); implement in ReqwestClient + test mocks.
+4. Tag naming patterns to confirm against the fetched HTML during implementation: `{size}`, `{size}-instruct-{quant}`, `{size}-it-{quant}`, `-text-`/`-base-` for non-chat variants.
 
 ---
 
@@ -33,7 +34,7 @@
 
 pub struct OllamaTag { pub tag: String, pub quant: String /* normalized, e.g. Q4_K_M */ }
 
-/// GET /v2/library/{base}/tags/list -> all tags; parse + filter to the ones
+/// GET https://ollama.com/library/{base}/tags (HTML) -> tag names extracted
 /// matching `size_prefix` (e.g. "8b") with a recognizable quant suffix.
 pub async fn fetch_model_tags(http: &dyn HttpClient, base: &str)
     -> Result<Vec<String>, TetroError>;
