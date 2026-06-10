@@ -1,0 +1,23 @@
+[package]
+name = "paddock-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hardware-aware LLM fit & speed estimation engine for Apple Silicon"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+async-trait.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = ["MTLDevice"] }
+
+[dev-dependencies]
+tempfile = "3"
