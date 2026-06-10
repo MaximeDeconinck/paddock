@@ -53,6 +53,12 @@ pub struct CatalogModel {
     pub params_active: u64,
     pub architecture: Option<String>,
     pub context_max: u32,
+    /// Release date (epoch seconds), when known. Display + age malus input.
+    #[serde(default)]
+    pub released_at: Option<i64>,
+    /// True when the date is a lower-bound proxy (Ollama tags page), not exact.
+    #[serde(default)]
+    pub released_approx: bool,
     pub variants: Vec<CatalogVariant>,
 }
 

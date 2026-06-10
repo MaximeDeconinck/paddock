@@ -244,6 +244,8 @@ pub async fn discover_model(
         params_active,
         architecture: arch,
         context_max: if context_max == 0 { 4096 } else { context_max },
+        released_at: None,
+        released_approx: false,
         variants,
     }))
 }
@@ -627,6 +629,8 @@ mod tests {
             params_active: 8_030_000_000,
             architecture: Some("llama".into()),
             context_max: 131_072,
+            released_at: None,
+            released_approx: false,
             variants: vec![CatalogVariant {
                 quant: "Q4_K_M".into(),
                 bpw: 4.83,

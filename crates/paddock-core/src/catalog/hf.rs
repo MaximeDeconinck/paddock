@@ -230,6 +230,8 @@ async fn fetch_hf_repo(
         params_active: moe_active_params(repo, params_total),
         architecture,
         context_max: if context_max == 0 { 4096 } else { context_max },
+        released_at: None,
+        released_approx: false,
         variants,
     }))
 }
@@ -321,6 +323,8 @@ pub async fn fetch_mlx(
             params_active: moe_active_params(repo, params_total),
             architecture: config["model_type"].as_str().map(String::from),
             context_max: context,
+            released_at: None,
+            released_approx: false,
             variants: vec![CatalogVariant {
                 quant,
                 bpw,

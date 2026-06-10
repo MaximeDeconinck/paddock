@@ -474,6 +474,8 @@ mod tests {
             params_active: 8_000_000_000,
             architecture: None,
             context_max: 8192,
+            released_at: None,
+            released_approx: false,
             variants: vec![],
         }
     }

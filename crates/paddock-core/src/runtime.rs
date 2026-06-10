@@ -335,6 +335,8 @@ mod tests {
             params_active: 8_030_000_000,
             architecture: Some("llama".into()),
             context_max: 131_072,
+            released_at: None,
+            released_approx: false,
             variants: vec![variant(
                 "Q4_K_M",
                 vec![RuntimeKind::Ollama, RuntimeKind::LlamaCpp],

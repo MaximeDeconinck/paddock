@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS models (
     params_active INTEGER NOT NULL,
     architecture TEXT,
     context_max INTEGER NOT NULL,
+    released_at INTEGER,
+    released_approx INTEGER NOT NULL DEFAULT 0,
     UNIQUE(source, name)
 );
 CREATE TABLE IF NOT EXISTS variants (
@@ -63,18 +65,30 @@ impl Db {
                 return Err(e.into());
             }
         }
+        // Migration for DBs created before model release dates existed.
+        for ddl in [
+            "ALTER TABLE models ADD COLUMN released_at INTEGER",
+            "ALTER TABLE models ADD COLUMN released_approx INTEGER NOT NULL DEFAULT 0",
+        ] {
+            if let Err(e) = conn.execute(ddl, []) {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(e.into());
+                }
+            }
+        }
         Ok(Self { conn })
     }
 
     pub fn upsert_model(&self, m: &CatalogModel) -> Result<i64, PaddockError> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO models (name, family, source, repo, params_total, params_active, architecture, context_max)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO models (name, family, source, repo, params_total, params_active, architecture, context_max, released_at, released_approx)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(source, name) DO UPDATE SET
                family=excluded.family, repo=excluded.repo,
                params_total=excluded.params_total, params_active=excluded.params_active,
-               architecture=excluded.architecture, context_max=excluded.context_max",
+               architecture=excluded.architecture, context_max=excluded.context_max,
+               released_at=excluded.released_at, released_approx=excluded.released_approx",
             params![
                 m.name,
                 m.family,
@@ -84,6 +98,8 @@ impl Db {
                 m.params_active as i64,
                 m.architecture,
                 m.context_max,
+                m.released_at,
+                m.released_approx as i64,
             ],
         )?;
         let id: i64 = tx.query_row(
@@ -150,7 +166,7 @@ impl Db {
 
     pub fn list_models(&self) -> Result<Vec<CatalogModel>, PaddockError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, family, source, repo, params_total, params_active, architecture, context_max
+            "SELECT id, name, family, source, repo, params_total, params_active, architecture, context_max, released_at, released_approx
              FROM models ORDER BY params_total DESC",
         )?;
         let mut models: Vec<CatalogModel> = stmt
@@ -165,6 +181,8 @@ impl Db {
                     params_active: r.get::<_, i64>(6)? as u64,
                     architecture: r.get(7)?,
                     context_max: r.get(8)?,
+                    released_at: r.get(9)?,
+                    released_approx: r.get::<_, i64>(10)? != 0,
                     variants: Vec::new(),
                 })
             })?
@@ -250,6 +268,8 @@ mod tests {
             params_active: 8_030_000_000,
             architecture: Some("llama".into()),
             context_max: 131_072,
+            released_at: None,
+            released_approx: false,
             variants: vec![CatalogVariant {
                 quant: "Q4_K_M".into(),
                 bpw: 4.83,
@@ -382,6 +402,40 @@ mod tests {
         drop(db);
         let db = Db::open(&path).unwrap();
         assert_eq!(db.list_models().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migration_adds_released_columns_and_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            // Pre-released_at schema: models table without the new columns.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE models (
+                    id INTEGER PRIMARY KEY, name TEXT NOT NULL, family TEXT,
+                    source TEXT NOT NULL, repo TEXT,
+                    params_total INTEGER NOT NULL, params_active INTEGER NOT NULL,
+                    architecture TEXT, context_max INTEGER NOT NULL,
+                    UNIQUE(source, name));",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let mut m = sample_model();
+        m.released_at = Some(1_743_465_600);
+        m.released_approx = true;
+        db.upsert_model(&m).unwrap();
+        let got = &db.list_models().unwrap()[0];
+        assert_eq!(got.released_at, Some(1_743_465_600));
+        assert!(got.released_approx);
+        // None roundtrips too.
+        m.released_at = None;
+        m.released_approx = false;
+        db.upsert_model(&m).unwrap();
+        let got = &db.list_models().unwrap()[0];
+        assert_eq!(got.released_at, None);
+        assert!(!got.released_approx);
     }
 
     #[test]

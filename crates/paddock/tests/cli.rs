@@ -27,6 +27,8 @@ fn seed_one_model(dir: &std::path::Path) {
         params_active: 1_000_000_000,
         architecture: Some("llama".into()),
         context_max: 8192,
+        released_at: None,
+        released_approx: false,
         variants: vec![CatalogVariant {
             quant: "Q4_K_M".into(),
             bpw: 4.83,

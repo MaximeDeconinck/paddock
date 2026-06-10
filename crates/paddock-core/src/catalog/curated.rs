@@ -42,6 +42,8 @@ pub fn curated_ollama_models() -> Vec<CatalogModel> {
             params_active: e.params_active.unwrap_or(e.params_total),
             architecture: Some(e.family),
             context_max: e.context_max,
+            released_at: None,
+            released_approx: false,
             variants: vec![CatalogVariant {
                 bpw: quant_bpw(&e.quant).unwrap_or(4.83),
                 quant: e.quant,
