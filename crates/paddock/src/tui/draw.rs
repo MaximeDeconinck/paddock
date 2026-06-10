@@ -22,11 +22,14 @@ const ACCENT: Color = Color::Rgb(92, 102, 255);
 const ACCENT_DEEP: Color = Color::Rgb(26, 26, 110);
 
 pub fn draw(frame: &mut Frame, state: &TuiState, profile: &HardwareProfile) {
+    // Breathing room against the terminal edges, like the box's own padding.
     let [header, table, footer] = Layout::vertical([
         Constraint::Length(7),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
+    .horizontal_margin(2)
+    .vertical_margin(1)
     .areas(frame.area());
     draw_header(frame, header, profile);
     draw_table(frame, table, state);
@@ -36,7 +39,43 @@ pub fn draw(frame: &mut Frame, state: &TuiState, profile: &HardwareProfile) {
     }
 }
 
+/// Block-letter wordmark drawn in the header, llama.cpp-style.
+const WORDMARK: [&str; 5] = [
+    "█████▄   ▄███▄   ▄▄▄██   ▄▄▄██   ▄██▄    ▄███▄  ██  ██",
+    "██  ██      ██  ██  ██  ██  ██  ██  ██  ██      ██ ██",
+    "██  ██   ▄████  ██  ██  ██  ██  ██  ██  ██      ████",
+    "█████▀  ██  ██  ██  ██  ██  ██  ██  ██  ██      ██ ██",
+    "██       ▀▀▀██   ▀▀▀██   ▀▀▀██   ▀██▀    ▀███▀  ██  ██",
+];
+/// Display width of the widest wordmark row + a 2-col right margin.
+const WORDMARK_WIDTH: u16 = 57;
+
 fn draw_header(frame: &mut Frame, area: Rect, p: &HardwareProfile) {
+    // Wide terminals: wordmark on the left, machine box to its right.
+    // Narrow ones: machine box only (it carries the " paddock " title then).
+    let min_box_width = 46;
+    let (mark_area, box_area) = if area.width >= WORDMARK_WIDTH + min_box_width {
+        let [m, b] = Layout::horizontal([Constraint::Length(WORDMARK_WIDTH), Constraint::Min(1)])
+            .areas(area);
+        (Some(m), b)
+    } else {
+        (None, area)
+    };
+    if let Some(m) = mark_area {
+        // Top blank line: the 5-row wordmark sits level with the box's
+        // content rows (the box spends its first row on the border).
+        let mut mark = vec![Line::default()];
+        mark.extend(
+            WORDMARK
+                .iter()
+                .map(|l| Line::from(Span::styled(*l, Style::new().fg(ACCENT)))),
+        );
+        frame.render_widget(Paragraph::new(mark), m);
+    }
+    draw_machine_box(frame, box_area, p, mark_area.is_none());
+}
+
+fn draw_machine_box(frame: &mut Frame, area: Rect, p: &HardwareProfile, titled: bool) {
     let label = |s: &str| Span::styled(format!("{s:<11}"), Style::new().fg(Color::DarkGray));
     let value = |s: String| Span::styled(s, Style::new().fg(Color::Gray));
     let gpu_line = match p.gpu.metal_limit_bytes {
@@ -79,12 +118,13 @@ fn draw_header(frame: &mut Frame, area: Rect, p: &HardwareProfile) {
         Line::from(vec![label("bandwidth"), value(bandwidth)]),
         Line::from(vec![label("runtimes"), value(runtimes)]),
     ];
-    let block = Block::bordered()
-        .border_style(Style::new().fg(Color::DarkGray))
-        .title(Span::styled(
+    let mut block = Block::bordered().border_style(Style::new().fg(Color::DarkGray));
+    if titled {
+        block = block.title(Span::styled(
             " paddock ",
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
+    }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 

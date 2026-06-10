@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/paddock-logo-white.png">
-    <img src="docs/assets/paddock-banner.png" alt="paddock" width="480">
-  </picture>
+  <img src="docs/assets/paddock-banner.png" alt="paddock" width="480">
 </p>
 
 **Which LLMs fit your Apple Silicon Mac, how fast they'll run, and how to launch them — in one command.**
