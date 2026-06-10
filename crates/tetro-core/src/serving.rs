@@ -52,8 +52,11 @@ impl Registry {
         std::fs::create_dir_all(&self.dir)
             .map_err(|e| TetroError::Other(format!("cannot create {:?}: {e}", self.dir)))?;
         let json = serde_json::to_vec_pretty(r).map_err(|e| TetroError::Other(e.to_string()))?;
-        std::fs::write(self.path_for(r.pid), json)
-            .map_err(|e| TetroError::Other(format!("cannot write serving record: {e}")))
+        let tmp = self.dir.join(format!("{}.json.tmp", r.pid));
+        std::fs::write(&tmp, json)
+            .map_err(|e| TetroError::Other(format!("cannot write serving record: {e}")))?;
+        std::fs::rename(&tmp, self.path_for(r.pid))
+            .map_err(|e| TetroError::Other(format!("cannot finalize serving record: {e}")))
     }
 
     pub fn unregister(&self, pid: u32) -> Result<(), TetroError> {
@@ -66,8 +69,10 @@ impl Registry {
         }
     }
 
-    /// Live records only; stale files (dead PID, unreachable endpoint,
-    /// unparseable JSON) are deleted as a side effect.
+    /// Live records only. Deletes a file only when its JSON is unparseable
+    /// (and its stem is a u32) or its PID is dead. An alive PID whose ready
+    /// probe fails is filtered from the result but the file is kept (transient
+    /// busy server). Files whose stem isn't a u32 are never touched.
     pub fn list_live(&self, probe: &dyn SystemProbe) -> Vec<ServingRecord> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
@@ -78,19 +83,30 @@ impl Registry {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
+            let stem_is_pid = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.parse::<u32>().is_ok());
+            if !stem_is_pid {
+                continue;
+            }
             let record = std::fs::read(&path)
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<ServingRecord>(&bytes).ok());
-            let alive = record.as_ref().is_some_and(|r| {
-                pid_alive(r.pid)
-                    && probe
+            match record {
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                }
+                Some(r) if !pid_alive(r.pid) => {
+                    let _ = std::fs::remove_file(&path);
+                }
+                Some(r) => {
+                    if probe
                         .http_get_local(&format!("{}{}", r.endpoint, r.ready_path))
                         .is_some()
-            });
-            match (record, alive) {
-                (Some(r), true) => live.push(r),
-                _ => {
-                    let _ = std::fs::remove_file(&path);
+                    {
+                        live.push(r);
+                    }
                 }
             }
         }
@@ -100,6 +116,8 @@ impl Registry {
 }
 
 /// `kill(pid, 0)` liveness probe (signal 0 = existence check, no signal sent).
+/// kill→-1/EPERM (alive process owned by another user) reads as dead here —
+/// acceptable, we only track our own children.
 fn pid_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
@@ -168,6 +186,8 @@ mod tests {
             .insert("http://127.0.0.1:8080/health".into(), "ok".into());
         let r = record(std::process::id());
         reg.register(&r).unwrap();
+        // atomic register: no .tmp lingers, exactly one file
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         let live = reg.list_live(&probe);
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].model_ref, "repo:Q4_K_M");
@@ -190,12 +210,24 @@ mod tests {
     }
 
     #[test]
-    fn unreachable_endpoint_is_reaped() {
+    fn unreachable_endpoint_is_filtered_not_deleted() {
         let dir = tempfile::tempdir().unwrap();
         let reg = Registry::at(dir.path());
         let probe = MockProbe::default(); // no HTTP answers
-        reg.register(&record(std::process::id())).unwrap();
+        let pid = std::process::id();
+        reg.register(&record(pid)).unwrap();
         assert!(reg.list_live(&probe).is_empty());
+        // alive PID, transient probe failure: file kept
+        assert!(dir.path().join(format!("{pid}.json")).exists());
+    }
+
+    #[test]
+    fn foreign_json_files_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.json"), b"{not json").unwrap();
+        let reg = Registry::at(dir.path());
+        assert!(reg.list_live(&MockProbe::default()).is_empty());
+        assert!(dir.path().join("notes.json").exists());
     }
 
     #[test]
