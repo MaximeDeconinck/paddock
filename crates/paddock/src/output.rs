@@ -71,16 +71,44 @@ pub fn print_endpoint(plan: &paddock_core::runtime::ServePlan) {
     );
 }
 
+/// Compact age: `3d` < 14 days ≤ `2w` < 56 days ≤ `7mo` < 1 year ≤ `1.2y`.
+/// `~` prefix = approximate source date; `?` = unknown release date.
+pub fn age_label(released_at: Option<i64>, approx: bool, now: i64) -> String {
+    let Some(r) = released_at else {
+        return "?".into();
+    };
+    let days = ((now - r) as f64 / 86_400.0).max(0.0);
+    let core = if days < 14.0 {
+        format!("{}d", days as u64)
+    } else if days < 56.0 {
+        format!("{}w", (days / 7.0) as u64)
+    } else if days < 365.25 {
+        format!("{}mo", (days / 30.44) as u64)
+    } else {
+        format!("{:.1}y", days / 365.25)
+    };
+    if approx {
+        format!("~{core}")
+    } else {
+        core
+    }
+}
+
 pub fn print_fit_table(rows: &[ScoredModel]) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     println!(
-        "{:<32} {:<9} {:>9} {:>9}  {:<12} {:>5}",
-        "MODEL", "QUANT", "MEMORY", "TOK/S", "FIT", "SCORE"
+        "{:<32} {:>6} {:<9} {:>9} {:>9}  {:<12} {:>5}",
+        "MODEL", "AGE", "QUANT", "MEMORY", "TOK/S", "FIT", "SCORE"
     );
     for r in rows {
         let v = &r.model.variants[r.variant_idx];
         println!(
-            "{:<32} {:<9} {:>9} {:>9.0}  {:<12} {:>5.0}",
+            "{:<32} {:>6} {:<9} {:>9} {:>9.0}  {:<12} {:>5.0}",
             truncate(&r.model.name, 32),
+            age_label(r.model.released_at, r.model.released_approx, now),
             v.quant,
             gib(r.memory.total_bytes),
             r.speed.generation_tps,
@@ -93,6 +121,8 @@ pub fn print_fit_table(rows: &[ScoredModel]) {
 #[derive(serde::Serialize)]
 struct FitRow<'a> {
     name: &'a str,
+    released_at: Option<i64>,
+    released_approx: bool,
     quant: &'a str,
     memory: &'a paddock_core::estimate::MemoryEstimate,
     speed: &'a paddock_core::estimate::SpeedEstimate,
@@ -104,6 +134,8 @@ pub fn print_fit_json(rows: &[ScoredModel]) -> anyhow::Result<()> {
         .iter()
         .map(|r| FitRow {
             name: &r.model.name,
+            released_at: r.model.released_at,
+            released_approx: r.model.released_approx,
             quant: &r.model.variants[r.variant_idx].quant,
             memory: &r.memory,
             speed: &r.speed,
@@ -186,5 +218,23 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         let cut: String = s.chars().take(n.saturating_sub(1)).collect();
         format!("{cut}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn age_label_cases() {
+        const NOW: i64 = 1_780_000_000;
+        const DAY: i64 = 86_400;
+        assert_eq!(age_label(None, false, NOW), "?");
+        assert_eq!(age_label(Some(NOW - 3 * DAY), false, NOW), "3d");
+        assert_eq!(age_label(Some(NOW - 20 * DAY), false, NOW), "2w");
+        assert_eq!(age_label(Some(NOW - 240 * DAY), false, NOW), "7mo");
+        assert_eq!(age_label(Some(NOW - 440 * DAY), false, NOW), "1.2y");
+        assert_eq!(age_label(Some(NOW - 440 * DAY), true, NOW), "~1.2y");
+        assert_eq!(age_label(Some(NOW + DAY), false, NOW), "0d"); // future clamps
     }
 }

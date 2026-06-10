@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
 use crate::app::ScoredModel;
-use crate::output::{gib, verdict_label};
+use crate::output::{age_label, gib, verdict_label};
 use crate::tui::state::{use_case_label, Mode, TuiState};
 
 /// Accent palette sampled from the paddock wordmark (deep indigo banner).
@@ -99,7 +99,11 @@ fn verdict_style(v: FitVerdict) -> Style {
 }
 
 fn draw_table(frame: &mut Frame, area: Rect, state: &TuiState) {
-    let header = Row::new(["MODEL", "QUANT", "MEMORY", "TOK/S", "FIT", "SCORE"]).style(
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let header = Row::new(["MODEL", "AGE", "QUANT", "MEMORY", "TOK/S", "FIT", "SCORE"]).style(
         Style::new()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
@@ -108,6 +112,7 @@ fn draw_table(frame: &mut Frame, area: Rect, state: &TuiState) {
         let v = &r.model.variants[r.variant_idx];
         Row::new(vec![
             Cell::from(r.model.name.clone()),
+            Cell::from(age_label(r.model.released_at, r.model.released_approx, now)),
             Cell::from(v.quant.clone()),
             Cell::from(gib(r.memory.total_bytes)),
             Cell::from(format!("{:.0}", r.speed.generation_tps)),
@@ -123,6 +128,7 @@ fn draw_table(frame: &mut Frame, area: Rect, state: &TuiState) {
         rows,
         [
             Constraint::Min(24),
+            Constraint::Length(6),
             Constraint::Length(9),
             Constraint::Length(10),
             Constraint::Length(6),
