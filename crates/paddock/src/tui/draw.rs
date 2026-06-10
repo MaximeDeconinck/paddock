@@ -1,5 +1,5 @@
 //! Pure rendering — reads state, never mutates it, no IO.
-//! Palette: DarkGray/Gray/White + a single Cyan accent.
+//! Palette: DarkGray/Gray/White + a single deep-blue accent.
 
 use paddock_core::catalog::RuntimeKind;
 use paddock_core::estimate::FitVerdict;
@@ -15,7 +15,11 @@ use crate::app::ScoredModel;
 use crate::output::{gib, verdict_label};
 use crate::tui::state::{use_case_label, Mode, TuiState};
 
-const ACCENT: Color = Color::Cyan;
+/// Accent palette sampled from the paddock wordmark (deep indigo banner).
+/// ACCENT for accented text on dark terminals (readable royal blue),
+/// ACCENT_DEEP as the selection background (white foreground on top).
+const ACCENT: Color = Color::Rgb(92, 102, 255);
+const ACCENT_DEEP: Color = Color::Rgb(26, 26, 110);
 
 pub fn draw(frame: &mut Frame, state: &TuiState, profile: &HardwareProfile) {
     let [header, table, footer] = Layout::vertical([
@@ -127,7 +131,7 @@ fn draw_table(frame: &mut Frame, area: Rect, state: &TuiState) {
         ],
     )
     .header(header)
-    .row_highlight_style(Style::new().fg(Color::Black).bg(ACCENT));
+    .row_highlight_style(Style::new().fg(Color::White).bg(ACCENT_DEEP));
     // Fresh TableState each frame: draw stays pure, ratatui recomputes the
     // scroll offset so the selected row is always visible.
     let mut ts = TableState::default().with_selected(Some(state.selected));
