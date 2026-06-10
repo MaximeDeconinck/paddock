@@ -7,9 +7,11 @@ use std::io::Write;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use tetro_core::catalog::CatalogModel;
-use tetro_core::runtime::{plan_run, InstallPlan, RunPlan};
+use tetro_core::catalog::{CatalogModel, RuntimeKind};
+use tetro_core::hardware::{RealSystemProbe, SystemProbe};
+use tetro_core::runtime::{plan_run, plan_serve, InstallPlan, RunPlan, ServePlan};
 use tetro_core::score::{best_variant, UseCase};
+use tetro_core::serving::{Registry, ServingRecord};
 use tetro_core::TetroError;
 
 use crate::app::App;
@@ -46,6 +48,7 @@ fn main() -> Result<()> {
             }
         }
         Some(Command::Run { model }) => run_model(&app, &model, cli.json)?,
+        Some(Command::Serve { model, port }) => serve_model(&app, &model, port, cli.json)?,
         Some(Command::Sync) => {
             let db = app.open_db()?;
             let http = tetro_core::catalog::hf::ReqwestClient::new()?;
@@ -93,11 +96,14 @@ fn fit(app: &App, all: bool, use_case: UseCase, limit: usize, json: bool) -> Res
     Ok(())
 }
 
-fn run_model(app: &App, query: &str, json: bool) -> Result<()> {
+/// Catalog lookup + best-fitting variant pick, shared by `run` and `serve`.
+/// Returns the model and the index into `model.variants` of the chosen quant.
+/// Exits the process on an ambiguous name (interactive disambiguation UX).
+fn resolve_model(app: &App, query: &str) -> Result<(CatalogModel, usize)> {
     let db = app.open_db()?;
     let models = db.list_models().context("reading catalog")?;
     let model = match find_model(&models, query) {
-        Lookup::Found(m) => m,
+        Lookup::Found(m) => m.clone(),
         Lookup::Ambiguous(names) => {
             eprintln!("model name `{query}` is ambiguous — candidates:");
             for n in names {
@@ -127,11 +133,15 @@ fn run_model(app: &App, query: &str, json: bool) -> Result<()> {
         .iter()
         .position(|v| std::ptr::eq(v, best))
         .expect("best_variant borrows from mvs");
-    let variant = &model.variants[best_idx];
+    Ok((model, best_idx))
+}
+
+fn run_model(app: &App, query: &str, json: bool) -> Result<()> {
+    let (model, idx) = resolve_model(app, query)?;
 
     // API delta vs the original plan: plan_run is fallible (repo-less HF/MLX
     // models, non-GGUF quants). Surface the actionable error and exit non-zero.
-    let plan: RunPlan = plan_run(model, variant, &app.profile.runtimes)?;
+    let plan: RunPlan = plan_run(&model, &model.variants[idx], &app.profile.runtimes)?;
 
     if json {
         // Machine mode never launches interactive processes.
@@ -141,6 +151,194 @@ fn run_model(app: &App, query: &str, json: bool) -> Result<()> {
 
     println!("$ {}", plan.display());
     launch(plan)
+}
+
+fn serve_model(app: &App, query: &str, port: Option<u16>, json: bool) -> Result<()> {
+    let (model, idx) = resolve_model(app, query)?;
+    let plan = plan_serve(&model, &model.variants[idx], &app.profile.runtimes, port)?;
+
+    if json {
+        // Machine mode: print the plan, zero side effects (no spawn, no pull).
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+        return Ok(());
+    }
+
+    serve_with_plan(plan)
+}
+
+/// Full serve lifecycle: confirm install, spawn the server child when needed,
+/// wait for readiness, run pre-steps (e.g. `ollama pull`), print the endpoint
+/// block, then wait on the child. Shared with the TUI (Task 3).
+pub(crate) fn serve_with_plan(plan: ServePlan) -> Result<()> {
+    if plan.port_ignored {
+        eprintln!("warning: --port is ignored for the Ollama daemon (fixed 11434)");
+    }
+    if let Some(install) = &plan.install {
+        confirm_and_install(install)?;
+    }
+
+    let mut child = match &plan.server_argv {
+        Some(argv) => {
+            eprintln!("$ {}", argv.join(" "));
+            Some(spawn_checked(argv)?)
+        }
+        None => None,
+    };
+
+    // Readiness + pre-steps; never leave an orphaned server behind on failure.
+    let prepared = wait_ready(&plan, child.as_mut()).and_then(|()| {
+        for step in &plan.pre_steps {
+            eprintln!("$ {}", step.join(" "));
+            run_checked(step)?;
+        }
+        Ok(())
+    });
+    if let Err(e) = prepared {
+        if let Some(c) = child.as_mut() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        return Err(e);
+    }
+
+    output::print_endpoint(&plan);
+
+    match child {
+        Some(mut c) => {
+            // Best-effort registry entry for tray/UIs; the guard unregisters
+            // on every exit path including `?`. SIGINT kills tetro and the
+            // child together (default tty behavior) without running Drop —
+            // the stale file is reaped by the next `list_live`.
+            let _guard = RegistryGuard::register(&plan, c.id());
+            eprintln!("serving — press Ctrl-C to stop");
+            let status = c.wait()?;
+            if !status.success() {
+                bail!("server exited with {status}");
+            }
+            Ok(())
+        }
+        // Ollama daemon keeps running; our job is done.
+        None => Ok(()),
+    }
+}
+
+/// Which runtime a ServePlan spawns, derived from its argv (registry label).
+fn serve_runtime_kind(plan: &ServePlan) -> RuntimeKind {
+    match plan
+        .server_argv
+        .as_ref()
+        .and_then(|a| a.first())
+        .map(String::as_str)
+    {
+        Some("llama-server") => RuntimeKind::LlamaCpp,
+        Some("mlx_lm.server") => RuntimeKind::MlxLm,
+        _ => RuntimeKind::Ollama,
+    }
+}
+
+/// RAII wrapper around the serving registry: best-effort register on
+/// creation, unregister on drop (normal return and `?` early-returns alike).
+struct RegistryGuard {
+    registry: Registry,
+    pid: u32,
+}
+
+impl RegistryGuard {
+    fn register(plan: &ServePlan, pid: u32) -> Self {
+        let registry = Registry::open_default();
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let record = ServingRecord {
+            pid,
+            runtime: serve_runtime_kind(plan),
+            endpoint: plan.endpoint.clone(),
+            openai_url: plan.openai_url.clone(),
+            model_ref: plan.model_ref.clone(),
+            ready_path: plan.ready_path.clone(),
+            started_at,
+        };
+        if let Err(e) = registry.register(&record) {
+            eprintln!("warning: could not record serving state: {e}");
+        }
+        Self { registry, pid }
+    }
+}
+
+impl Drop for RegistryGuard {
+    fn drop(&mut self) {
+        let _ = self.registry.unregister(self.pid);
+    }
+}
+
+/// Poll `{endpoint}{ready_path}` until it answers 2xx. llama-server may be
+/// DOWNLOADING a multi-GB model via `-hf` before /health stops returning 503,
+/// so its timeout is far more generous than the default.
+fn wait_ready(plan: &ServePlan, mut child: Option<&mut std::process::Child>) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let url = format!("{}{}", plan.endpoint, plan.ready_path);
+    let is_llama = serve_runtime_kind(plan) == RuntimeKind::LlamaCpp;
+    let timeout = if is_llama {
+        Duration::from_secs(600)
+    } else {
+        Duration::from_secs(15)
+    };
+    let start = Instant::now();
+    let mut notified = false;
+    loop {
+        if RealSystemProbe.http_get_local(&url).is_some() {
+            return Ok(());
+        }
+        if let Some(c) = child.as_deref_mut() {
+            if let Some(status) = c.try_wait()? {
+                let argv = plan.server_argv.as_deref().unwrap_or_default().join(" ");
+                bail!(
+                    "server exited with {status} before becoming ready — \
+                     run `{argv}` manually to see the error"
+                );
+            }
+        }
+        if start.elapsed() >= timeout {
+            break;
+        }
+        if is_llama && !notified && start.elapsed() >= Duration::from_secs(5) {
+            eprintln!("downloading/loading model — this can take a while");
+            notified = true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    match child {
+        Some(_) => bail!(
+            "server did not become ready within {}s ({url}); \
+             run it manually to see the error",
+            timeout.as_secs()
+        ),
+        None => bail!("ollama daemon not reachable on 11434 — is it running?"),
+    }
+}
+
+/// Spawn a server child, with an actionable error when the binary is missing.
+fn spawn_checked(argv: &[String]) -> Result<std::process::Child> {
+    std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to start {}: {e}. Is it in PATH?", argv[0]))
+}
+
+/// Run a pre-step to completion (stdout/stderr inherited — progress streams
+/// to the tty) and fail on non-zero exit.
+fn run_checked(argv: &[String]) -> Result<()> {
+    let cmd = argv.join(" ");
+    let status = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .status()
+        .with_context(|| format!("running `{cmd}`"))?;
+    if !status.success() {
+        bail!("`{cmd}` failed ({status}); fix it and retry");
+    }
+    Ok(())
 }
 
 /// Shared launch path for `tetro run` and the TUI: confirm any required

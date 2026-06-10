@@ -40,6 +40,13 @@ pub enum Command {
     },
     /// Launch a model with the best available runtime
     Run { model: String },
+    /// Serve a model over HTTP and print the endpoint (OpenAI-compatible)
+    Serve {
+        model: String,
+        /// Port for llama.cpp / mlx servers (Ollama always uses 11434)
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Refresh the model catalog
     Sync,
 }

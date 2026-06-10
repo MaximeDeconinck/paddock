@@ -2,13 +2,43 @@ use assert_cmd::Command;
 use tempfile::TempDir;
 
 /// Returns the command plus the tempdir guard that owns the isolated catalog
-/// DB; the caller binds the guard so the dir lives until the test ends.
+/// DB and serving registry; the caller binds the guard so the dir lives until
+/// the test ends.
 fn tetro() -> (Command, TempDir) {
     let mut c = Command::cargo_bin("tetro").unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("catalog.db");
-    c.env("TETRO_DB_PATH", &path);
+    c.env("TETRO_DB_PATH", dir.path().join("catalog.db"));
+    c.env("TETRO_SERVING_DIR", dir.path().join("serving"));
     (c, dir)
+}
+
+/// Seed the test catalog with one small Ollama-source model so serve/run
+/// planning works without network or a real sync.
+fn seed_one_model(dir: &std::path::Path) {
+    use tetro_core::catalog::{db::Db, CatalogModel, CatalogVariant, RuntimeKind, Source};
+    let db = Db::open(dir.join("catalog.db")).unwrap();
+    db.upsert_model(&CatalogModel {
+        id: 0,
+        name: "fake-model".into(),
+        family: Some("llama".into()),
+        source: Source::Ollama,
+        repo: None,
+        params_total: 1_000_000_000,
+        params_active: 1_000_000_000,
+        architecture: Some("llama".into()),
+        context_max: 8192,
+        variants: vec![CatalogVariant {
+            quant: "Q4_K_M".into(),
+            bpw: 4.83,
+            file_size_bytes: None,
+            layers: 16,
+            kv_heads: 8,
+            head_dim: 64,
+            embedding_dim: 2048,
+            runtime_compat: vec![RuntimeKind::Ollama],
+        }],
+    })
+    .unwrap();
 }
 
 #[test]
@@ -48,6 +78,37 @@ fn run_unknown_model_fails_actionably() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("tetro sync"));
+}
+
+#[test]
+fn serve_unknown_model_fails_actionably() {
+    let (mut cmd, _dir) = tetro();
+    cmd.args(["serve", "definitely-not-a-model"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("tetro sync"));
+}
+
+#[test]
+fn serve_json_prints_plan_without_side_effects() {
+    let (mut cmd, dir) = tetro();
+    seed_one_model(dir.path());
+    let out = cmd
+        .args(["serve", "fake-model", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert!(v["endpoint"]
+        .as_str()
+        .unwrap()
+        .starts_with("http://127.0.0.1:"));
+    assert!(v["openai_url"]
+        .as_str()
+        .unwrap()
+        .ends_with("/v1/chat/completions"));
+    assert!(v["model_ref"].is_string());
+    // zero side effects: no serving record was written
+    assert!(!dir.path().join("serving").exists());
 }
 
 #[test]

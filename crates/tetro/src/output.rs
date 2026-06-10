@@ -58,6 +58,19 @@ pub fn print_profile(p: &HardwareProfile) {
     println!("            {}", rt(&p.runtimes.mlx, "mlx-lm"));
 }
 
+/// The product output of `tetro serve`: where to point an OpenAI client.
+/// The curl line is display-only (single quotes are literal, no shell here).
+pub fn print_endpoint(plan: &tetro_core::runtime::ServePlan) {
+    println!("endpoint    {}", plan.endpoint);
+    println!("openai      {}", plan.openai_url);
+    println!("model       {}", plan.model_ref);
+    println!("try it      curl -s {} \\", plan.openai_url);
+    println!(
+        "              -d '{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hello\"}}]}}'",
+        plan.model_ref
+    );
+}
+
 pub fn print_fit_table(rows: &[ScoredModel]) {
     println!(
         "{:<32} {:<9} {:>9} {:>9}  {:<12} {:>5}",
