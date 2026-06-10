@@ -77,6 +77,22 @@ Auth: if the live API turns out to require the Docker token flow, add it inside 
 
 ---
 
+### Task C: Ollama library discovery (no curation needed)
+
+(Added 2026-06-10 after lfm2.5 report. PRE-VERIFIED live: index page `https://ollama.com/library` exposes 234 names via `href="/library/{name}"`; `registry.ollama.ai/v2/library/{name}/manifests/{tag}` gives the model blob digest+size; blob GET with `Range: bytes=0-262143` returns HTTP 206 with a parseable GGUF v3 header carrying general.architecture, *.block_count, *.attention.head_count_kv, *.embedding_length, *.context_length — verified on lfm2.5 (arch `lfm2moe`). User decision: enabled by default, top 60 of the index, `--discover-limit N` / `--no-discover`; Ollama Cloud models EXCLUDED (skip tags ending `-cloud`; skip models whose every quant-bearing tag is cloud).)
+
+**Files:** `crates/paddock-core/src/catalog/ollama_registry.rs` (+discovery fns), `catalog/mod.rs` (sync stage, SyncOptions.discover_limit: Option<usize> default Some(60)), `catalog/gguf.rs` (GgufMeta gains general.parameter_count), cli.rs/main.rs flags, README.
+
+- [ ] **C.1 (TDD)** `fetch_library_index(http) -> Result<Vec<String>>`: get_text on /library, extract names by URL pattern, dedup ordered (index order = popularity).
+- [ ] **C.2 (TDD)** `fetch_manifest_model_blob(http, base, tag) -> Result<(String, u64)>`: get_json with the Docker Accept header (extend HttpClient or use a URL that returns JSON without header? VERIFY: the earlier probe sent the Accept header — if get_json lacks header support, add `get_json_with_accept`), pick the layer whose mediaType contains "model".
+- [ ] **C.3 (TDD)** gguf.rs: `parameter_count: Option<u64>` (key `general.parameter_count`).
+- [ ] **C.4 (TDD)** `discover_model(http, name) -> Result<Option<CatalogModel>>`: tags page → quant-tag filtering PLUS skip tags ending `-cloud`; group by size prefix; for the first-seen size fetch the manifest of its preferred tag, Range 0..256KiB the blob, parse header → arch params; params_total = parameter_count, else blob_size×8/bpw, else size-token parse; params_active via `*.expert_used_count`/`*.expert_count` ratio when present (comment: rough MoE approximation); Ok(None) when: no non-cloud quant tags, or architecture in skiplist (bert, nomic-bert, clip — embeddings/vision out of scope), or header unparseable. One CatalogModel per size with variants per quant tag (source_tag set; file_size only for the probed tag).
+- [ ] **C.5 (TDD)** sync(): discovery stage after curated enrichment — index minus curated base names, take discover_limit, best-effort each, upsert; `SyncReport.discovered: usize`; skipped when discover_limit None.
+- [ ] **C.6** CLI `--discover-limit N` / `--no-discover`; summary gains `, D discovered`. README.
+- [ ] **C.7** REAL verification: `paddock sync` → lfm2.5 present, `paddock run lfm2.5 --json` shows a real tag ref; paste counts + duration. Gates + commit `feat: ollama library discovery via registry manifests and GGUF headers`.
+
+---
+
 ## Self-review notes
 - source_tag threading: CatalogVariant → db column (migration safe on old DBs) → runtime ollama_ref → CLI/TUI unchanged (they consume plan argv).
 - Tag explosion control: only tags matching the entry's size prefix + known quant suffix; `-text-`/`-base-` skipped; unknown quants skipped (no bpw → no estimate).
