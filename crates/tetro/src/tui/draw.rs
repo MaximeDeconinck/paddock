@@ -266,17 +266,26 @@ fn detail_lines<'a>(
     }
     // One-line serve hint right under the run command, plan-derived so the
     // endpoint shown is exactly the one `s` would serve on.
-    if let Some(Ok(sp)) = serve_plan {
-        let runtime = match sp.runtime {
-            RuntimeKind::Ollama => "ollama",
-            RuntimeKind::LlamaCpp => "llama.cpp",
-            RuntimeKind::MlxLm => "mlx-lm",
-        };
-        lines.push(Line::from(vec![
-            Span::styled("  s to serve on ", Style::new().fg(Color::DarkGray)),
-            Span::styled(sp.endpoint.clone(), Style::new().fg(ACCENT)),
-            Span::styled(format!(" ({runtime})"), Style::new().fg(Color::DarkGray)),
-        ]));
+    match serve_plan {
+        Some(Ok(sp)) => {
+            let runtime = match sp.runtime {
+                RuntimeKind::Ollama => "ollama",
+                RuntimeKind::LlamaCpp => "llama.cpp",
+                RuntimeKind::MlxLm => "mlx-lm",
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  s to serve on ", Style::new().fg(Color::DarkGray)),
+                Span::styled(sp.endpoint.clone(), Style::new().fg(ACCENT)),
+                Span::styled(format!(" ({runtime})"), Style::new().fg(Color::DarkGray)),
+            ]));
+        }
+        Some(Err(e)) => lines.push(Line::from(Span::styled(
+            format!("  {e}"),
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ))),
+        None => {}
     }
     if r.memory.verdict == FitVerdict::FitsWithSysctlTuning {
         let mb = r.memory.total_bytes / (1024 * 1024) + 1024;

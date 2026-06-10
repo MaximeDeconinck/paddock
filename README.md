@@ -115,7 +115,7 @@ try it      curl -s http://127.0.0.1:11434/v1/chat/completions \
 
 The lifecycle depends on the runtime:
 
-- **Ollama models** reuse the daemon: tetro starts `ollama serve` only if it isn't already running, pulls the model, prints the endpoint and exits — the daemon keeps serving in the background on its fixed port 11434.
+- **Ollama models** reuse the daemon: if it's already running, tetro pulls the model, prints the endpoint and exits — the daemon keeps serving in the background on its fixed port 11434. If tetro had to start it (`ollama serve` cold start), tetro stays attached and **Ctrl-C stops it**.
 - **llama.cpp / mlx-lm models** spawn a foreground server (`llama-server -hf …` / `mlx_lm.server --model …`), wait until it answers its readiness check, print the endpoint, and stay attached — **Ctrl-C stops the server**. llama-server may download the model first; tetro waits through that.
 
 `--port <N>` picks the port for foreground servers (default 8080). The Ollama daemon's port is fixed, so `--port` is ignored there with a warning. `--json` prints the full serve plan (argv, endpoint, pre-steps) without spawning or pulling anything.
