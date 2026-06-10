@@ -3,8 +3,13 @@
 //! epoch seconds" and "subtract relative ages".
 
 /// Days from civil date to 1970-01-01 (Howard Hinnant's algorithm), then to
-/// epoch seconds. Returns None for out-of-range month/day.
+/// epoch seconds. Returns None for out-of-range month/day. Years are bounded
+/// to a sane catalog range: years outside 1970..=9999 → None (also keeps the
+/// arithmetic far from i64 overflow on hostile input).
 pub fn ymd_to_epoch(y: i64, m: u32, d: u32) -> Option<i64> {
+    if !(1970..=9999).contains(&y) {
+        return None;
+    }
     if !(1..=12).contains(&m) {
         return None;
     }
@@ -69,19 +74,23 @@ pub fn parse_relative_ago(s: &str, now: i64) -> Option<i64> {
     }
     let mut it = s.split_whitespace();
     let n: i64 = it.next()?.parse().ok()?;
+    if n < 0 {
+        return None; // "-3 days ago" would be a future date
+    }
     let unit = it.next()?;
     if it.next() != Some("ago") {
         return None;
     }
-    let days = match unit.trim_end_matches('s') {
+    let unit = unit.strip_suffix('s').unwrap_or(unit);
+    let days = match unit {
         "day" => n,
-        "week" => n * 7,
-        "month" => n * 30,
-        "year" => n * 365,
+        "week" => n.checked_mul(7)?,
+        "month" => n.checked_mul(30)?,
+        "year" => n.checked_mul(365)?,
         "hour" | "minute" | "second" => 0,
         _ => return None,
     };
-    Some(now - days * DAY)
+    now.checked_sub(days.checked_mul(DAY)?)
 }
 
 /// Scan a page for every `"N unit ago"` mention and return the OLDEST as an
@@ -91,6 +100,13 @@ pub fn parse_relative_ago(s: &str, now: i64) -> Option<i64> {
 pub fn oldest_relative_date(html: &str, now: i64) -> Option<i64> {
     let mut oldest: Option<i64> = None;
     for (idx, _) in html.match_indices(" ago") {
+        // Require a word boundary after "ago" so "3 days agonizing" doesn't
+        // count: the next byte (if any) must not be alphanumeric.
+        if let Some(&b) = html.as_bytes().get(idx + 4) {
+            if b.is_ascii_alphanumeric() {
+                continue;
+            }
+        }
         // Walk back over "N unit " (max ~20 chars: "59 minutes").
         let start = html[..idx]
             .char_indices()
@@ -104,7 +120,7 @@ pub fn oldest_relative_date(html: &str, now: i64) -> Option<i64> {
         for (i, c) in window.char_indices() {
             if c.is_ascii_digit() {
                 if let Some(e) = parse_relative_ago(&window[i..], now) {
-                    oldest = Some(oldest.map_or(e, |o: i64| o.min(e)));
+                    oldest = Some(oldest.map_or(e, |o| o.min(e)));
                     break;
                 }
             }
@@ -126,6 +142,15 @@ mod tests {
         assert_eq!(ymd_to_epoch(2024, 13, 1), None);
         assert_eq!(ymd_to_epoch(2024, 0, 1), None);
         assert_eq!(ymd_to_epoch(2024, 2, 30), None);
+    }
+
+    #[test]
+    fn ymd_to_epoch_rejects_out_of_range_years() {
+        assert_eq!(ymd_to_epoch(i64::MAX, 1, 1), None);
+        assert_eq!(ymd_to_epoch(i64::MIN, 1, 1), None);
+        assert_eq!(ymd_to_epoch(1969, 12, 31), None);
+        assert_eq!(ymd_to_epoch(10_000, 1, 1), None);
+        assert_eq!(ymd_to_epoch(9999, 12, 31), Some(253_402_214_400));
     }
 
     #[test]
@@ -170,6 +195,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_relative_ago_rejects_hostile_input() {
+        const NOW: i64 = 1_780_000_000;
+        // Huge n must not overflow (panic in debug, wrap in release).
+        assert_eq!(parse_relative_ago("99999999999999999 years ago", NOW), None);
+        assert_eq!(
+            parse_relative_ago("9223372036854775807 days ago", NOW),
+            None
+        );
+        // Negative n would produce a future date.
+        assert_eq!(parse_relative_ago("-3 days ago", NOW), None);
+    }
+
+    #[test]
     fn oldest_relative_date_scans_whole_page() {
         const NOW: i64 = 1_780_000_000;
         let html = r#"
@@ -180,5 +218,38 @@ mod tests {
         // Oldest mention wins: 1 year ago.
         assert_eq!(oldest_relative_date(html, NOW), Some(NOW - 365 * 86_400));
         assert_eq!(oldest_relative_date("<html>no dates</html>", NOW), None);
+    }
+
+    #[test]
+    fn oldest_relative_date_requires_word_boundary_after_ago() {
+        const NOW: i64 = 1_780_000_000;
+        const DAY: i64 = 86_400;
+        // " ago" inside a longer word is not a date.
+        assert_eq!(
+            oldest_relative_date("we waited 3 days agonizing over it", NOW),
+            None
+        );
+        // Punctuation or markup right after "ago" is still a date.
+        assert_eq!(
+            oldest_relative_date("pushed 3 days ago.", NOW),
+            Some(NOW - 3 * DAY)
+        );
+        assert_eq!(
+            oldest_relative_date("<span>3 days ago</span>", NOW),
+            Some(NOW - 3 * DAY)
+        );
+        // End of string right after "ago" is fine too.
+        assert_eq!(oldest_relative_date("3 days ago", NOW), Some(NOW - 3 * DAY));
+    }
+
+    #[test]
+    fn oldest_relative_date_survives_hostile_numbers() {
+        const NOW: i64 = 1_780_000_000;
+        // Must not panic (debug overflow) on absurd counts. The 20-char window
+        // may salvage a smaller "N years ago" digit suffix, but the result must
+        // never be a wrapped future date.
+        let html = "<span>99999999999999999 years ago</span>";
+        let got = oldest_relative_date(html, NOW);
+        assert!(got.is_none_or(|e| e <= NOW));
     }
 }
