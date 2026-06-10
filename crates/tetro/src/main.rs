@@ -8,7 +8,7 @@ use std::io::Write;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use tetro_core::catalog::{CatalogModel, RuntimeKind};
+use tetro_core::catalog::CatalogModel;
 use tetro_core::hardware::{RealSystemProbe, SystemProbe};
 use tetro_core::runtime::{plan_run, plan_serve, InstallPlan, RunPlan, ServePlan};
 use tetro_core::score::{best_variant, UseCase};
@@ -260,24 +260,34 @@ impl Drop for RegistryGuard {
     }
 }
 
-/// Poll `{endpoint}{ready_path}` until it answers 2xx. llama-server may be
-/// DOWNLOADING a multi-GB model via `-hf` before /health stops returning 503,
-/// so its timeout is far more generous than the default.
+/// How long to wait for readiness. A spawned child gets no deadline at all:
+/// runtimes like `llama-server -hf` and mlx_lm.server may be DOWNLOADING a
+/// multi-GB model on first run (tens of minutes on slow links), and any fixed
+/// cap conflates "still downloading" with "hung". Liveness is covered by
+/// `try_wait` instead. Without a child the Ollama daemon is expected up
+/// already, so refusal should be near-instant.
+fn readiness_deadline(child_spawned: bool) -> Option<std::time::Duration> {
+    if child_spawned {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(3))
+    }
+}
+
+/// Poll `{endpoint}{ready_path}` until it answers 2xx. With a spawned child
+/// this loops indefinitely — the child exiting is the only failure mode; a
+/// notice after 5 s and a heartbeat every 60 s keep the user informed. Each
+/// iteration blocks at most ~800 ms (300 ms connect + 500 ms read in
+/// `http_get_local`, plus a 250 ms sleep), so Ctrl-C — which kills tetro and
+/// the child together via default tty behavior — feels instant.
 fn wait_ready(plan: &ServePlan, mut child: Option<&mut std::process::Child>) -> Result<()> {
     use std::time::{Duration, Instant};
 
     let url = format!("{}{}", plan.endpoint, plan.ready_path);
-    let is_llama = plan.runtime == RuntimeKind::LlamaCpp;
-    let timeout = if is_llama {
-        Duration::from_secs(600)
-    } else if child.is_none() {
-        // No child spawned: daemon expected up already; refusal is instant.
-        Duration::from_secs(3)
-    } else {
-        Duration::from_secs(15)
-    };
+    let deadline = readiness_deadline(child.is_some());
     let start = Instant::now();
     let mut notified = false;
+    let mut next_heartbeat = Duration::from_secs(60);
     loop {
         if RealSystemProbe.http_get_local(&url).is_some() {
             return Ok(());
@@ -291,22 +301,20 @@ fn wait_ready(plan: &ServePlan, mut child: Option<&mut std::process::Child>) -> 
                 );
             }
         }
-        if start.elapsed() >= timeout {
-            break;
+        if let Some(deadline) = deadline {
+            if start.elapsed() >= deadline {
+                bail!("ollama daemon not reachable on 11434 — is it running?");
+            }
         }
-        if is_llama && !notified && start.elapsed() >= Duration::from_secs(5) {
+        if !notified && start.elapsed() >= Duration::from_secs(5) {
             eprintln!("downloading/loading model — this can take a while");
             notified = true;
         }
+        if start.elapsed() >= next_heartbeat {
+            eprintln!("still waiting for {} — Ctrl-C to stop", plan.endpoint);
+            next_heartbeat += Duration::from_secs(60);
+        }
         std::thread::sleep(Duration::from_millis(250));
-    }
-    match child {
-        Some(_) => bail!(
-            "server did not become ready within {}s ({url}); \
-             run it manually to see the error",
-            timeout.as_secs()
-        ),
-        None => bail!("ollama daemon not reachable on 11434 — is it running?"),
     }
 }
 
@@ -504,5 +512,20 @@ mod tests {
     fn not_found_when_nothing_matches() {
         let models = vec![model("Llama3")];
         assert!(matches!(find_model(&models, "mistral"), Lookup::NotFound));
+    }
+
+    #[test]
+    fn spawned_child_waits_without_deadline() {
+        // First-run model downloads can take tens of minutes; any fixed cap
+        // would kill a healthy child mid-download.
+        assert_eq!(readiness_deadline(true), None);
+    }
+
+    #[test]
+    fn daemon_probe_keeps_short_deadline() {
+        assert_eq!(
+            readiness_deadline(false),
+            Some(std::time::Duration::from_secs(3))
+        );
     }
 }
