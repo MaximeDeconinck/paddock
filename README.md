@@ -181,6 +181,16 @@ Total memory is checked against a ladder, because "fits" is not binary on macOS:
 | 5–15 | usable |
 | < 5 | slow |
 
+### Scoring
+
+Four sub-scores (fit, speed, quality, context), each 0–100, combined as a **weighted geometric mean** — not an arithmetic average:
+
+```text
+total = 100 × Π (max(subscore, 1) / 100)^(weight / 100)
+```
+
+Geometric, because on a capable machine fit/speed/context all saturate near 100 for small models; with an arithmetic average a terrible quality score could only subtract its own weight, flooring totals around 75. With the geometric mean, one bad component drags the whole total down and saturated components can't compensate. The quality proxy is `log10(params)` normalized over the local-model range — 1B → 0, ~70B → 100 (clamped above) — minus a malus for sub-Q4/sub-Q3 quants. Fit is a gate, not a reward: fitting the GPU scores 85 plus up to 15 for headroom.
+
 ## Roadmap
 
 - **Tauri desktop app** on top of `tetro-core`

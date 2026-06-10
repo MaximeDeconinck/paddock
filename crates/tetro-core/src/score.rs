@@ -1,4 +1,19 @@
 //! Composite 0-100 scoring of model variants per use case.
+//!
+//! The total is a *weighted geometric mean* of the four sub-scores:
+//!
+//! ```text
+//! total = 100 × Π_i (max(s_i, 1) / 100)^(w_i / 100)    for i in {fit, speed, quality, context}
+//! ```
+//!
+//! Why geometric rather than arithmetic: on a capable machine fit/speed/context
+//! all saturate near 100 for small models, so under an arithmetic mean a terrible
+//! quality score could only subtract its own weight (e.g. ≤25 points in General),
+//! flooring totals around 75 and letting low-quality tiny models crowd the top.
+//! With a geometric mean a bad component drags the whole total down multiplicatively,
+//! and saturated components cannot compensate for it. The `max(s_i, 1)` floor avoids
+//! total annihilation when one sub-score is exactly 0 while still crushing it
+//! ((1/100)^0.25 ≈ 0.316).
 
 use serde::{Deserialize, Serialize};
 
@@ -80,9 +95,14 @@ pub fn score_variant(
     let quality = quality_subscore(v);
     let context = context_subscore(v.context_max);
     let w = weights(uc);
-    let total = ((w.fit * fit + w.speed * speed_s + w.quality * quality + w.context * context)
-        / 100.0)
-        .clamp(0.0, 100.0);
+    // Weighted geometric mean (see module docs): a bad component drags the total
+    // down; saturated components cannot compensate. max(s, 1) avoids total=0.
+    let total = (100.0
+        * (fit.max(1.0) / 100.0).powf(w.fit / 100.0)
+        * (speed_s.max(1.0) / 100.0).powf(w.speed / 100.0)
+        * (quality.max(1.0) / 100.0).powf(w.quality / 100.0)
+        * (context.max(1.0) / 100.0).powf(w.context / 100.0))
+    .clamp(0.0, 100.0);
     Score {
         total,
         fit,
@@ -92,7 +112,8 @@ pub fn score_variant(
     }
 }
 
-/// FitsGpu rewards memory headroom: 60 base + up to 40 for margin.
+/// FitsGpu: 85 base + up to 15 for margin. Once a model fits the GPU, extra
+/// headroom has little user value; fit acts as a gate, not a reward.
 fn fit_subscore(mem: &MemoryEstimate) -> f64 {
     match mem.verdict {
         FitVerdict::FitsGpu => {
@@ -101,7 +122,7 @@ fn fit_subscore(mem: &MemoryEstimate) -> f64 {
             } else {
                 0.0
             };
-            60.0 + 40.0 * margin.clamp(0.0, 1.0)
+            85.0 + 15.0 * margin.clamp(0.0, 1.0)
         }
         FitVerdict::FitsWithSysctlTuning => 45.0,
         FitVerdict::FitsRamOnly => 25.0,
@@ -131,10 +152,16 @@ fn speed_subscore(tps: f64) -> f64 {
     100.0
 }
 
-/// v0.1 proxy: log10(params) normalized 1B->0, 1T->100, minus low-quant malus.
+/// Quality curve bounds, calibrated to the local-model range:
+/// 1B (log10 = 9.0) -> 0, ~70B (log10 = 10.85) -> 100 (clamped above).
+const QUALITY_LOG10_MIN: f64 = 9.0;
+const QUALITY_LOG10_MAX: f64 = 10.85;
+
+/// v0.1 proxy: log10(params) normalized 1B->0, ~70B->100, minus low-quant malus.
 fn quality_subscore(v: &ModelVariant) -> f64 {
     let p = (v.params_total.max(1)) as f64;
-    let base = ((p.log10() - 9.0) / 3.0 * 100.0).clamp(0.0, 100.0);
+    let base = ((p.log10() - QUALITY_LOG10_MIN) / (QUALITY_LOG10_MAX - QUALITY_LOG10_MIN) * 100.0)
+        .clamp(0.0, 100.0);
     let malus = if v.bpw < QUALITY_MALUS_SUB_Q3_BPW {
         QUALITY_MALUS_SUB_Q3
     } else if v.bpw < QUALITY_MALUS_SUB_Q4_BPW {
@@ -289,6 +316,57 @@ mod tests {
     fn negative_tps_clamps_to_zero_subscore() {
         let s = speed_subscore(-10.0);
         assert_eq!(s, 0.0);
+    }
+
+    #[test]
+    fn saturated_subscores_cannot_carry_low_quality() {
+        // Tiny model on a capable machine: fit/speed/context saturate near 100,
+        // but quality ~5 must drag the geometric total well below the old ~75 floor.
+        let tiny = ModelVariant {
+            model_name: "llama3.2:1b".into(),
+            quant: "Q8_0".into(),
+            bpw: 8.5,
+            params_total: 1_240_000_000,
+            params_active: 1_240_000_000,
+            layers: 16,
+            kv_heads: 8,
+            head_dim: 64,
+            embedding_dim: 2048,
+            context_max: 131_072,
+        };
+        let s = score_of(&tiny, UseCase::General);
+        assert!(
+            s.total < 55.0,
+            "tiny low-quality model scored {} (expected < 55)",
+            s.total
+        );
+    }
+
+    #[test]
+    fn general_ranking_prefers_quality_when_speed_comparable() {
+        // 4.3B dense vs 30B-A3B-style MoE: both fit the GPU, both generate fast.
+        // The MoE's far higher quality must win the General ranking.
+        let small = variant("Q4_K_M", 4.83, 4_300_000_000);
+        let moe = ModelVariant {
+            model_name: "qwen3-30b-a3b".into(),
+            quant: "Q4_K_M".into(),
+            bpw: 4.83,
+            params_total: 30_500_000_000,
+            params_active: 3_300_000_000,
+            layers: 48,
+            kv_heads: 4,
+            head_dim: 128,
+            embedding_dim: 2048,
+            context_max: 131_072,
+        };
+        let s_small = score_of(&small, UseCase::General);
+        let s_moe = score_of(&moe, UseCase::General);
+        assert!(
+            s_moe.total > s_small.total,
+            "MoE {} must beat small dense {}",
+            s_moe.total,
+            s_small.total
+        );
     }
 
     #[test]
