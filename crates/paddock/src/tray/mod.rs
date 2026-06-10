@@ -126,7 +126,7 @@ mod macos {
 
     /// MenuModel → tray-icon menu + id→action map. Header/Info are disabled
     /// items; Model rows are clickable and copy their URL. The footer
-    /// (separator + Rafraîchir + Quitter) is owned by this layer.
+    /// (separator + Refresh + Quit) is owned by this layer.
     fn render(model: &MenuModel) -> (Menu, HashMap<MenuId, Action>) {
         let menu = Menu::new();
         let mut actions = HashMap::new();
@@ -147,10 +147,10 @@ mod macos {
             }
         }
         append(&PredefinedMenuItem::separator());
-        let refresh = MenuItem::new("Rafraîchir", true, None);
+        let refresh = MenuItem::new("Refresh", true, None);
         actions.insert(refresh.id().clone(), Action::Refresh);
         append(&refresh);
-        let quit = MenuItem::new("Quitter paddock", true, None);
+        let quit = MenuItem::new("Quit paddock", true, None);
         actions.insert(quit.id().clone(), Action::Quit);
         append(&quit);
         (menu, actions)

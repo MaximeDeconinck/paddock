@@ -140,7 +140,7 @@ Some Hugging Face repos ship their vision projector as a separate `mmproj-*.gguf
 paddock tray
 ```
 
-Puts a small "P" in the macOS menu bar listing every active serve endpoint. Discovery is hybrid: servers launched by `paddock serve` (llama-server, mlx-lm, an `ollama serve` booted by paddock) plus whatever the local Ollama daemon reports via `/api/ps` — so models loaded outside paddock show up too. Each section is `runtime — host:port` with one row per model; **clicking a model row copies its OpenAI-compatible URL** to the clipboard. "Rafraîchir" re-scans immediately; otherwise the menu refreshes every 5 seconds.
+Puts a small "P" in the macOS menu bar listing every active serve endpoint. Discovery is hybrid: servers launched by `paddock serve` (llama-server, mlx-lm, an `ollama serve` booted by paddock) plus whatever the local Ollama daemon reports via `/api/ps` — so models loaded outside paddock show up too. Each section is `runtime — host:port` with one row per model; **clicking a model row copies its OpenAI-compatible URL** to the clipboard. "Refresh" re-scans immediately; otherwise the menu refreshes every 5 seconds.
 
 v1 limits: macOS only, no stop-server action, no login item (launch it manually), and running two instances gives you two icons.
 

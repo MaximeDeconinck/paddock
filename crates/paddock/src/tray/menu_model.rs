@@ -32,7 +32,7 @@ pub struct MenuModel {
 /// Merge paddock-launched servers (registry) with live Ollama state (`/api/ps`)
 /// into a flat list of menu entries. `ollama_ps: None` means the daemon is
 /// unreachable; the section only exists at all when Ollama is installed.
-/// The footer (Rafraîchir/Quitter) belongs to the rendering layer, not here.
+/// The footer (Refresh/Quit) belongs to the rendering layer, not here.
 pub fn build_menu_model(
     records: &[ServingRecord],
     ollama_ps: Option<&[LoadedModel]>,
@@ -56,7 +56,7 @@ pub fn build_menu_model(
             }
             Some(_) => {
                 entries.push(MenuEntry::Header(format!("Ollama — {OLLAMA_HOST}")));
-                entries.push(MenuEntry::Info("aucun modèle chargé".into()));
+                entries.push(MenuEntry::Info("no model loaded".into()));
             }
             None => entries.push(MenuEntry::Info("Ollama — injoignable".into())),
         }
@@ -154,7 +154,7 @@ mod tests {
             m.entries,
             vec![
                 MenuEntry::Header("Ollama — 127.0.0.1:11434".into()),
-                MenuEntry::Info("aucun modèle chargé".into()),
+                MenuEntry::Info("no model loaded".into()),
             ]
         );
     }
