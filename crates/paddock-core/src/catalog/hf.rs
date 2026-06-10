@@ -230,7 +230,9 @@ async fn fetch_hf_repo(
         params_active: moe_active_params(repo, params_total),
         architecture,
         context_max: if context_max == 0 { 4096 } else { context_max },
-        released_at: None,
+        released_at: detail["createdAt"]
+            .as_str()
+            .and_then(super::dates::parse_iso_date_prefix),
         released_approx: false,
         variants,
     }))
@@ -323,7 +325,9 @@ pub async fn fetch_mlx(
             params_active: moe_active_params(repo, params_total),
             architecture: config["model_type"].as_str().map(String::from),
             context_max: context,
-            released_at: None,
+            released_at: item["createdAt"]
+                .as_str()
+                .and_then(super::dates::parse_iso_date_prefix),
             released_approx: false,
             variants: vec![CatalogVariant {
                 quant,
@@ -470,6 +474,7 @@ mod tests {
                 &detail_url,
                 json!({
                     "id": repo,
+                    "createdAt": "2024-03-07T15:45:34.000Z",
                     "gguf": {
                         "architecture": "llama",
                         "context_length": 131072,
@@ -501,6 +506,12 @@ mod tests {
             assert_eq!(v.kv_heads, 8);
             assert_eq!(v.head_dim, 128);
         }
+        // createdAt → released_at (exact, day precision)
+        assert_eq!(
+            m.released_at,
+            crate::catalog::dates::ymd_to_epoch(2024, 3, 7)
+        );
+        assert!(!m.released_approx);
     }
 
     #[tokio::test]
@@ -539,6 +550,9 @@ mod tests {
         assert_eq!(m.variants.len(), 1);
         assert_eq!(m.variants[0].quant, "UD-Q4_K_M");
         assert_eq!(m.variants[0].runtime_compat, vec![RuntimeKind::LlamaCpp]);
+        // Detail JSON without createdAt → no release date.
+        assert_eq!(m.released_at, None);
+        assert!(!m.released_approx);
     }
 
     #[test]
@@ -593,7 +607,10 @@ mod tests {
         let config_url = format!("https://huggingface.co/{repo}/resolve/main/config.json");
 
         let http = MockHttp::new()
-            .add_json(&list_url, json!([{"id": repo}]))
+            .add_json(
+                &list_url,
+                json!([{"id": repo, "createdAt": "2024-03-07T15:45:34.000Z"}]),
+            )
             .add_json(
                 &config_url,
                 json!({
@@ -617,6 +634,39 @@ mod tests {
         assert_eq!(v.layers, 32);
         assert_eq!(v.kv_heads, 8);
         assert_eq!(v.head_dim, 128); // 4096 / 32
+                                     // createdAt from the list item → released_at (exact, day precision)
+        assert_eq!(
+            m.released_at,
+            crate::catalog::dates::ymd_to_epoch(2024, 3, 7)
+        );
+        assert!(!m.released_approx);
+    }
+
+    #[tokio::test]
+    async fn fetch_mlx_without_created_at_has_no_release_date() {
+        let list_url = format!("{HF_API}/models?author=mlx-community&sort=downloads&limit=1");
+        let repo = "mlx-community/Qwen2.5-7B-Instruct-4bit";
+        let config_url = format!("https://huggingface.co/{repo}/resolve/main/config.json");
+
+        let http = MockHttp::new()
+            .add_json(&list_url, json!([{"id": repo}]))
+            .add_json(
+                &config_url,
+                json!({
+                    "model_type": "qwen2",
+                    "num_hidden_layers": 28,
+                    "num_attention_heads": 28,
+                    "num_key_value_heads": 4,
+                    "hidden_size": 3584,
+                    "max_position_embeddings": 131072,
+                    "quantization": {"bits": 4}
+                }),
+            );
+
+        let models = fetch_mlx(&http, 1).await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].released_at, None);
+        assert!(!models[0].released_approx);
     }
 
     #[tokio::test]
