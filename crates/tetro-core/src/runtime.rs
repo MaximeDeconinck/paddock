@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::catalog::{self, CatalogModel, CatalogVariant, RuntimeKind, Source};
 use crate::error::TetroError;
+use crate::estimate::DEFAULT_CONTEXT;
 use crate::hardware::RuntimesStatus;
 
 #[derive(Debug, Clone, Serialize)]
@@ -77,8 +78,21 @@ pub fn plan_run(
             // mmproj vision files, ollama/ollama#15447): llama.cpp only.
             if !variant.runtime_compat.contains(&RuntimeKind::Ollama) {
                 let model_ref = format!("{repo}:{}", variant.quant);
+                // `-c` aligns runtime memory with the fit verdict's context
+                // assumption: llama-cli defaults --ctx-size to 0 = the model's
+                // full context, which can be 262k → tens of GB of KV cache.
+                // `--no-mmproj` skips the vision tower — text-only in v0.1,
+                // and the estimator doesn't count vision weights (flag
+                // verified present in llama.cpp b9580 for both binaries).
                 return Ok(RunPlan {
-                    argv: s(&["llama-cli", "-hf", &model_ref]),
+                    argv: s(&[
+                        "llama-cli",
+                        "-hf",
+                        &model_ref,
+                        "-c",
+                        &DEFAULT_CONTEXT.to_string(),
+                        "--no-mmproj",
+                    ]),
                     install: (!rt.llama_cpp.installed).then(llama_cpp_install),
                 });
             }
@@ -264,12 +278,21 @@ fn llama_server_plan(
     install: Option<InstallPlan>,
 ) -> ServePlan {
     ServePlan {
+        // `-c` aligns runtime memory with the fit verdict's context
+        // assumption: llama-server defaults --ctx-size to 0 = the model's
+        // full context, which can be 262k → tens of GB of KV cache.
+        // `--no-mmproj` skips the vision tower — text-only in v0.1, and the
+        // estimator doesn't count vision weights (flag verified present in
+        // llama.cpp b9580 for both binaries).
         server_argv: Some(s(&[
             "llama-server",
             "-hf",
             &hf_ref,
             "--port",
             &port.to_string(),
+            "-c",
+            &DEFAULT_CONTEXT.to_string(),
+            "--no-mmproj",
         ])),
         pre_steps: vec![],
         endpoint: local.to_string(),
@@ -510,6 +533,9 @@ mod tests {
                 "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M".to_string(),
                 "--port".to_string(),
                 "8080".to_string(),
+                "-c".to_string(),
+                "8192".to_string(),
+                "--no-mmproj".to_string(),
             ])
         );
         assert!(p.pre_steps.is_empty());
@@ -620,6 +646,9 @@ mod tests {
                 "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_M".to_string(),
                 "--port".to_string(),
                 "8080".to_string(),
+                "-c".to_string(),
+                "8192".to_string(),
+                "--no-mmproj".to_string(),
             ])
         );
         assert!(
@@ -665,7 +694,10 @@ mod tests {
             vec![
                 "llama-cli",
                 "-hf",
-                "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_M"
+                "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_M",
+                "-c",
+                "8192",
+                "--no-mmproj"
             ]
         );
         assert!(plan.install.is_none());
