@@ -55,7 +55,7 @@ runtimes    ollama 0.30.6 (running)
 
 ```text
 $ paddock sync
-synced: 78 curated (461 ollama tags), 43 discovered, 85 huggingface, 20 mlx
+synced: 78 curated (461 ollama tags), 44 discovered, 84 huggingface, 20 mlx
 ```
 
 Four sources:
@@ -73,18 +73,20 @@ Flags: `--hf-limit N` (default 100) and `--mlx-limit N` (default 60) bound the n
 
 ```text
 $ paddock fit -n 8
-MODEL                            QUANT        MEMORY     TOK/S  FIT          SCORE
-gpt-oss-20b-MXFP4-Q8             MLX_4BIT   11.8 GiB        57  fits            81
-Qwen3.6-35B-A3B-Uncensored-Hauh… Q4_K_M     21.9 GiB        64  fits            79
-Qwen3.6-35B-A3B-GGUF             Q4_K_M     21.9 GiB        64  fits            79
-Qwen3.6-35B-A3B-MTP-GGUF         Q4_K_M     22.4 GiB        64  fits            79
-llama3.2:3b                      Q4_K_M      3.3 GiB        59  fits            78
-Qwen3-30B-A3B-Instruct-2507-GGUF Q5_K_M     22.1 GiB        49  fits            77
-gemma3:4b                        Q4_K_M      4.1 GiB        44  fits            77
-phi3:3.8b                        Q4_K_M      5.7 GiB        50  fits            76
+MODEL                               AGE QUANT        MEMORY     TOK/S  FIT          SCORE
+nemotron3:33b                         ? Q4_K_M     21.2 GiB        49  fits            91
+nemotron-cascade-2:30b                ? Q4_K_M     23.4 GiB        52  fits            90
+glm-4.7-flash:q4_K_M                ~5d Q4_K_M     21.1 GiB        41  fits            89
+qwen3-coder:30b                    ~7mo Q4_K_M     18.9 GiB        40  fits            89
+Qwen3.6-35B-A3B-Uncensored-Hauh…     7w Q4_K_M     21.3 GiB        25  fits            86
+Qwen3.6-35B-A3B-GGUF                 7w Q4_K_M     21.3 GiB        25  fits            86
+Qwen3.6-35B-A3B-MTP-GGUF             4w UD-Q4_K_XL  23.3 GiB        24  fits            85
+gpt-oss:20b                        ~7mo Q4_K_M     14.2 GiB        27  fits            85
 ```
 
 For each model paddock picks the best quantization that fits — starting from the highest-quality quant and walking down toward Q2 only as memory demands — then estimates memory and speed and ranks. `--all` includes models that don't fit, `--use-case coding|chat|reasoning|general` changes the scoring weights, `-n` limits rows.
+
+Ranking is age-aware: the quality sub-score takes a progressive malus once a model is older than six months (−10 points per year, capped at −20), so a year-old model sinks below a fresh one of comparable size without disappearing from the list. The AGE column shows how old each model is — `~` marks approximate dates (inferred from the Ollama tags page), `?` means no release date is known.
 
 ### `paddock recommend` — top 5 with reasons
 
