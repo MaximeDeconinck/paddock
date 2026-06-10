@@ -10,7 +10,7 @@ use crate::output::gib;
 const OLLAMA_HOST: &str = "127.0.0.1:11434";
 const OLLAMA_OPENAI_URL: &str = "http://127.0.0.1:11434/v1/chat/completions";
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MenuEntry {
     /// Disabled section header, e.g. "Ollama — 127.0.0.1:11434".
     Header(String),
@@ -24,6 +24,7 @@ pub enum MenuEntry {
     Separator,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct MenuModel {
     pub entries: Vec<MenuEntry>,
 }

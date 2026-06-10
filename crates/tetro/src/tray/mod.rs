@@ -12,7 +12,7 @@ mod macos {
     use tao::event::{Event, StartCause};
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
     use tetro_core::hardware::runtimes::detect_runtimes;
-    use tetro_core::hardware::RealSystemProbe;
+    use tetro_core::hardware::{RealSystemProbe, RuntimesStatus};
     use tetro_core::serving::{ollama_loaded_models, Registry};
     use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
     use tray_icon::{TrayIcon, TrayIconBuilder};
@@ -42,8 +42,13 @@ mod macos {
             let _ = proxy.send_event(UserEvent::Menu(e));
         }));
 
+        // Installed-ness is stable for the process lifetime: detect runtimes
+        // once here instead of on every refresh tick.
+        let runtimes = detect_runtimes(&RealSystemProbe);
+
         let mut tray: Option<TrayIcon> = None;
         let mut actions: HashMap<MenuId, Action> = HashMap::new();
+        let mut prev_model: Option<MenuModel> = None;
         let mut next_refresh = Instant::now() + REFRESH_EVERY;
 
         event_loop.run(move |event, _, control_flow| {
@@ -51,8 +56,10 @@ mod macos {
                 // Create the tray icon once the loop actually runs
                 // (tray-icon issue #90: creating it earlier can hide it).
                 Event::NewEvents(StartCause::Init) => {
-                    let (menu, map) = render(&refresh_model());
+                    let model = refresh_model(&runtimes);
+                    let (menu, map) = render(&model);
                     actions = map;
+                    prev_model = Some(model);
                     tray = Some(
                         TrayIconBuilder::new()
                             .with_menu(Box::new(menu))
@@ -65,13 +72,13 @@ mod macos {
                     next_refresh = Instant::now() + REFRESH_EVERY;
                 }
                 Event::NewEvents(_) if Instant::now() >= next_refresh => {
-                    refresh_into(tray.as_ref(), &mut actions);
+                    refresh_into(tray.as_ref(), &mut actions, &runtimes, &mut prev_model);
                     next_refresh = Instant::now() + REFRESH_EVERY;
                 }
                 Event::UserEvent(UserEvent::Menu(e)) => match actions.get(e.id()) {
                     Some(Action::Copy(url)) => copy_to_clipboard(url),
                     Some(Action::Refresh) => {
-                        refresh_into(tray.as_ref(), &mut actions);
+                        refresh_into(tray.as_ref(), &mut actions, &runtimes, &mut prev_model);
                         next_refresh = Instant::now() + REFRESH_EVERY;
                     }
                     Some(Action::Quit) => {
@@ -87,21 +94,34 @@ mod macos {
         })
     }
 
-    /// Probe the world: installed runtimes, live registry records, Ollama ps.
-    fn refresh_model() -> MenuModel {
+    /// Probe the live state: registry records + Ollama ps. `runtimes` is
+    /// detected once by the caller (installed-ness is stable for the process
+    /// lifetime), so each tick only does the fast, bounded-timeout probes.
+    fn refresh_model(runtimes: &RuntimesStatus) -> MenuModel {
         let probe = RealSystemProbe;
-        let runtimes = detect_runtimes(&probe);
         let records = Registry::open_default().list_live(&probe);
         let ps = ollama_loaded_models(&probe);
-        build_menu_model(&records, ps.as_deref(), &runtimes)
+        build_menu_model(&records, ps.as_deref(), runtimes)
     }
 
-    fn refresh_into(tray: Option<&TrayIcon>, actions: &mut HashMap<MenuId, Action>) {
-        let (menu, map) = render(&refresh_model());
+    fn refresh_into(
+        tray: Option<&TrayIcon>,
+        actions: &mut HashMap<MenuId, Action>,
+        runtimes: &RuntimesStatus,
+        prev_model: &mut Option<MenuModel>,
+    ) {
+        let model = refresh_model(runtimes);
+        // Unchanged content: keep the existing menu and id→action map valid
+        // (no flicker, and in-flight clicks keep resolving).
+        if prev_model.as_ref() == Some(&model) {
+            return;
+        }
+        let (menu, map) = render(&model);
         *actions = map;
         if let Some(t) = tray {
             t.set_menu(Some(Box::new(menu)));
         }
+        *prev_model = Some(model);
     }
 
     /// MenuModel → tray-icon menu + id→action map. Header/Info are disabled
