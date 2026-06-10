@@ -49,6 +49,19 @@ fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| x.to_string()).collect()
 }
 
+/// Ollama library reference for a variant: `{base}:{source_tag}` when the
+/// catalog carries the exact library tag (registry-enriched variants), else
+/// the curated model name as-is (e.g. `llama3.1:8b`).
+fn ollama_ref(model: &CatalogModel, variant: &CatalogVariant) -> String {
+    match &variant.source_tag {
+        Some(tag) => {
+            let base = model.name.split(':').next().unwrap_or(&model.name);
+            format!("{base}:{tag}")
+        }
+        None => model.name.clone(),
+    }
+}
+
 /// Hybrid run strategy (see README): prefer Ollama for GGUF, mlx_lm for MLX.
 /// mlx-lm chat command verified against ml-explore/mlx-lm README (2026-06).
 pub fn plan_run(
@@ -68,7 +81,7 @@ pub fn plan_run(
             })
         }
         Source::Ollama => Ok(RunPlan {
-            argv: s(&["ollama", "run", &model.name]),
+            argv: s(&["ollama", "run", &ollama_ref(model, variant)]),
             install: (!rt.ollama.installed).then(ollama_install),
         }),
         Source::HuggingFace => {
@@ -235,7 +248,7 @@ pub fn plan_serve(
             }
             let model_ref = match hf_ref {
                 Some(hf_ref) => format!("hf.co/{hf_ref}"),
-                None => model.name.clone(),
+                None => ollama_ref(model, variant),
             };
             Ok(ServePlan {
                 server_argv: (!rt.ollama.running).then(|| s(&["ollama", "serve"])),
@@ -339,6 +352,7 @@ mod tests {
             head_dim: 128,
             embedding_dim: 4096,
             runtime_compat: compat,
+            source_tag: None,
         }
     }
 
@@ -376,6 +390,41 @@ mod tests {
         m.name = "llama3.1:8b".into();
         let plan = plan_run(&m, &m.variants[0], &with_ollama()).unwrap();
         assert_eq!(plan.argv, vec!["ollama", "run", "llama3.1:8b"]);
+    }
+
+    /// Curated Ollama model enriched with an exact library tag.
+    fn enriched_ollama_model() -> CatalogModel {
+        let mut m = hf_model();
+        m.source = Source::Ollama;
+        m.repo = None;
+        m.name = "llama3.1:8b".into();
+        m.variants[0].source_tag = Some("8b-instruct-q4_K_M".into());
+        m
+    }
+
+    #[test]
+    fn run_enriched_ollama_variant_uses_exact_source_tag() {
+        let m = enriched_ollama_model();
+        let plan = plan_run(&m, &m.variants[0], &with_ollama()).unwrap();
+        assert_eq!(
+            plan.argv,
+            vec!["ollama", "run", "llama3.1:8b-instruct-q4_K_M"]
+        );
+    }
+
+    #[test]
+    fn serve_enriched_ollama_variant_pulls_exact_source_tag() {
+        let m = enriched_ollama_model();
+        let p = plan_serve(&m, &m.variants[0], &with_ollama(), None).unwrap();
+        assert_eq!(
+            p.pre_steps,
+            vec![vec![
+                "ollama".to_string(),
+                "pull".to_string(),
+                "llama3.1:8b-instruct-q4_K_M".to_string()
+            ]]
+        );
+        assert_eq!(p.model_ref, "llama3.1:8b-instruct-q4_K_M");
     }
 
     #[test]

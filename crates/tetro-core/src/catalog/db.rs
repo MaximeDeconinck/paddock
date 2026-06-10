@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS variants (
     head_dim INTEGER NOT NULL,
     embedding_dim INTEGER NOT NULL,
     runtime_compat TEXT NOT NULL,
+    source_tag TEXT,
     UNIQUE(model_id, quant)
 );
 ";
@@ -56,6 +57,13 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
+        // Migration for DBs created before source_tag existed. SQLite has no
+        // ADD COLUMN IF NOT EXISTS, so ignore the duplicate-column error.
+        if let Err(e) = conn.execute("ALTER TABLE variants ADD COLUMN source_tag TEXT", []) {
+            if !e.to_string().contains("duplicate column name") {
+                return Err(e.into());
+            }
+        }
         Ok(Self { conn })
     }
 
@@ -88,13 +96,13 @@ impl Db {
             let compat = serde_json::to_string(&v.runtime_compat)
                 .map_err(|e| TetroError::Other(e.to_string()))?;
             tx.execute(
-                "INSERT INTO variants (model_id, quant, bpw, file_size_bytes, layers, kv_heads, head_dim, embedding_dim, runtime_compat)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "INSERT INTO variants (model_id, quant, bpw, file_size_bytes, layers, kv_heads, head_dim, embedding_dim, runtime_compat, source_tag)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(model_id, quant) DO UPDATE SET
                    bpw=excluded.bpw, file_size_bytes=excluded.file_size_bytes,
                    layers=excluded.layers, kv_heads=excluded.kv_heads,
                    head_dim=excluded.head_dim, embedding_dim=excluded.embedding_dim,
-                   runtime_compat=excluded.runtime_compat",
+                   runtime_compat=excluded.runtime_compat, source_tag=excluded.source_tag",
                 params![
                     id,
                     v.quant,
@@ -105,6 +113,7 @@ impl Db {
                     v.head_dim,
                     v.embedding_dim,
                     compat,
+                    v.source_tag,
                 ],
             )?;
         }
@@ -151,7 +160,7 @@ impl Db {
             })?
             .collect::<Result<_, _>>()?;
         let mut vstmt = self.conn.prepare(
-            "SELECT quant, bpw, file_size_bytes, layers, kv_heads, head_dim, embedding_dim, runtime_compat
+            "SELECT quant, bpw, file_size_bytes, layers, kv_heads, head_dim, embedding_dim, runtime_compat, source_tag
              FROM variants WHERE model_id = ?1",
         )?;
         for m in &mut models {
@@ -169,6 +178,7 @@ impl Db {
                             &r.get::<_, String>(7)?,
                         )
                         .unwrap_or_default(),
+                        source_tag: r.get(8)?,
                     })
                 })?
                 .collect::<Result<_, _>>()?;
@@ -239,6 +249,7 @@ mod tests {
                 head_dim: 128,
                 embedding_dim: 4096,
                 runtime_compat: vec![RuntimeKind::Ollama],
+                source_tag: None,
             }],
         }
     }
@@ -269,6 +280,7 @@ mod tests {
             head_dim: 128,
             embedding_dim: 4096,
             runtime_compat: vec![RuntimeKind::Ollama],
+            source_tag: None,
         });
         db.upsert_model(&m).unwrap();
         let models = db.list_models().unwrap();
@@ -280,6 +292,86 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].variants.len(), 1);
         assert_eq!(models[0].variants[0].quant, "Q4_K_M");
+    }
+
+    #[test]
+    fn source_tag_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("catalog.db")).unwrap();
+        let mut m = sample_model();
+        m.variants[0].source_tag = Some("8b-instruct-q4_K_M".into());
+        db.upsert_model(&m).unwrap();
+        let models = db.list_models().unwrap();
+        assert_eq!(
+            models[0].variants[0].source_tag.as_deref(),
+            Some("8b-instruct-q4_K_M")
+        );
+
+        // Upsert back to None must clear the stored tag.
+        db.upsert_model(&sample_model()).unwrap();
+        let models = db.list_models().unwrap();
+        assert_eq!(models[0].variants[0].source_tag, None);
+    }
+
+    #[test]
+    fn open_migrates_pre_source_tag_db() {
+        // Build a DB file with the OLD schema (no source_tag column), as
+        // shipped before the ollama tag enrichment.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE models (
+                     id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     family TEXT,
+                     source TEXT NOT NULL,
+                     repo TEXT,
+                     params_total INTEGER NOT NULL,
+                     params_active INTEGER NOT NULL,
+                     architecture TEXT,
+                     context_max INTEGER NOT NULL,
+                     UNIQUE(source, name)
+                 );
+                 CREATE TABLE variants (
+                     id INTEGER PRIMARY KEY,
+                     model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+                     quant TEXT NOT NULL,
+                     bpw REAL NOT NULL,
+                     file_size_bytes INTEGER,
+                     layers INTEGER NOT NULL,
+                     kv_heads INTEGER NOT NULL,
+                     head_dim INTEGER NOT NULL,
+                     embedding_dim INTEGER NOT NULL,
+                     runtime_compat TEXT NOT NULL,
+                     UNIQUE(model_id, quant)
+                 );
+                 INSERT INTO models (name, family, source, repo, params_total, params_active, architecture, context_max)
+                 VALUES ('llama3.1:8b', 'llama', 'ollama', NULL, 8030000000, 8030000000, 'llama', 131072);
+                 INSERT INTO variants (model_id, quant, bpw, file_size_bytes, layers, kv_heads, head_dim, embedding_dim, runtime_compat)
+                 VALUES (1, 'Q4_K_M', 4.83, NULL, 32, 8, 128, 4096, '[\"ollama\"]');",
+            )
+            .unwrap();
+        }
+
+        // Reopen via Db::open: migration adds the column, everything works.
+        let db = Db::open(&path).unwrap();
+        let models = db.list_models().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].variants[0].source_tag, None);
+
+        let mut m = sample_model();
+        m.variants[0].source_tag = Some("8b".into());
+        db.upsert_model(&m).unwrap();
+        let models = db.list_models().unwrap();
+        assert_eq!(models[0].variants[0].source_tag.as_deref(), Some("8b"));
+
+        // Re-opening an already-migrated DB must not error (duplicate column).
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.list_models().unwrap().len(), 1);
     }
 
     #[test]

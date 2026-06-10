@@ -44,6 +44,7 @@ pub fn curated_ollama_models() -> Vec<CatalogModel> {
                 head_dim: e.head_dim,
                 embedding_dim: e.embedding_dim,
                 runtime_compat: vec![RuntimeKind::Ollama],
+                source_tag: None,
             }],
         })
         .collect()

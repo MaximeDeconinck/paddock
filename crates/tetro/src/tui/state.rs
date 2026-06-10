@@ -252,6 +252,7 @@ mod tests {
                 head_dim: 128,
                 embedding_dim: 4096,
                 runtime_compat: vec![RuntimeKind::Ollama],
+                source_tag: None,
             }],
         };
         let budget = MemoryBudget {

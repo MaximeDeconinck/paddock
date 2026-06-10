@@ -2,6 +2,7 @@ pub mod curated;
 pub mod db;
 pub mod gguf;
 pub mod hf;
+pub mod ollama_registry;
 
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +34,10 @@ pub struct CatalogVariant {
     pub head_dim: u32,
     pub embedding_dim: u32,
     pub runtime_compat: Vec<RuntimeKind>,
+    /// Exact Ollama library tag (e.g. `8b-instruct-q4_K_M`) for
+    /// `ollama run {base}:{tag}`; None for curated-offline/HF/MLX variants.
+    #[serde(default)]
+    pub source_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +227,10 @@ mod tests {
     #[async_trait]
     impl hf::HttpClient for FailingHttp {
         async fn get_json(&self, url: &str) -> Result<Value, TetroError> {
+            Err(TetroError::Network(format!("mock failure: {url}")))
+        }
+
+        async fn get_text(&self, url: &str) -> Result<String, TetroError> {
             Err(TetroError::Network(format!("mock failure: {url}")))
         }
 

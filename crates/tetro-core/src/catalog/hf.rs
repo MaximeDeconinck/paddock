@@ -9,6 +9,8 @@ use crate::TetroError;
 #[async_trait]
 pub trait HttpClient: Send + Sync {
     async fn get_json(&self, url: &str) -> Result<Value, TetroError>;
+    /// Plain GET returning the body as text (e.g. an HTML page).
+    async fn get_text(&self, url: &str) -> Result<String, TetroError>;
     /// GET with `Range: bytes=start-end` (inclusive), follows redirects.
     async fn get_range(&self, url: &str, start: u64, end: u64) -> Result<Vec<u8>, TetroError>;
 }
@@ -39,6 +41,17 @@ impl HttpClient for ReqwestClient {
             )));
         }
         resp.json().await.map_err(net)
+    }
+
+    async fn get_text(&self, url: &str) -> Result<String, TetroError> {
+        let resp = self.client.get(url).send().await.map_err(net)?;
+        if !resp.status().is_success() {
+            return Err(TetroError::Network(format!(
+                "{url}: HTTP {}",
+                resp.status()
+            )));
+        }
+        resp.text().await.map_err(net)
     }
 
     async fn get_range(&self, url: &str, start: u64, end: u64) -> Result<Vec<u8>, TetroError> {
@@ -174,6 +187,7 @@ async fn fetch_hf_repo(
                 head_dim,
                 embedding_dim,
                 runtime_compat: runtime_compat.clone(),
+                source_tag: None,
             })
         })
         .collect::<Vec<_>>();
@@ -291,6 +305,7 @@ pub async fn fetch_mlx(
                 head_dim: if heads > 0 { hidden / heads } else { 0 },
                 embedding_dim: hidden,
                 runtime_compat: vec![RuntimeKind::MlxLm],
+                source_tag: None,
             }],
         });
     }
@@ -352,6 +367,7 @@ mod tests {
     /// Mock HTTP client for unit tests.
     struct MockHttp {
         json: HashMap<String, Value>,
+        text: HashMap<String, String>,
         ranges: HashMap<String, Vec<u8>>,
     }
 
@@ -359,6 +375,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 json: HashMap::new(),
+                text: HashMap::new(),
                 ranges: HashMap::new(),
             }
         }
@@ -381,6 +398,13 @@ mod tests {
                 .get(url)
                 .cloned()
                 .ok_or_else(|| TetroError::Network(format!("mock: no json for {url}")))
+        }
+
+        async fn get_text(&self, url: &str) -> Result<String, TetroError> {
+            self.text
+                .get(url)
+                .cloned()
+                .ok_or_else(|| TetroError::Network(format!("mock: no text for {url}")))
         }
 
         async fn get_range(

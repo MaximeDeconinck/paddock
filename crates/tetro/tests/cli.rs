@@ -36,6 +36,7 @@ fn seed_one_model(dir: &std::path::Path) {
             head_dim: 64,
             embedding_dim: 2048,
             runtime_compat: vec![RuntimeKind::Ollama],
+            source_tag: None,
         }],
     })
     .unwrap();
