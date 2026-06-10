@@ -49,6 +49,8 @@ pub enum Command {
     },
     /// Refresh the model catalog
     Sync,
+    /// Menu bar status item showing active serve endpoints (macOS)
+    Tray,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]

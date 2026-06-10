@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod output;
+mod tray;
 mod tui;
 
 use std::io::Write;
@@ -69,6 +70,7 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Some(Command::Tray) => tray::run()?,
         None => {
             if cli.cli || cli.json {
                 fit(&app, false, UseCase::General, 20, cli.json)?;

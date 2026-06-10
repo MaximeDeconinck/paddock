@@ -120,6 +120,16 @@ The lifecycle depends on the runtime:
 
 `--port <N>` picks the port for foreground servers (default 8080). The Ollama daemon's port is fixed, so `--port` is ignored there with a warning. `--json` prints the full serve plan (argv, endpoint, pre-steps) without spawning or pulling anything.
 
+### `tetro tray` — menu bar (macOS)
+
+```sh
+tetro tray
+```
+
+Puts a small "t" in the macOS menu bar listing every active serve endpoint. Discovery is hybrid: servers launched by `tetro serve` (llama-server, mlx-lm, an `ollama serve` booted by tetro) plus whatever the local Ollama daemon reports via `/api/ps` — so models loaded outside tetro show up too. Each section is `runtime — host:port` with one row per model; **clicking a model row copies its OpenAI-compatible URL** to the clipboard. "Rafraîchir" re-scans immediately; otherwise the menu refreshes every 5 seconds.
+
+v1 limits: macOS only, no stop-server action, no login item (launch it manually), and running two instances gives you two icons.
+
 ### `--json` everywhere
 
 Every subcommand takes `--json` for machine-readable output; `tetro run x --json` prints the planned `argv` without launching anything:
