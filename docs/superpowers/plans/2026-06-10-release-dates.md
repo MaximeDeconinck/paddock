@@ -18,7 +18,7 @@
 - Create: `crates/paddock-core/src/catalog/dates.rs`
 - Modify: `crates/paddock-core/src/catalog/mod.rs` (add `pub mod dates;` after `pub mod db;`)
 
-- [ ] **1.1 Write failing tests** in the new file:
+- [x] **1.1 Write failing tests** in the new file:
 
 ```rust
 //! Minimal civil-calendar date helpers (UTC, day precision). Hand-rolled to
@@ -93,9 +93,9 @@ mod tests {
 }
 ```
 
-- [ ] **1.2 Run, verify failure**: `cargo test -p paddock-core dates` → compile error (functions missing).
+- [x] **1.2 Run, verify failure**: `cargo test -p paddock-core dates` → compile error (functions missing).
 
-- [ ] **1.3 Implement** above the test module:
+- [x] **1.3 Implement** above the test module:
 
 ```rust
 /// Days from civil date to 1970-01-01 (Howard Hinnant's algorithm), then to
@@ -190,8 +190,8 @@ pub fn oldest_relative_date(html: &str, now: i64) -> Option<i64> {
 }
 ```
 
-- [ ] **1.4 Run**: `cargo test -p paddock-core dates` → all pass.
-- [ ] **1.5 Commit**: `git add crates/paddock-core/src/catalog/{dates.rs,mod.rs} && git commit -m "feat(core): civil-date helpers for release dates"`
+- [x] **1.4 Run**: `cargo test -p paddock-core dates` → all pass.
+- [x] **1.5 Commit**: `git add crates/paddock-core/src/catalog/{dates.rs,mod.rs} && git commit -m "feat(core): civil-date helpers for release dates"`
 
 ---
 
@@ -201,7 +201,7 @@ pub fn oldest_relative_date(html: &str, now: i64) -> Option<i64> {
 - Modify: `crates/paddock-core/src/catalog/mod.rs` (CatalogModel)
 - Modify: `crates/paddock-core/src/catalog/db.rs` (schema, migration, upsert, list)
 
-- [ ] **2.1 Add fields to `CatalogModel`** (mod.rs):
+- [x] **2.1 Add fields to `CatalogModel`** (mod.rs):
 
 ```rust
     /// Release date (epoch seconds), when known. Display + age malus input.
@@ -214,7 +214,7 @@ pub fn oldest_relative_date(html: &str, now: i64) -> Option<i64> {
 
 Then `cargo build -p paddock-core 2>&1 | grep "missing field"` and add `released_at: None, released_approx: false,` to every constructor it lists (curated.rs, hf.rs ×2, ollama_registry.rs discover_model, db.rs list_models, plus test fixtures).
 
-- [ ] **2.2 Write failing DB test** (db.rs tests; mirror the existing `source_tag` migration test):
+- [x] **2.2 Write failing DB test** (db.rs tests; mirror the existing `source_tag` migration test):
 
 ```rust
     #[test]
@@ -254,9 +254,9 @@ Then `cargo build -p paddock-core 2>&1 | grep "missing field"` and add `released
 
 (If db.rs has no `sample_model()` helper, build a minimal `CatalogModel` inline with one variant, as the existing tests do.)
 
-- [ ] **2.3 Run, verify failure**: `cargo test -p paddock-core migration_adds_released` → fails.
+- [x] **2.3 Run, verify failure**: `cargo test -p paddock-core migration_adds_released` → fails.
 
-- [ ] **2.4 Implement** in db.rs:
+- [x] **2.4 Implement** in db.rs:
   - SCHEMA `models` gains `released_at INTEGER,` and `released_approx INTEGER NOT NULL DEFAULT 0,` before the UNIQUE line.
   - In `Db::open`, after the `source_tag` migration, same pattern twice:
 
@@ -276,8 +276,8 @@ Then `cargo build -p paddock-core 2>&1 | grep "missing field"` and add `released
   - `upsert_model`: INSERT columns + `?9, ?10` → add `released_at, released_approx` (params `m.released_at`, `m.released_approx as i64`), and `released_at=excluded.released_at, released_approx=excluded.released_approx` in the UPDATE SET.
   - `list_models`: SELECT the two columns; `released_at: r.get(9)?`, `released_approx: r.get::<_, i64>(10)? != 0` (adjust indices to the actual column order).
 
-- [ ] **2.5 Run**: `cargo test -p paddock-core` → all pass (catalog tests compile with the new fields).
-- [ ] **2.6 Commit**: `git commit -am "feat(core): released_at/released_approx on models with DB migration"`
+- [x] **2.5 Run**: `cargo test -p paddock-core` → all pass (catalog tests compile with the new fields).
+- [x] **2.6 Commit**: `git commit -am "feat(core): released_at/released_approx on models with DB migration"`
 
 ---
 
@@ -287,7 +287,7 @@ Then `cargo build -p paddock-core 2>&1 | grep "missing field"` and add `released
 - Modify: `crates/paddock-core/src/catalog/curated_ollama.json` (all 78 entries)
 - Modify: `crates/paddock-core/src/catalog/curated.rs` (Entry + mapping + validity test)
 
-- [ ] **3.1 Extend the validity test first** (curated.rs):
+- [x] **3.1 Extend the validity test first** (curated.rs):
 
 ```rust
         // Every entry carries a parseable release month within sane bounds.
@@ -303,9 +303,9 @@ Then `cargo build -p paddock-core 2>&1 | grep "missing field"` and add `released
         }
 ```
 
-- [ ] **3.2 Run, verify failure**: `cargo test -p paddock-core curated` → panics on missing released.
+- [x] **3.2 Run, verify failure**: `cargo test -p paddock-core curated` → panics on missing released.
 
-- [ ] **3.3 Implement**: `Entry` gains `released: String`; mapping sets
+- [x] **3.3 Implement**: `Entry` gains `released: String`; mapping sets
 
 ```rust
             released_at: Some(
@@ -317,9 +317,9 @@ Then `cargo build -p paddock-core 2>&1 | grep "missing field"` and add `released
 
   Then add `"released": "YYYY-MM"` to every JSON entry. Source of truth = the implementer's knowledge of each family's release announcement (e.g. llama3.1 → `2024-07`, llama3 → `2024-04`, llama2 → `2023-07`, qwen3 → `2025-04`, qwen2.5 → `2024-09`, gemma3 → `2025-03`, gemma2 → `2024-06`, phi4 → `2024-12`, deepseek-r1 → `2025-01`, mistral-small3.1 → `2025-03`, gpt-oss → `2025-08`, granite3.3 → `2025-04`, smollm2 → `2024-11`, …). **For any entry whose release month you cannot state with confidence, look it up (web search for the announcement, or the HF repo's `createdAt`) instead of guessing.**
 
-- [ ] **3.4 Spot-check 8 dates against the web** (HF repo createdAt or announcement blog). Paste the 8 checked pairs in the task output.
-- [ ] **3.5 Run**: `cargo test -p paddock-core curated` → pass.
-- [ ] **3.6 Commit**: `git commit -am "feat(core): hand-curated release dates for the embedded catalog"`
+- [x] **3.4 Spot-check 8 dates against the web** (HF repo createdAt or announcement blog). Paste the 8 checked pairs in the task output.
+- [x] **3.5 Run**: `cargo test -p paddock-core curated` → pass.
+- [x] **3.6 Commit**: `git commit -am "feat(core): hand-curated release dates for the embedded catalog"`
 
 ---
 
@@ -328,7 +328,7 @@ Then `cargo build -p paddock-core 2>&1 | grep "missing field"` and add `released
 **Files:**
 - Modify: `crates/paddock-core/src/catalog/hf.rs`
 
-- [ ] **4.1 Extend existing fixtures/tests**: in the hf.rs test module, add `"createdAt": "2024-03-07T15:45:34.000Z"` to the repo-detail JSON fixture used by the happy-path `fetch_hf_repo`/`fetch_hf_gguf` test and to one `fetch_mlx` fixture, then assert on the produced model:
+- [x] **4.1 Extend existing fixtures/tests**: in the hf.rs test module, add `"createdAt": "2024-03-07T15:45:34.000Z"` to the repo-detail JSON fixture used by the happy-path `fetch_hf_repo`/`fetch_hf_gguf` test and to one `fetch_mlx` fixture, then assert on the produced model:
 
 ```rust
         assert_eq!(m.released_at, super::super::dates::ymd_to_epoch(2024, 3, 7));
@@ -337,9 +337,9 @@ Then `cargo build -p paddock-core 2>&1 | grep "missing field"` and add `released
 
   Also assert a fixture *without* `createdAt` yields `released_at: None`.
 
-- [ ] **4.2 Run, verify failure.**
+- [x] **4.2 Run, verify failure.**
 
-- [ ] **4.3 Implement**: in `fetch_hf_repo` (detail JSON) and in the `fetch_mlx` item loop:
+- [x] **4.3 Implement**: in `fetch_hf_repo` (detail JSON) and in the `fetch_mlx` item loop:
 
 ```rust
         released_at: item["createdAt"]
@@ -350,8 +350,8 @@ Then `cargo build -p paddock-core 2>&1 | grep "missing field"` and add `released
 
   (`detail["createdAt"]` in fetch_hf_repo; verify the MLX code path has a JSON value with `createdAt` — the list API provides it; if fetch_mlx only uses the list API, read it from the list item.)
 
-- [ ] **4.4 Run**: `cargo test -p paddock-core hf` → pass.
-- [ ] **4.5 Commit**: `git commit -am "feat(core): HF/MLX release dates from createdAt"`
+- [x] **4.4 Run**: `cargo test -p paddock-core hf` → pass.
+- [x] **4.5 Commit**: `git commit -am "feat(core): HF/MLX release dates from createdAt"`
 
 ---
 
@@ -360,7 +360,7 @@ Then `cargo build -p paddock-core 2>&1 | grep "missing field"` and add `released
 **Files:**
 - Modify: `crates/paddock-core/src/catalog/ollama_registry.rs`
 
-- [ ] **5.1 Write failing test**: extend `LFM25_TAGS_HTML` with per-tag dates and assert in `discover_model_builds_first_seen_size_only`:
+- [x] **5.1 Write failing test**: extend `LFM25_TAGS_HTML` with per-tag dates and assert in `discover_model_builds_first_seen_size_only`:
 
 ```rust
     // In LFM25_TAGS_HTML, add date spans like the real page:
@@ -380,9 +380,9 @@ Then `cargo build -p paddock-core 2>&1 | grep "missing field"` and add `released
 
   Also assert a tags page without any date yields `released_at: None, released_approx: false`. `discover_model` needs an injectable `now`: change the signature to `discover_model(http, name, now: i64)` and pass a `const NOW: i64 = 1_780_000_000;` in tests.
 
-- [ ] **5.2 Run, verify failure** (signature change breaks mod.rs too — fix the call site in the same step with `now` threaded from sync; see 5.3).
+- [x] **5.2 Run, verify failure** (signature change breaks mod.rs too — fix the call site in the same step with `now` threaded from sync; see 5.3).
 
-- [ ] **5.3 Implement**:
+- [x] **5.3 Implement**:
   - `discover_model(http, name, now)`: currently calls `fetch_model_tags` which drops the HTML. Refactor: extract the pure parser from `fetch_model_tags` into `fn extract_tag_names(html: &str, base: &str) -> Vec<String>` (same URL-pattern logic), have `fetch_model_tags` fetch + delegate, and in `discover_model` fetch the page text ONCE:
 
 ```rust
@@ -405,8 +405,8 @@ Then `cargo build -p paddock-core 2>&1 | grep "missing field"` and add `released
 
   (pass `now` as a parameter to `discover_library_models` from `sync`, computed next to the existing `last_sync` timestamp logic).
 
-- [ ] **5.4 Run**: `cargo test -p paddock-core` → all pass (curated enrichment path untouched: enriched models keep their curated exact date).
-- [ ] **5.5 Commit**: `git commit -am "feat(core): approximate release dates for discovered models from tags pages"`
+- [x] **5.4 Run**: `cargo test -p paddock-core` → all pass (curated enrichment path untouched: enriched models keep their curated exact date).
+- [x] **5.5 Commit**: `git commit -am "feat(core): approximate release dates for discovered models from tags pages"`
 
 ---
 
@@ -416,7 +416,7 @@ Then `cargo build -p paddock-core 2>&1 | grep "missing field"` and add `released
 - Modify: `crates/paddock-core/src/score.rs`
 - Modify: `crates/paddock/src/app.rs` (call site)
 
-- [ ] **6.1 Write failing tests** (score.rs):
+- [x] **6.1 Write failing tests** (score.rs):
 
 ```rust
     #[test]
@@ -449,9 +449,9 @@ Then `cargo build -p paddock-core 2>&1 | grep "missing field"` and add `released
     }
 ```
 
-- [ ] **6.2 Run, verify failure**: `cargo test -p paddock-core score` → compile error.
+- [x] **6.2 Run, verify failure**: `cargo test -p paddock-core score` → compile error.
 
-- [ ] **6.3 Implement**:
+- [x] **6.3 Implement**:
 
 ```rust
 /// Age malus on quality: 6-month grace, then 10 pts/year, capped.
@@ -481,8 +481,8 @@ fn age_malus(age_days: Option<f64>) -> f64 {
 
   and per model: `let age_days = model.released_at.map(|r| (now - r) as f64 / 86_400.0);` → `score_variant(mv, &memory, &speed, use_case, age_days)`.
 
-- [ ] **6.4 Run**: `cargo test` (workspace) → all pass.
-- [ ] **6.5 Commit**: `git commit -am "feat: age malus on quality subscore"`
+- [x] **6.4 Run**: `cargo test` (workspace) → all pass.
+- [x] **6.5 Commit**: `git commit -am "feat: age malus on quality subscore"`
 
 ---
 
@@ -492,7 +492,7 @@ fn age_malus(age_days: Option<f64>) -> f64 {
 - Modify: `crates/paddock/src/output.rs` (age_label + table + JSON)
 - Modify: `crates/paddock/src/tui/draw.rs:102` (header + row)
 
-- [ ] **7.1 Write failing tests** (output.rs test module; create one if absent):
+- [x] **7.1 Write failing tests** (output.rs test module; create one if absent):
 
 ```rust
     #[test]
@@ -509,9 +509,9 @@ fn age_malus(age_days: Option<f64>) -> f64 {
     }
 ```
 
-- [ ] **7.2 Run, verify failure.**
+- [x] **7.2 Run, verify failure.**
 
-- [ ] **7.3 Implement** in output.rs:
+- [x] **7.3 Implement** in output.rs:
 
 ```rust
 /// Compact age: `3d` < 14 days ≤ `3w` < 8 weeks ≤ `8mo` < 12 months ≤ `1.2y`.
@@ -540,8 +540,8 @@ pub fn age_label(released_at: Option<i64>, approx: bool, now: i64) -> String {
   - `print_fit_json`: each row object gains `"released_at": r.model.released_at` and `"released_approx": r.model.released_approx`.
   - tui/draw.rs:102: header array gains `"AGE"` after `"MODEL"`; the row construction adds the same `age_label` call (import `crate::output::age_label`); add one narrow column `Constraint` matching the existing widths table.
 
-- [ ] **7.4 Run**: `cargo test` → pass. Then visual check: `cargo run -q -- fit -n 5` shows the AGE column; `cargo run -q --` (TUI) renders it.
-- [ ] **7.5 Commit**: `git commit -am "feat: AGE column in fit table, TUI and JSON output"`
+- [x] **7.4 Run**: `cargo test` → pass. Then visual check: `cargo run -q -- fit -n 5` shows the AGE column; `cargo run -q --` (TUI) renders it.
+- [x] **7.5 Commit**: `git commit -am "feat: AGE column in fit table, TUI and JSON output"`
 
 ---
 
@@ -550,16 +550,16 @@ pub fn age_label(released_at: Option<i64>, approx: bool, now: i64) -> String {
 **Files:**
 - Modify: `README.md` (fit table example + one sentence on the age malus in the scoring section)
 
-- [ ] **8.1 Real sync + checks**:
+- [x] **8.1 Real sync + checks**:
   - `cargo run -q -- sync` → completes; then `cargo run -q -- fit -n 15`:
     - curated models show exact ages (llama3.1 ≈ `1.9y`, qwen3 ≈ `1.2y`)
     - discovered models show `~` ages or `?`
     - year-old models (qwen3 family) sit visibly lower than in the pre-change screenshot; recent models (gpt-oss, glm) hold or gain.
   - `cargo run -q -- fit --json | python3 -c "import json,sys; rows=json.load(sys.stdin); print([r['released_at'] for r in rows[:3]])"` → epochs present.
   - Paste outputs.
-- [ ] **8.2 README**: update the fit example block to include the AGE column and add one sentence to the scoring/catalog prose: quality takes a progressive age malus (6-month grace, −10 pts/year, capped at −20) so stale models sink without vanishing; `~` marks approximate dates, `?` unknown.
-- [ ] **8.3 Gates**: `cargo fmt --all && cargo clippy --all-targets && cargo test` → clean.
-- [ ] **8.4 Commit**: `git commit -am "feat: model release dates with age-aware ranking"` and push.
+- [x] **8.2 README**: update the fit example block to include the AGE column and add one sentence to the scoring/catalog prose: quality takes a progressive age malus (6-month grace, −10 pts/year, capped at −20) so stale models sink without vanishing; `~` marks approximate dates, `?` unknown.
+- [x] **8.3 Gates**: `cargo fmt --all && cargo clippy --all-targets && cargo test` → clean.
+- [x] **8.4 Commit**: `git commit -am "feat: model release dates with age-aware ranking"` and push.
 
 ---
 
