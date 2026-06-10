@@ -119,7 +119,8 @@ async fn fetch_hf_repo(
         }
         // Separate vision projector file: not a model variant, and Ollama
         // cannot import such repos via hf.co (ollama/ollama#15447).
-        if name.to_lowercase().contains("mmproj") {
+        let last_segment = name.rsplit('/').next().unwrap_or(name).to_lowercase();
+        if last_segment.starts_with("mmproj") && last_segment.ends_with(".gguf") {
             has_mmproj = true;
             continue;
         }

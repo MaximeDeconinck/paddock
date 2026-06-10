@@ -112,8 +112,8 @@ pub fn quant_from_filename(name: &str) -> Option<String> {
     const KNOWN: &[&str] = &[
         "Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q4_0", "Q3_K_M", "Q2_K", "IQ4_XS", "BF16", "F16",
     ];
-    // UD XL family checked first (longest match): none of its tags contain a
-    // KNOWN base quant, but a shorter scan could still grab fragments.
+    // UD_XL tags checked first because several contain a KNOWN base quant as
+    // a substring (UD-Q2_K_XL contains Q2_K, etc.).
     const UD_XL: &[&str] = &[
         "UD-Q2_K_XL",
         "UD-Q3_K_XL",
@@ -129,7 +129,11 @@ pub fn quant_from_filename(name: &str) -> Option<String> {
     for q in KNOWN {
         if let Some(idx) = upper.find(q) {
             // `UD-` immediately before the base quant → Unsloth Dynamic tag.
-            if idx >= 3 && &upper[idx - 3..idx] == "UD-" {
+            // `get` handles idx < 3 and non-char-boundary slices without panic.
+            // Word boundary: "CLOUD-Q4_K_M" must not match as UD-.
+            if upper.get(idx.wrapping_sub(3)..idx) == Some("UD-")
+                && (idx == 3 || !upper.as_bytes()[idx - 4].is_ascii_alphanumeric())
+            {
                 return Some(format!("UD-{q}"));
             }
             return Some(q.to_string());
@@ -249,6 +253,25 @@ mod tests {
         // plain tags unchanged
         assert_eq!(
             quant_from_filename("x-Q4_K_M.gguf"),
+            Some("Q4_K_M".to_string())
+        );
+    }
+
+    #[test]
+    fn quant_from_filename_ud_word_boundary_and_multibyte() {
+        // "UD-" preceded by an alphanumeric char is not an Unsloth tag.
+        assert_eq!(
+            quant_from_filename("Cloud-Q4_K_M.gguf"),
+            Some("Q4_K_M".to_string())
+        );
+        // Multibyte char earlier in the name must not panic.
+        assert_eq!(
+            quant_from_filename("Éx-UD-Q4_K_M.gguf"),
+            Some("UD-Q4_K_M".to_string())
+        );
+        // Multibyte within 3 bytes of the tag must not panic.
+        assert_eq!(
+            quant_from_filename("Méga-Q4_K_M.gguf"),
             Some("Q4_K_M".to_string())
         );
     }
