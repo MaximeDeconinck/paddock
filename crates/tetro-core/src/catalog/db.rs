@@ -138,6 +138,17 @@ impl Db {
         Ok(id)
     }
 
+    /// Whether a model row exists for `(source, name)`. Used by sync to
+    /// preserve previously enriched rows when the registry is unreachable.
+    pub fn model_exists(&self, source: Source, name: &str) -> Result<bool, TetroError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM models WHERE source = ?1 AND name = ?2",
+            params![source_str(source), name],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn list_models(&self) -> Result<Vec<CatalogModel>, TetroError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, family, source, repo, params_total, params_active, architecture, context_max

@@ -184,12 +184,45 @@ pub async fn sync(
 ) -> Result<SyncReport, crate::TetroError> {
     let mut report = SyncReport::default();
     let mut curated_models = curated::curated_ollama_models();
-    for m in &curated_models {
-        db.upsert_model(m)?;
-        report.curated += 1;
-    }
+    // Enrich IN MEMORY first, then upsert each model exactly once. Upserting
+    // the single-variant baseline before enrichment would prune previously
+    // enriched variants from the DB whenever the registry is unreachable.
+    let mut preserve = std::collections::HashSet::new();
     if opts.ollama_registry {
-        enrich_curated_with_registry(http, db, &mut curated_models, &mut report).await;
+        enrich_curated_with_registry(http, db, &mut curated_models, &mut preserve, &mut report)
+            .await;
+    } else {
+        // Registry disabled: no tag data this sync. Models already in the DB
+        // may carry enriched variants from a previous sync; a baseline upsert
+        // would prune them, so preserve every existing model and only insert
+        // the curated baseline for absent ones.
+        for m in &curated_models {
+            match db.model_exists(m.source, &m.name) {
+                Ok(true) => {
+                    preserve.insert(m.name.clone());
+                }
+                Ok(false) => {}
+                Err(e) => report
+                    .errors
+                    .push(format!("curated lookup {}: {e}", m.name)),
+            }
+        }
+    }
+    for m in &curated_models {
+        if preserve.contains(&m.name) {
+            // Preserved as-is (no registry data this sync): still curated.
+            report.curated += 1;
+            continue;
+        }
+        match db.upsert_model(m) {
+            Ok(_) => {
+                report.curated += 1;
+                report.ollama_tags += m.variants.iter().filter(|v| v.source_tag.is_some()).count();
+            }
+            Err(e) => report
+                .errors
+                .push(format!("curated upsert {}: {e}", m.name)),
+        }
     }
     match hf::fetch_hf_gguf(http, opts.hf_limit).await {
         Ok(models) => {
@@ -223,14 +256,21 @@ pub async fn sync(
     Ok(report)
 }
 
-/// Best-effort live tag enrichment: one tags-page fetch per curated base name
-/// (`llama3.1` for `llama3.1:8b` and `llama3.1:70b`), then per curated size
-/// keep one tag per known quant and re-upsert with `source_tag` set. Registry
-/// errors land in `report.errors`; the curated offline data always stands.
+/// Best-effort live tag enrichment, IN MEMORY ONLY (the caller upserts): one
+/// tags-page fetch per curated base name (`llama3.1` for `llama3.1:8b` and
+/// `llama3.1:70b`), then per curated size keep one tag per known quant and
+/// replace the model's variants with `source_tag` set.
+///
+/// On a per-base fetch failure the error lands in `report.errors` and each
+/// affected model already present in the DB is added to `preserve`: its
+/// existing (possibly enriched) row must not be degraded to the
+/// single-variant baseline. Models absent from the DB are NOT preserved, so
+/// a first sync while offline still inserts the curated baseline.
 async fn enrich_curated_with_registry(
     http: &dyn hf::HttpClient,
     db: &db::Db,
     curated_models: &mut [CatalogModel],
+    preserve: &mut std::collections::HashSet<String>,
     report: &mut SyncReport,
 ) {
     // Base names in curated order, deduplicated (entries lacking ':' have no
@@ -248,6 +288,20 @@ async fn enrich_curated_with_registry(
             Ok(t) => t,
             Err(e) => {
                 report.errors.push(format!("ollama tags {base}: {e}"));
+                for m in curated_models.iter() {
+                    if m.name.split_once(':').map(|(b, _)| b) != Some(base) {
+                        continue;
+                    }
+                    match db.model_exists(m.source, &m.name) {
+                        Ok(true) => {
+                            preserve.insert(m.name.clone());
+                        }
+                        Ok(false) => {}
+                        Err(e) => report
+                            .errors
+                            .push(format!("ollama preserve {}: {e}", m.name)),
+                    }
+                }
                 continue;
             }
         };
@@ -262,17 +316,9 @@ async fn enrich_curated_with_registry(
                 continue;
             };
             let selected = ollama_registry::select_variant_tags(&tags, size, &default_quant);
-            if selected.is_empty() {
-                continue;
-            }
+            // Empty selection: the registry answered but lists no usable tag
+            // for this size — the curated baseline stands (and is upserted).
             ollama_registry::enrich_with_tags(m, &selected);
-            match db.upsert_model(m) {
-                Ok(_) => {
-                    report.ollama_tags +=
-                        m.variants.iter().filter(|v| v.source_tag.is_some()).count();
-                }
-                Err(e) => report.errors.push(format!("ollama enrich {}: {e}", m.name)),
-            }
         }
     }
 }
@@ -531,5 +577,113 @@ mod tests {
             .errors
             .iter()
             .any(|e| e.contains("ollama tags gemma3")));
+    }
+
+    #[tokio::test]
+    async fn resync_with_registry_down_preserves_enriched_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::Db::open(dir.path().join("catalog.db")).unwrap();
+
+        // First sync: registry serves llama3.1 tags → enriched variants land
+        // in the DB.
+        let llama_page = r#"
+            <a href="/library/llama3.1:8b-instruct-q4_K_M">x</a>
+            <a href="/library/llama3.1:8b-instruct-q8_0">x</a>
+        "#;
+        let mut pages = std::collections::HashMap::new();
+        pages.insert(
+            "https://ollama.com/library/llama3.1/tags".to_string(),
+            llama_page.to_string(),
+        );
+        let http = PagesHttp {
+            pages,
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        sync(&http, &db, &SyncOptions::default()).await.unwrap();
+        let models = db.list_models().unwrap();
+        let m = models.iter().find(|m| m.name == "llama3.1:8b").unwrap();
+        assert_eq!(m.variants.len(), 2, "precondition: enriched in DB");
+
+        // Re-sync with the registry fully down: the previously enriched
+        // variants must survive (no degradation to single-variant baseline).
+        let report = sync(&FailingHttp, &db, &SyncOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("ollama tags llama3.1")),
+            "expected per-base registry error, got {:?}",
+            report.errors
+        );
+
+        let models = db.list_models().unwrap();
+        let m = models.iter().find(|m| m.name == "llama3.1:8b").unwrap();
+        assert_eq!(
+            m.variants.len(),
+            2,
+            "enriched variants must survive a registry-down re-sync"
+        );
+        assert!(m
+            .variants
+            .iter()
+            .any(|v| v.source_tag.as_deref() == Some("8b-instruct-q8_0")));
+    }
+
+    #[tokio::test]
+    async fn resync_with_registry_disabled_preserves_enriched_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::Db::open(dir.path().join("catalog.db")).unwrap();
+
+        // First sync enriches llama3.1:8b from the registry.
+        let llama_page = r#"
+            <a href="/library/llama3.1:8b-instruct-q4_K_M">x</a>
+            <a href="/library/llama3.1:8b-instruct-q8_0">x</a>
+        "#;
+        let mut pages = std::collections::HashMap::new();
+        pages.insert(
+            "https://ollama.com/library/llama3.1/tags".to_string(),
+            llama_page.to_string(),
+        );
+        let http = PagesHttp {
+            pages,
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        sync(&http, &db, &SyncOptions::default()).await.unwrap();
+
+        // Re-sync with `--no-ollama-registry`: existing rows preserved.
+        let opts = SyncOptions {
+            ollama_registry: false,
+            ..SyncOptions::default()
+        };
+        let report = sync(&FailingHttp, &db, &opts).await.unwrap();
+        assert!(report.curated >= 70, "preserved models still count");
+
+        let models = db.list_models().unwrap();
+        let m = models.iter().find(|m| m.name == "llama3.1:8b").unwrap();
+        assert_eq!(m.variants.len(), 2);
+        assert!(m
+            .variants
+            .iter()
+            .any(|v| v.source_tag.as_deref() == Some("8b-instruct-q8_0")));
+    }
+
+    #[tokio::test]
+    async fn registry_down_still_inserts_models_absent_from_db() {
+        // First-sync-offline case: nothing in the DB yet, every registry
+        // fetch fails → the curated baseline must still be inserted.
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::Db::open(dir.path().join("catalog.db")).unwrap();
+
+        let report = sync(&FailingHttp, &db, &SyncOptions::default())
+            .await
+            .unwrap();
+        assert!(report.curated >= 70);
+
+        let models = db.list_models().unwrap();
+        let m = models.iter().find(|m| m.name == "llama3.1:8b").unwrap();
+        assert_eq!(m.variants.len(), 1);
+        assert_eq!(m.variants[0].source_tag, None);
     }
 }

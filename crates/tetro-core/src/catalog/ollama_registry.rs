@@ -71,17 +71,25 @@ fn normalize_quant(suffix: &str) -> Option<String> {
 ///   known quant (per `quant_bpw` after normalization);
 /// - `-text`/`-base` (non-chat) tags and unknown quants (q4_1, q5_0, …) are
 ///   skipped;
-/// - one tag per normalized quant, shortest tag wins (proxy for the
-///   canonical `8b-instruct-q4_K_M` over longer exotic variants).
+/// - one tag per normalized quant, picked by canonical-form preference:
+///   plain `{size}` > exact `{size}-instruct-{q}` > exact `{size}-it-{q}` >
+///   exact `{size}-{q}` > shortest remaining (fallback). This avoids pinning
+///   stale versioned tags (`35b-v0.1-q4_K_M`) when a canonical form exists.
 pub fn select_variant_tags(
     tags: &[String],
     size_prefix: &str,
     default_quant: &str,
 ) -> Vec<OllamaTag> {
-    let mut out: Vec<OllamaTag> = Vec::new();
+    struct Kept {
+        tag: String,
+        quant: String,
+        rank: u8,
+    }
+    let mut out: Vec<Kept> = Vec::new();
     for tag in tags {
-        let quant = if tag == size_prefix {
-            default_quant.to_string()
+        let (quant, rank) = if tag == size_prefix {
+            // Plain default alias: the library's own canonical pick.
+            (default_quant.to_string(), 0u8)
         } else {
             let Some(rest) = tag.strip_prefix(size_prefix) else {
                 continue;
@@ -93,29 +101,48 @@ pub fn select_variant_tags(
                 continue;
             }
             // Infallible: `rest` starts with '-', so rsplit yields a segment.
-            let Some(quant) = tag.rsplit('-').next().and_then(normalize_quant) else {
+            let raw = tag.rsplit('-').next().unwrap_or_default();
+            let Some(quant) = normalize_quant(raw) else {
                 continue;
             };
-            quant
+            let rank = if *tag == format!("{size_prefix}-instruct-{raw}") {
+                1
+            } else if *tag == format!("{size_prefix}-it-{raw}") {
+                2
+            } else if *tag == format!("{size_prefix}-{raw}") {
+                3
+            } else {
+                4
+            };
+            (quant, rank)
         };
         match out.iter_mut().find(|t| t.quant == quant) {
             Some(existing) => {
-                if tag.len() < existing.tag.len() {
+                if rank < existing.rank || (rank == existing.rank && tag.len() < existing.tag.len())
+                {
                     existing.tag = tag.clone();
+                    existing.rank = rank;
                 }
             }
-            None => out.push(OllamaTag {
+            None => out.push(Kept {
                 tag: tag.clone(),
                 quant,
+                rank,
             }),
         }
     }
-    out
+    out.into_iter()
+        .map(|k| OllamaTag {
+            tag: k.tag,
+            quant: k.quant,
+        })
+        .collect()
 }
 
 /// Replace the model's variants with one per selected tag: bpw via
 /// `quant_bpw`, architecture fields copied from the existing first variant,
-/// file size unknown (estimates derive from params × bpw), `source_tag` set
+/// file size kept from the curated default variant when the quant matches
+/// (unknown otherwise; estimates derive from params × bpw), `source_tag` set
 /// to the exact library tag. No-op when `tags` is empty (offline fallback:
 /// the curated default variant stands).
 pub fn enrich_with_tags(model: &mut CatalogModel, tags: &[OllamaTag]) {
@@ -131,7 +158,11 @@ pub fn enrich_with_tags(model: &mut CatalogModel, tags: &[OllamaTag]) {
             quant_bpw(&t.quant).map(|bpw| CatalogVariant {
                 quant: t.quant.clone(),
                 bpw,
-                file_size_bytes: None,
+                file_size_bytes: if t.quant == arch.quant {
+                    arch.file_size_bytes
+                } else {
+                    None
+                },
                 layers: arch.layers,
                 kv_heads: arch.kv_heads,
                 head_dim: arch.head_dim,
@@ -308,6 +339,60 @@ mod tests {
     }
 
     #[test]
+    fn select_variant_tags_prefers_canonical_instruct_over_stale_versioned() {
+        // The stale `-v0.1-` tag is SHORTER, but the exact canonical
+        // `{size}-instruct-{q}` form must win the quant slot.
+        let tags: Vec<String> = ["8b-v0.1-q4_K_M", "8b-instruct-q4_K_M"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let kept = select_variant_tags(&tags, "8b", "Q4_K_M");
+        assert_eq!(
+            kept,
+            vec![OllamaTag {
+                tag: "8b-instruct-q4_K_M".into(),
+                quant: "Q4_K_M".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn select_variant_tags_prefers_it_and_plain_size_quant_forms() {
+        // `{size}-it-{q}` beats non-canonical forms — even at equal length
+        // and listed second (page order / shortest must not decide).
+        let tags: Vec<String> = ["9b-v1-q4_K_M", "9b-it-q4_K_M"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let kept = select_variant_tags(&tags, "9b", "Q4_K_M");
+        assert_eq!(kept[0].tag, "9b-it-q4_K_M");
+
+        // …and exact `{size}-{q}` beats non-canonical too.
+        let tags: Vec<String> = ["7b-2407-q4_K_M", "7b-q4_K_M"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let kept = select_variant_tags(&tags, "7b", "Q4_K_M");
+        assert_eq!(kept[0].tag, "7b-q4_K_M");
+    }
+
+    #[test]
+    fn select_variant_tags_no_canonical_falls_back_to_shortest() {
+        let tags: Vec<String> = ["35b-v0.1-q4_K_M", "35b-08-2024-q4_K_M"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let kept = select_variant_tags(&tags, "35b", "Q4_K_M");
+        assert_eq!(
+            kept,
+            vec![OllamaTag {
+                tag: "35b-v0.1-q4_K_M".into(),
+                quant: "Q4_K_M".into()
+            }]
+        );
+    }
+
+    #[test]
     fn select_variant_tags_prefix_must_be_whole_segment() {
         // "8b1-q4_K_M" must not match size prefix "8b".
         let tags = vec!["8b1-instruct-q4_K_M".to_string()];
@@ -378,9 +463,11 @@ mod tests {
         assert_eq!(q8.kv_heads, 8);
         assert_eq!(q8.head_dim, 128);
         assert_eq!(q8.embedding_dim, 4096);
-        // Default tag variant carries its exact tag too.
+        // Default tag variant carries its exact tag too, and keeps the
+        // curated file size (same quant as the curated default).
         let q4 = m.variants.iter().find(|v| v.quant == "Q4_K_M").unwrap();
         assert_eq!(q4.source_tag.as_deref(), Some("8b"));
+        assert_eq!(q4.file_size_bytes, Some(4_920_000_000));
     }
 
     #[test]

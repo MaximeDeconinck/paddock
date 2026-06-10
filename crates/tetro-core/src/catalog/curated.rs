@@ -20,6 +20,13 @@ struct Entry {
     file_size_bytes: u64,
 }
 
+// NOTE (curated_ollama.json cannot carry comments): `deepseek-coder-v2:16b`
+// uses MLA (Multi-head Latent Attention); its entry encodes the
+// GQA-equivalent shape (kv_heads=16, head_dim=128), so the GQA KV-cache math
+// overestimates the real MLA compressed-KV footprint by roughly 7x. The
+// error is in the conservative direction (never under-provisions memory),
+// so the numbers stay as published; modeling it exactly would take an
+// MLA-aware KV estimator.
 pub fn curated_ollama_models() -> Vec<CatalogModel> {
     let entries: Vec<Entry> = serde_json::from_str(include_str!("curated_ollama.json"))
         .expect("embedded curated_ollama.json must be valid (checked by unit test)");
