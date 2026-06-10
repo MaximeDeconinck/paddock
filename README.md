@@ -5,7 +5,6 @@
 **Which LLMs fit your Apple Silicon Mac, how fast they'll run, and how to launch them — in one command.**
 
 ![demo](docs/demo.gif)
-<!-- TODO: record with vhs -->
 
 ## Why paddock
 
