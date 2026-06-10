@@ -18,6 +18,9 @@ struct Entry {
     embedding_dim: u32,
     quant: String,
     file_size_bytes: u64,
+    /// Release month of the model family/size announcement, `YYYY-MM`.
+    /// Required: a curated entry without a date must fail loudly.
+    released: String,
 }
 
 // NOTE (curated_ollama.json cannot carry comments): `deepseek-coder-v2:16b`
@@ -42,7 +45,10 @@ pub fn curated_ollama_models() -> Vec<CatalogModel> {
             params_active: e.params_active.unwrap_or(e.params_total),
             architecture: Some(e.family),
             context_max: e.context_max,
-            released_at: None,
+            released_at: Some(
+                super::dates::parse_year_month(&e.released)
+                    .expect("curated released must be YYYY-MM (checked by unit test)"),
+            ),
             released_approx: false,
             variants: vec![CatalogVariant {
                 bpw: quant_bpw(&e.quant).unwrap_or(4.83),
@@ -76,6 +82,19 @@ mod tests {
             assert!(v.layers > 0, "model {} has layers=0", m.name);
             assert!(v.kv_heads > 0, "model {} has kv_heads=0", m.name);
             assert!(v.bpw > 0.0, "model {} has bpw=0", m.name);
+        }
+        // Every entry carries a parseable release month within sane bounds.
+        for m in &models {
+            let r = m
+                .released_at
+                .unwrap_or_else(|| panic!("{} missing released", m.name));
+            assert!(
+                r >= super::super::dates::ymd_to_epoch(2020, 1, 1).unwrap()
+                    && r <= super::super::dates::ymd_to_epoch(2027, 1, 1).unwrap(),
+                "{} release date out of range",
+                m.name
+            );
+            assert!(!m.released_approx, "curated dates are exact");
         }
         // Every raw entry must use a known quant: a typo'd quant must fail
         // here instead of silently falling back to the runtime default bpw.
