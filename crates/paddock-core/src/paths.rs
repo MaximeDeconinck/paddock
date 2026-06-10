@@ -5,7 +5,8 @@
 use std::path::{Path, PathBuf};
 
 /// Pre-rename data directory name. Sole intentional occurrence of the old
-/// project name in the codebase; required to find existing installs.
+/// project name in the source tree (historical planning docs keep it);
+/// required to find existing installs.
 const LEGACY_DIR_NAME: &str = "tetro";
 
 /// `~/Library/Application Support/paddock`, migrating a legacy directory in
@@ -18,11 +19,15 @@ pub fn app_support_dir() -> PathBuf {
 /// If the paddock dir is absent and the legacy dir exists, rename the whole
 /// legacy dir (catalog.db + serving/) to paddock. Best-effort and one-shot:
 /// errors are ignored silently — worst case the user gets a fresh dir and
-/// re-syncs.
+/// re-syncs. If both dirs ever coexist (a past failed rename, or an old
+/// binary recreating the legacy dir), the legacy dir is left orphaned and is
+/// NOT cleaned up or reported — acceptable pre-1.0; manual cleanup: delete
+/// ~/Library/Application Support/tetro.
 fn resolve(base: &Path) -> PathBuf {
     let paddock = base.join("paddock");
     let legacy = base.join(LEGACY_DIR_NAME);
     if !paddock.exists() && legacy.exists() {
+        // Benign TOCTOU: POSIX rename replaces an empty target dir, so a concurrently created empty paddock/ may be swapped for the legacy dir during startup — legacy data wins, concurrent migrations are safe (loser gets ENOENT, ignored).
         let _ = std::fs::rename(&legacy, &paddock);
     }
     paddock
