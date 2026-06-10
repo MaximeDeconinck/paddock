@@ -93,7 +93,7 @@ fn no_repo(name: &str) -> TetroError {
 fn validate_gguf_quant(model: &CatalogModel, variant: &CatalogVariant) -> Result<(), TetroError> {
     if catalog::quant_bpw(&variant.quant).is_none() || variant.quant.starts_with("MLX_") {
         return Err(TetroError::Other(format!(
-            "variant `{}` of `{}` is not a valid GGUF tag for `ollama run hf.co/...`",
+            "variant `{}` of `{}` is not a GGUF quant tag usable by GGUF runtimes",
             variant.quant, model.name
         )));
     }
@@ -124,6 +124,9 @@ pub struct ServePlan {
     pub ready_path: String,
     /// Same contract as RunPlan: the binary MUST confirm before installing.
     pub install: Option<InstallPlan>,
+    /// True when caller requested a port but the plan uses Ollama's fixed
+    /// daemon port (11434) instead.
+    pub port_ignored: bool,
 }
 
 /// Serve strategy mirrors `plan_run`, plus a llama.cpp fallback for HF GGUF
@@ -145,6 +148,13 @@ pub fn plan_serve(
     rt: &RuntimesStatus,
     port: Option<u16>,
 ) -> Result<ServePlan, TetroError> {
+    if port == Some(0) {
+        return Err(TetroError::Other(
+            "port 0 is not supported; pick a fixed port so the endpoint is known upfront"
+                .to_string(),
+        ));
+    }
+    let port_requested = port.is_some();
     let port = port.unwrap_or(DEFAULT_SERVE_PORT);
     let local = format!("http://127.0.0.1:{port}");
     match model.source {
@@ -167,39 +177,44 @@ pub fn plan_serve(
                     kind: RuntimeKind::MlxLm,
                     argv: s(&["uv", "tool", "install", "mlx-lm"]),
                 }),
+                port_ignored: false,
             })
         }
         Source::Ollama | Source::HuggingFace => {
-            let model_ref = match model.source {
-                Source::Ollama => model.name.clone(),
-                _ => {
-                    let repo = model.repo.as_deref().ok_or_else(|| no_repo(&model.name))?;
-                    validate_gguf_quant(model, variant)?;
-                    format!("hf.co/{repo}:{}", variant.quant)
-                }
+            // repo:quant ref, validated once for the HF case.
+            let mut hf_ref = if model.source == Source::HuggingFace {
+                let repo = model.repo.as_deref().ok_or_else(|| no_repo(&model.name))?;
+                validate_gguf_quant(model, variant)?;
+                Some(format!("{repo}:{}", variant.quant))
+            } else {
+                None
             };
             // Prefer Ollama; fall back to llama-server for HF GGUF when only
             // llama.cpp is installed.
-            if !rt.ollama.installed && rt.llama_cpp.installed && model.source == Source::HuggingFace
-            {
-                let repo = model.repo.as_deref().ok_or_else(|| no_repo(&model.name))?;
-                let hf_ref = format!("{repo}:{}", variant.quant);
-                return Ok(ServePlan {
-                    server_argv: Some(s(&[
-                        "llama-server",
-                        "-hf",
-                        &hf_ref,
-                        "--port",
-                        &port.to_string(),
-                    ])),
-                    pre_steps: vec![],
-                    endpoint: local.clone(),
-                    openai_url: format!("{local}/v1/chat/completions"),
-                    model_ref: hf_ref,
-                    ready_path: "/health".to_string(),
-                    install: None,
-                });
+            if !rt.ollama.installed && rt.llama_cpp.installed {
+                if let Some(hf_ref) = hf_ref.take() {
+                    return Ok(ServePlan {
+                        server_argv: Some(s(&[
+                            "llama-server",
+                            "-hf",
+                            &hf_ref,
+                            "--port",
+                            &port.to_string(),
+                        ])),
+                        pre_steps: vec![],
+                        endpoint: local.clone(),
+                        openai_url: format!("{local}/v1/chat/completions"),
+                        model_ref: hf_ref,
+                        ready_path: "/health".to_string(),
+                        install: None,
+                        port_ignored: false,
+                    });
+                }
             }
+            let model_ref = match hf_ref {
+                Some(hf_ref) => format!("hf.co/{hf_ref}"),
+                None => model.name.clone(),
+            };
             Ok(ServePlan {
                 server_argv: (!rt.ollama.running).then(|| s(&["ollama", "serve"])),
                 pre_steps: vec![vec![
@@ -212,6 +227,7 @@ pub fn plan_serve(
                 model_ref,
                 ready_path: "/api/version".to_string(),
                 install: (!rt.ollama.installed).then(ollama_install),
+                port_ignored: port_requested,
             })
         }
     }
@@ -360,13 +376,13 @@ mod tests {
         m.variants = vec![variant("MLX_4BIT", vec![RuntimeKind::MlxLm])];
         let err = plan_run(&m, &m.variants[0], &with_ollama()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("not a valid GGUF tag"), "{msg}");
+        assert!(msg.contains("not a GGUF quant tag"), "{msg}");
         assert!(msg.contains("MLX_4BIT"), "{msg}");
 
         // DB-roundtripped garbage (unknown quant) must also be refused
         m.variants = vec![variant("Q4_BOGUS", vec![RuntimeKind::Ollama])];
         let err = plan_run(&m, &m.variants[0], &with_ollama()).unwrap_err();
-        assert!(err.to_string().contains("not a valid GGUF tag"));
+        assert!(err.to_string().contains("not a GGUF quant tag"));
     }
 
     fn ollama_running() -> RuntimesStatus {
@@ -464,9 +480,17 @@ mod tests {
         let p = plan_serve(&m, &m.variants[0], &llama_cpp_only(), Some(9999)).unwrap();
         assert_eq!(p.endpoint, "http://127.0.0.1:9999");
         assert!(p.server_argv.unwrap().contains(&"9999".to_string()));
+        assert!(!p.port_ignored);
         // ollama ignores --port (fixed daemon port)
         let p2 = plan_serve(&m, &m.variants[0], &ollama_running(), Some(9999)).unwrap();
         assert_eq!(p2.endpoint, "http://127.0.0.1:11434");
+        assert!(p2.port_ignored);
+    }
+
+    #[test]
+    fn serve_rejects_port_zero() {
+        let m = hf_model();
+        assert!(plan_serve(&m, &m.variants[0], &llama_cpp_only(), Some(0)).is_err());
     }
 
     #[test]
