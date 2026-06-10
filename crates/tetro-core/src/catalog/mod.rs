@@ -70,6 +70,24 @@ impl CatalogModel {
 
 /// Effective bits-per-weight per quant (K-quants carry metadata overhead).
 pub fn quant_bpw(quant: &str) -> Option<f64> {
+    // Unsloth Dynamic (UD-*) tags: same layout as the base quant. The _XL
+    // family upcasts the important layers; +0.35 bpw over the closest base
+    // quant is a conservative estimate of that upcast cost.
+    if let Some(base) = quant.strip_prefix("UD-") {
+        let xl_base = match base {
+            "Q2_K_XL" => Some("Q2_K"),
+            "Q3_K_XL" => Some("Q3_K_M"),
+            "Q4_K_XL" => Some("Q4_K_M"),
+            "Q5_K_XL" => Some("Q5_K_M"),
+            "Q6_K_XL" => Some("Q6_K"),
+            "Q8_K_XL" => Some("Q8_0"),
+            _ => None,
+        };
+        return match xl_base {
+            Some(b) => quant_bpw(b).map(|v| v + 0.35),
+            None => quant_bpw(base),
+        };
+    }
     Some(match quant {
         "Q8_0" => 8.5,
         "Q6_K" => 6.59,
@@ -87,15 +105,37 @@ pub fn quant_bpw(quant: &str) -> Option<f64> {
 }
 
 /// Extract a known quant tag from a GGUF filename, e.g. "llama-3.1-8b-Q4_K_M.gguf".
+/// Unsloth Dynamic tags are returned EXACTLY as published (`UD-Q4_K_M`,
+/// `UD-Q4_K_XL`): the tag doubles as the `hf.co/{repo}:{quant}` file selector,
+/// so it must match a real filename in the repo.
 pub fn quant_from_filename(name: &str) -> Option<String> {
     const KNOWN: &[&str] = &[
         "Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q4_0", "Q3_K_M", "Q2_K", "IQ4_XS", "BF16", "F16",
     ];
+    // UD XL family checked first (longest match): none of its tags contain a
+    // KNOWN base quant, but a shorter scan could still grab fragments.
+    const UD_XL: &[&str] = &[
+        "UD-Q2_K_XL",
+        "UD-Q3_K_XL",
+        "UD-Q4_K_XL",
+        "UD-Q5_K_XL",
+        "UD-Q6_K_XL",
+        "UD-Q8_K_XL",
+    ];
     let upper = name.to_uppercase();
-    KNOWN
-        .iter()
-        .find(|q| upper.contains(*q))
-        .map(|q| q.to_string())
+    if let Some(q) = UD_XL.iter().find(|q| upper.contains(*q)) {
+        return Some(q.to_string());
+    }
+    for q in KNOWN {
+        if let Some(idx) = upper.find(q) {
+            // `UD-` immediately before the base quant → Unsloth Dynamic tag.
+            if idx >= 3 && &upper[idx - 3..idx] == "UD-" {
+                return Some(format!("UD-{q}"));
+            }
+            return Some(q.to_string());
+        }
+    }
+    None
 }
 
 /// Options for `sync`. Limits keep first sync fast; raise via CLI later if wanted.
@@ -189,6 +229,43 @@ mod tests {
         ) -> Result<Vec<u8>, TetroError> {
             Err(TetroError::Network(format!("mock failure: {url}")))
         }
+    }
+
+    #[test]
+    fn quant_from_filename_ud_prefix_kept_exactly() {
+        assert_eq!(
+            quant_from_filename("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"),
+            Some("UD-Q4_K_M".to_string())
+        );
+        assert_eq!(
+            quant_from_filename("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
+            Some("UD-Q4_K_XL".to_string())
+        );
+        // lowercase ud- in the filename still yields the canonical tag
+        assert_eq!(
+            quant_from_filename("model-ud-q4_k_m.gguf"),
+            Some("UD-Q4_K_M".to_string())
+        );
+        // plain tags unchanged
+        assert_eq!(
+            quant_from_filename("x-Q4_K_M.gguf"),
+            Some("Q4_K_M".to_string())
+        );
+    }
+
+    #[test]
+    fn quant_bpw_ud_tags() {
+        // plain UD- maps to the base quant
+        assert_eq!(quant_bpw("UD-Q4_K_M"), Some(4.83));
+        // _XL family: base bpw + 0.35
+        let xl = quant_bpw("UD-Q4_K_XL").expect("UD-Q4_K_XL must have a bpw");
+        assert!((xl - 5.18).abs() < 1e-9, "got {xl}");
+        let q6 = quant_bpw("UD-Q6_K_XL").expect("UD-Q6_K_XL must have a bpw");
+        assert!((q6 - 6.94).abs() < 1e-9, "got {q6}");
+        // existing exact entries unchanged
+        assert_eq!(quant_bpw("Q4_K_M"), Some(4.83));
+        assert_eq!(quant_bpw("nonsense"), None);
+        assert_eq!(quant_bpw("UD-nonsense"), None);
     }
 
     #[tokio::test]

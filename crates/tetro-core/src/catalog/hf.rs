@@ -108,12 +108,19 @@ async fn fetch_hf_repo(
 
     // Collect GGUF files with a recognizable quant.
     let mut files: Vec<(String, String, u64)> = Vec::new(); // (filename, quant, size)
+    let mut has_mmproj = false;
     for sib in detail["siblings"].as_array().unwrap_or(&Vec::new()) {
         let Some(name) = sib["rfilename"].as_str() else {
             continue;
         };
         if !name.ends_with(".gguf") || name.contains("-of-") {
             // skip split files
+            continue;
+        }
+        // Separate vision projector file: not a model variant, and Ollama
+        // cannot import such repos via hf.co (ollama/ollama#15447).
+        if name.to_lowercase().contains("mmproj") {
+            has_mmproj = true;
             continue;
         }
         if let Some(q) = quant_from_filename(name) {
@@ -149,6 +156,11 @@ async fn fetch_hf_repo(
         return Ok(None); // cannot estimate without these — skip repo
     }
 
+    let runtime_compat = if has_mmproj {
+        vec![RuntimeKind::LlamaCpp]
+    } else {
+        vec![RuntimeKind::Ollama, RuntimeKind::LlamaCpp]
+    };
     let variants = files
         .into_iter()
         .filter_map(|(_, quant, size)| {
@@ -160,7 +172,7 @@ async fn fetch_hf_repo(
                 kv_heads,
                 head_dim,
                 embedding_dim,
-                runtime_compat: vec![RuntimeKind::Ollama, RuntimeKind::LlamaCpp],
+                runtime_compat: runtime_compat.clone(),
             })
         })
         .collect::<Vec<_>>();
@@ -435,6 +447,44 @@ mod tests {
             assert_eq!(v.kv_heads, 8);
             assert_eq!(v.head_dim, 128);
         }
+    }
+
+    #[tokio::test]
+    async fn mmproj_repo_is_llama_cpp_only() {
+        // Repos shipping a separate vision projector (mmproj-*.gguf) cannot be
+        // imported by Ollama via hf.co (ollama/ollama#15447).
+        let repo = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF";
+        let detail_url = format!("{HF_API}/models/{repo}?blobs=true");
+        let list_url = format!("{HF_API}/models?filter=gguf&sort=downloads&limit=1");
+        let range_url =
+            format!("https://huggingface.co/{repo}/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf");
+
+        let http = MockHttp::new()
+            .add_json(&list_url, json!([{"id": repo}]))
+            .add_json(
+                &detail_url,
+                json!({
+                    "id": repo,
+                    "gguf": {
+                        "architecture": "qwen3moe",
+                        "context_length": 262144,
+                        "total": 35000000000u64
+                    },
+                    "siblings": [
+                        {"rfilename": "mmproj-BF16.gguf", "size": 1200000000u64},
+                        {"rfilename": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf", "size": 22000000000u64}
+                    ]
+                }),
+            )
+            .add_range(&range_url, llama_header());
+
+        let models = fetch_hf_gguf(&http, 1).await.unwrap();
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        // mmproj-BF16.gguf must NOT surface as a BF16 model variant
+        assert_eq!(m.variants.len(), 1);
+        assert_eq!(m.variants[0].quant, "UD-Q4_K_M");
+        assert_eq!(m.variants[0].runtime_compat, vec![RuntimeKind::LlamaCpp]);
     }
 
     #[test]

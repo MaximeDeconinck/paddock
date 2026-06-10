@@ -73,6 +73,15 @@ pub fn plan_run(
         Source::HuggingFace => {
             let repo = model.repo.as_deref().ok_or_else(|| no_repo(&model.name))?;
             validate_gguf_quant(model, variant)?;
+            // Some repos cannot go through Ollama at all (e.g. separate
+            // mmproj vision files, ollama/ollama#15447): llama.cpp only.
+            if !variant.runtime_compat.contains(&RuntimeKind::Ollama) {
+                let model_ref = format!("{repo}:{}", variant.quant);
+                return Ok(RunPlan {
+                    argv: s(&["llama-cli", "-hf", &model_ref]),
+                    install: (!rt.llama_cpp.installed).then(llama_cpp_install),
+                });
+            }
             let model_ref = format!("hf.co/{repo}:{}", variant.quant);
             Ok(RunPlan {
                 argv: s(&["ollama", "run", &model_ref]),
@@ -192,27 +201,22 @@ pub fn plan_serve(
             } else {
                 None
             };
+            // Variants Ollama cannot import (e.g. separate mmproj vision
+            // files, ollama/ollama#15447) always go through llama-server,
+            // proposing its install when missing.
+            if model.source == Source::HuggingFace
+                && !variant.runtime_compat.contains(&RuntimeKind::Ollama)
+            {
+                // Infallible: the HF arm above always sets `hf_ref`.
+                let hf_ref = hf_ref.take().unwrap();
+                let install = (!rt.llama_cpp.installed).then(llama_cpp_install);
+                return Ok(llama_server_plan(hf_ref, port, &local, install));
+            }
             // Prefer Ollama; fall back to llama-server for HF GGUF when only
             // llama.cpp is installed.
             if !rt.ollama.installed && rt.llama_cpp.installed {
                 if let Some(hf_ref) = hf_ref.take() {
-                    return Ok(ServePlan {
-                        server_argv: Some(s(&[
-                            "llama-server",
-                            "-hf",
-                            &hf_ref,
-                            "--port",
-                            &port.to_string(),
-                        ])),
-                        pre_steps: vec![],
-                        endpoint: local.clone(),
-                        openai_url: format!("{local}/v1/chat/completions"),
-                        model_ref: hf_ref,
-                        ready_path: "/health".to_string(),
-                        install: None,
-                        port_ignored: false,
-                        runtime: RuntimeKind::LlamaCpp,
-                    });
+                    return Ok(llama_server_plan(hf_ref, port, &local, None));
                 }
             }
             let model_ref = match hf_ref {
@@ -242,6 +246,39 @@ fn ollama_install() -> InstallPlan {
     InstallPlan {
         kind: RuntimeKind::Ollama,
         argv: s(&["brew", "install", "ollama"]),
+    }
+}
+
+fn llama_cpp_install() -> InstallPlan {
+    InstallPlan {
+        kind: RuntimeKind::LlamaCpp,
+        argv: s(&["brew", "install", "llama.cpp"]),
+    }
+}
+
+/// Foreground `llama-server -hf {repo}:{quant}` plan (HF GGUF).
+fn llama_server_plan(
+    hf_ref: String,
+    port: u16,
+    local: &str,
+    install: Option<InstallPlan>,
+) -> ServePlan {
+    ServePlan {
+        server_argv: Some(s(&[
+            "llama-server",
+            "-hf",
+            &hf_ref,
+            "--port",
+            &port.to_string(),
+        ])),
+        pre_steps: vec![],
+        endpoint: local.to_string(),
+        openai_url: format!("{local}/v1/chat/completions"),
+        model_ref: hf_ref,
+        ready_path: "/health".to_string(),
+        install,
+        port_ignored: false,
+        runtime: RuntimeKind::LlamaCpp,
     }
 }
 
@@ -550,6 +587,118 @@ mod tests {
         let m2 = hf_model();
         let bad = variant("MLX_4BIT", vec![RuntimeKind::MlxLm]);
         assert!(plan_serve(&m2, &bad, &ollama_running(), None).is_err());
+    }
+
+    /// HF model whose repo ships a separate mmproj file: llama.cpp-only.
+    fn mmproj_model() -> CatalogModel {
+        let mut m = hf_model();
+        m.name = "Qwen3.6-35B-A3B-MTP-GGUF".into();
+        m.repo = Some("unsloth/Qwen3.6-35B-A3B-MTP-GGUF".into());
+        m.variants = vec![variant("UD-Q4_K_M", vec![RuntimeKind::LlamaCpp])];
+        m
+    }
+
+    fn ollama_and_llama_cpp() -> RuntimesStatus {
+        let mut rt = ollama_running();
+        rt.llama_cpp = RuntimeStatus {
+            installed: true,
+            version: None,
+            running: false,
+        };
+        rt
+    }
+
+    #[test]
+    fn serve_llama_cpp_only_variant_never_uses_ollama_even_if_running() {
+        let m = mmproj_model();
+        let p = plan_serve(&m, &m.variants[0], &ollama_and_llama_cpp(), None).unwrap();
+        assert_eq!(
+            p.server_argv,
+            Some(vec![
+                "llama-server".to_string(),
+                "-hf".to_string(),
+                "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_M".to_string(),
+                "--port".to_string(),
+                "8080".to_string(),
+            ])
+        );
+        assert!(
+            p.pre_steps.is_empty(),
+            "must not ollama pull: {:?}",
+            p.pre_steps
+        );
+        assert_eq!(p.runtime, RuntimeKind::LlamaCpp);
+        assert!(p.install.is_none());
+    }
+
+    #[test]
+    fn serve_llama_cpp_only_variant_without_runtimes_proposes_llama_cpp_install() {
+        let m = mmproj_model();
+        let p = plan_serve(&m, &m.variants[0], &RuntimesStatus::default(), None).unwrap();
+        let install = p.install.expect("must propose install");
+        assert_eq!(install.kind, RuntimeKind::LlamaCpp);
+        assert_eq!(install.argv, vec!["brew", "install", "llama.cpp"]);
+        // plan still shows what will run post-install: llama-server shape
+        let argv = p.server_argv.expect("llama-server argv");
+        assert_eq!(argv[0], "llama-server");
+        assert_eq!(p.endpoint, "http://127.0.0.1:8080");
+        assert_eq!(p.ready_path, "/health");
+        assert_eq!(p.runtime, RuntimeKind::LlamaCpp);
+    }
+
+    #[test]
+    fn serve_llama_cpp_only_variant_with_only_ollama_running_still_llama_server() {
+        let m = mmproj_model();
+        let p = plan_serve(&m, &m.variants[0], &ollama_running(), None).unwrap();
+        assert_eq!(p.runtime, RuntimeKind::LlamaCpp);
+        assert!(p.pre_steps.is_empty());
+        let install = p.install.expect("llama.cpp not installed → propose it");
+        assert_eq!(install.argv, vec!["brew", "install", "llama.cpp"]);
+    }
+
+    #[test]
+    fn run_llama_cpp_only_variant_uses_llama_cli() {
+        let m = mmproj_model();
+        let plan = plan_run(&m, &m.variants[0], &ollama_and_llama_cpp()).unwrap();
+        assert_eq!(
+            plan.argv,
+            vec![
+                "llama-cli",
+                "-hf",
+                "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_M"
+            ]
+        );
+        assert!(plan.install.is_none());
+    }
+
+    #[test]
+    fn run_llama_cpp_only_variant_without_runtimes_proposes_llama_cpp_install() {
+        let m = mmproj_model();
+        let plan = plan_run(&m, &m.variants[0], &RuntimesStatus::default()).unwrap();
+        assert_eq!(plan.argv[0], "llama-cli");
+        let install = plan.install.expect("must propose install");
+        assert_eq!(install.kind, RuntimeKind::LlamaCpp);
+        assert_eq!(install.argv, vec!["brew", "install", "llama.cpp"]);
+    }
+
+    #[test]
+    fn ud_quants_accepted_on_ollama_path_too() {
+        // UD- tags now have a known bpw and name a real file in the repo, so
+        // the hf.co ref is valid for ollama-compatible variants.
+        let mut m = hf_model();
+        m.variants = vec![variant(
+            "UD-Q4_K_M",
+            vec![RuntimeKind::Ollama, RuntimeKind::LlamaCpp],
+        )];
+        let plan = plan_run(&m, &m.variants[0], &with_ollama()).unwrap();
+        assert_eq!(
+            plan.argv,
+            vec![
+                "ollama",
+                "run",
+                "hf.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:UD-Q4_K_M"
+            ]
+        );
     }
 
     #[test]
