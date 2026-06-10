@@ -54,6 +54,8 @@ fn main() -> Result<()> {
             hf_limit,
             mlx_limit,
             no_ollama_registry,
+            discover_limit,
+            no_discover,
         }) => {
             let db = app.open_db()?;
             let http = paddock_core::catalog::hf::ReqwestClient::new()?;
@@ -61,6 +63,7 @@ fn main() -> Result<()> {
                 hf_limit,
                 mlx_limit,
                 ollama_registry: !no_ollama_registry,
+                discover_limit: (!no_discover).then_some(discover_limit),
             };
             let report = tokio::runtime::Runtime::new()?
                 .block_on(paddock_core::catalog::sync(&http, &db, &opts))?;
@@ -68,8 +71,12 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!(
-                    "synced: {} curated ({} ollama tags), {} huggingface, {} mlx",
-                    report.curated, report.ollama_tags, report.huggingface, report.mlx
+                    "synced: {} curated ({} ollama tags), {} discovered, {} huggingface, {} mlx",
+                    report.curated,
+                    report.ollama_tags,
+                    report.discovered,
+                    report.huggingface,
+                    report.mlx
                 );
                 for e in &report.errors {
                     eprintln!("warning: {e}");

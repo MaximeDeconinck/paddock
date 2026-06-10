@@ -154,6 +154,10 @@ pub struct SyncOptions {
     /// Enrich curated Ollama models with the real library tag list
     /// (one request per model base name; best-effort).
     pub ollama_registry: bool,
+    /// Auto-discover this many top library models beyond the curated set
+    /// (tags page + manifest + 256 KiB GGUF probe each; best-effort).
+    /// None disables discovery.
+    pub discover_limit: Option<usize>,
 }
 
 impl Default for SyncOptions {
@@ -162,6 +166,7 @@ impl Default for SyncOptions {
             hf_limit: 100,
             mlx_limit: 60,
             ollama_registry: true,
+            discover_limit: Some(60),
         }
     }
 }
@@ -171,6 +176,8 @@ pub struct SyncReport {
     pub curated: usize,
     /// Curated variants enriched with an exact Ollama library tag.
     pub ollama_tags: usize,
+    /// Uncurated Ollama library models discovered via registry manifests.
+    pub discovered: usize,
     pub huggingface: usize,
     pub mlx: usize,
     pub errors: Vec<String>,
@@ -223,6 +230,9 @@ pub async fn sync(
                 .errors
                 .push(format!("curated upsert {}: {e}", m.name)),
         }
+    }
+    if let Some(limit) = opts.discover_limit {
+        discover_library_models(http, db, &curated_models, limit, &mut report).await;
     }
     match hf::fetch_hf_gguf(http, opts.hf_limit).await {
         Ok(models) => {
@@ -319,6 +329,46 @@ async fn enrich_curated_with_registry(
             // Empty selection: the registry answered but lists no usable tag
             // for this size — the curated baseline stands (and is upserted).
             ollama_registry::enrich_with_tags(m, &selected);
+        }
+    }
+}
+
+/// Best-effort discovery of uncurated Ollama library models: index page in
+/// popularity order, minus the curated base names, first `limit` entries.
+/// Each candidate costs a tags page + one manifest + one 256 KiB header
+/// probe; failures are reported per model and never fatal.
+async fn discover_library_models(
+    http: &dyn hf::HttpClient,
+    db: &db::Db,
+    curated_models: &[CatalogModel],
+    limit: usize,
+    report: &mut SyncReport,
+) {
+    let index = match ollama_registry::fetch_library_index(http).await {
+        Ok(names) => names,
+        Err(e) => {
+            report.errors.push(format!("ollama discovery index: {e}"));
+            return;
+        }
+    };
+    let curated_bases: std::collections::HashSet<&str> = curated_models
+        .iter()
+        .map(|m| m.name.split(':').next().unwrap_or(&m.name))
+        .collect();
+    for name in index
+        .iter()
+        .filter(|n| !curated_bases.contains(n.as_str()))
+        .take(limit)
+    {
+        match ollama_registry::discover_model(http, name).await {
+            Ok(Some(m)) => match db.upsert_model(&m) {
+                Ok(_) => report.discovered += 1,
+                Err(e) => report
+                    .errors
+                    .push(format!("discover upsert {}: {e}", m.name)),
+            },
+            Ok(None) => {} // deliberately skipped (cloud-only, embeddings, …)
+            Err(e) => report.errors.push(format!("discover {name}: {e}")),
         }
     }
 }
@@ -432,6 +482,12 @@ mod tests {
             "expected per-base registry errors, got {:?}",
             report.errors
         );
+        // Discovery degrades to a single index error, nothing discovered.
+        assert_eq!(report.discovered, 0);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.contains("ollama discovery index")));
         assert!(report.errors.iter().any(|e| e.contains("huggingface")));
         assert!(report.errors.iter().any(|e| e.contains("mlx")));
         // last_sync set even on network failure
@@ -454,6 +510,7 @@ mod tests {
         let http = FailingHttp;
         let opts = SyncOptions {
             ollama_registry: false,
+            discover_limit: None, // isolate the registry knob
             ..SyncOptions::default()
         };
 
@@ -685,5 +742,154 @@ mod tests {
         let m = models.iter().find(|m| m.name == "llama3.1:8b").unwrap();
         assert_eq!(m.variants.len(), 1);
         assert_eq!(m.variants[0].source_tag, None);
+    }
+
+    /// MockHttp serving text pages, JSON manifests and blob ranges; anything
+    /// unregistered fails like a network error.
+    #[derive(Default)]
+    struct DiscoveryHttp {
+        text: std::collections::HashMap<String, String>,
+        json: std::collections::HashMap<String, Value>,
+        ranges: std::collections::HashMap<String, Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl hf::HttpClient for DiscoveryHttp {
+        async fn get_json(&self, url: &str) -> Result<Value, PaddockError> {
+            self.json
+                .get(url)
+                .cloned()
+                .ok_or_else(|| PaddockError::Network(format!("mock failure: {url}")))
+        }
+
+        async fn get_text(&self, url: &str) -> Result<String, PaddockError> {
+            self.text
+                .get(url)
+                .cloned()
+                .ok_or_else(|| PaddockError::Network(format!("mock failure: {url}")))
+        }
+
+        async fn get_range(
+            &self,
+            url: &str,
+            _start: u64,
+            _end: u64,
+        ) -> Result<Vec<u8>, PaddockError> {
+            self.ranges
+                .get(url)
+                .cloned()
+                .ok_or_else(|| PaddockError::Network(format!("mock failure: {url}")))
+        }
+    }
+
+    /// Register the full discovery chain for one uncurated model.
+    fn add_lfm25_fixtures(http: &mut DiscoveryHttp) {
+        http.text.insert(
+            "https://ollama.com/library/lfm2.5/tags".to_string(),
+            r#"
+                <a href="/library/lfm2.5:1.2b">1.2b</a>
+                <a href="/library/lfm2.5:1.2b-q8_0">x</a>
+            "#
+            .to_string(),
+        );
+        http.json.insert(
+            "https://registry.ollama.ai/v2/library/lfm2.5/manifests/1.2b".to_string(),
+            serde_json::json!({
+                "schemaVersion": 2,
+                "layers": [{
+                    "mediaType": "application/vnd.ollama.image.model",
+                    "digest": "sha256:blob",
+                    "size": 736_000_000u64
+                }]
+            }),
+        );
+        http.ranges.insert(
+            "https://registry.ollama.ai/v2/library/lfm2.5/blobs/sha256:blob".to_string(),
+            gguf::tests::GgufBuilder::new()
+                .string("general.architecture", "lfm2moe")
+                .u64("general.parameter_count", 1_170_000_000)
+                .u32("lfm2moe.block_count", 16)
+                .u32("lfm2moe.attention.head_count", 16)
+                .u32("lfm2moe.attention.head_count_kv", 4)
+                .u32("lfm2moe.embedding_length", 2048)
+                .u32("lfm2moe.context_length", 32768)
+                .build(),
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_discovers_uncurated_library_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::Db::open(dir.path().join("catalog.db")).unwrap();
+
+        // Index lists a curated base (llama3.1 — must be skipped, no fixtures
+        // needed) and one uncurated model with a full discovery chain.
+        let mut http = DiscoveryHttp::default();
+        http.text.insert(
+            "https://ollama.com/library".to_string(),
+            r#"
+                <a href="/library/llama3.1"><h2>llama3.1</h2></a>
+                <a href="/library/lfm2.5"><h2>lfm2.5</h2></a>
+            "#
+            .to_string(),
+        );
+        add_lfm25_fixtures(&mut http);
+
+        let report = sync(&http, &db, &SyncOptions::default()).await.unwrap();
+
+        assert_eq!(report.discovered, 1, "errors: {:?}", report.errors);
+        // Curated base on the index must not be re-discovered (its manifest
+        // fixture does not exist, so an attempt would surface as an error).
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|e| e.contains("discover llama3.1")),
+            "curated bases must be excluded from discovery: {:?}",
+            report.errors
+        );
+
+        let models = db.list_models().unwrap();
+        let m = models.iter().find(|m| m.name == "lfm2.5:1.2b").unwrap();
+        assert_eq!(m.source, Source::Ollama);
+        assert_eq!(m.architecture.as_deref(), Some("lfm2moe"));
+        assert_eq!(m.params_total, 1_170_000_000);
+        assert_eq!(m.variants.len(), 2);
+        assert!(m.variants.iter().all(|v| v.source_tag.is_some()));
+    }
+
+    #[tokio::test]
+    async fn sync_discover_limit_caps_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::Db::open(dir.path().join("catalog.db")).unwrap();
+
+        // Two uncurated names; limit 1 → the second (fixture-less, would
+        // error if attempted) must never be fetched.
+        let mut http = DiscoveryHttp::default();
+        http.text.insert(
+            "https://ollama.com/library".to_string(),
+            r#"
+                <a href="/library/lfm2.5"><h2>lfm2.5</h2></a>
+                <a href="/library/somemodel"><h2>somemodel</h2></a>
+            "#
+            .to_string(),
+        );
+        add_lfm25_fixtures(&mut http);
+        let opts = SyncOptions {
+            discover_limit: Some(1),
+            ..SyncOptions::default()
+        };
+
+        let report = sync(&http, &db, &opts).await.unwrap();
+
+        assert_eq!(report.discovered, 1, "errors: {:?}", report.errors);
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|e| e.contains("discover somemodel")),
+            "limit must cap discovery attempts: {:?}",
+            report.errors
+        );
     }
 }

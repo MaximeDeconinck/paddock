@@ -123,6 +123,14 @@ fn sync_help_lists_catalog_flags() {
         help.contains("--no-ollama-registry"),
         "missing --no-ollama-registry:\n{help}"
     );
+    assert!(
+        help.contains("--discover-limit"),
+        "missing --discover-limit:\n{help}"
+    );
+    assert!(
+        help.contains("--no-discover"),
+        "missing --no-discover:\n{help}"
+    );
 }
 
 #[test]

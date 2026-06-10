@@ -16,6 +16,12 @@ pub struct GgufMeta {
     pub head_count_kv: Option<u64>,
     pub embedding_length: Option<u64>,
     pub context_length: Option<u64>,
+    /// `general.parameter_count` — total weight count, when published.
+    pub parameter_count: Option<u64>,
+    /// `{arch}.expert_count` — total experts of a MoE model.
+    pub expert_count: Option<u64>,
+    /// `{arch}.expert_used_count` — experts active per token.
+    pub expert_used_count: Option<u64>,
 }
 
 impl GgufMeta {
@@ -107,6 +113,11 @@ fn decode_scalar_u64(ty: u32, raw: &[u8]) -> Option<u64> {
 }
 
 fn all_tracked_filled(m: &GgufMeta) -> bool {
+    // Includes the optional-in-practice fields (parameter_count, expert_*):
+    // early exit must never skip a tracked key still ahead in the buffer.
+    // When a file lacks them the full (in-memory, <= a few MiB) buffer is
+    // scanned instead — skipping bytes is cheap, and probe truncation is
+    // handled separately in `parse_gguf_header`.
     m.architecture.is_some()
         && m.name.is_some()
         && m.block_count.is_some()
@@ -114,6 +125,9 @@ fn all_tracked_filled(m: &GgufMeta) -> bool {
         && m.head_count_kv.is_some()
         && m.embedding_length.is_some()
         && m.context_length.is_some()
+        && m.parameter_count.is_some()
+        && m.expert_count.is_some()
+        && m.expert_used_count.is_some()
 }
 
 /// Parse one key/value pair, updating `meta` for tracked keys.
@@ -170,6 +184,12 @@ fn parse_kv(r: &mut Reader, meta: &mut GgufMeta) -> Result<(), PaddockError> {
         meta.embedding_length = value_u64;
     } else if key.ends_with(".context_length") {
         meta.context_length = value_u64;
+    } else if key == "general.parameter_count" {
+        meta.parameter_count = value_u64;
+    } else if key.ends_with(".expert_used_count") {
+        meta.expert_used_count = value_u64;
+    } else if key.ends_with(".expert_count") {
+        meta.expert_count = value_u64;
     }
     let _ = value_str; // keys we don't track are simply skipped
     Ok(())
@@ -246,6 +266,14 @@ pub(crate) mod tests {
         pub(crate) fn u32(mut self, key: &str, val: u32) -> Self {
             self.push_key(key);
             self.kvs.extend(4u32.to_le_bytes()); // type 4 = u32
+            self.kvs.extend(val.to_le_bytes());
+            self.count += 1;
+            self
+        }
+
+        pub(crate) fn u64(mut self, key: &str, val: u64) -> Self {
+            self.push_key(key);
+            self.kvs.extend(10u32.to_le_bytes()); // type 10 = u64
             self.kvs.extend(val.to_le_bytes());
             self.count += 1;
             self
@@ -388,27 +416,56 @@ pub(crate) mod tests {
 
     #[test]
     fn early_exit_once_all_tracked_fields_filled() {
-        // All seven tracked fields appear before a giant array; the parser
-        // must return without needing the array bytes at all.
+        // Every tracked field appears before a giant array; the parser must
+        // return without needing the array bytes at all.
         let full = GgufBuilder::new()
             .string("general.architecture", "llama")
             .string("general.name", "Llama Test")
+            .u64("general.parameter_count", 8_030_000_000)
             .u32("llama.block_count", 32)
             .u32("llama.attention.head_count", 32)
             .u32("llama.attention.head_count_kv", 8)
             .u32("llama.embedding_length", 4096)
             .u32("llama.context_length", 131072)
+            .u32("llama.expert_count", 8)
+            .u32("llama.expert_used_count", 2)
             .u32_array("tokenizer.ggml.token_ids", &vec![7u32; 100_000])
             .build();
         let cut = full.len() - 200_000; // cut deep inside the array
         let m = parse_gguf_header(&full[..cut]).unwrap();
         assert_eq!(m.architecture.as_deref(), Some("llama"));
         assert_eq!(m.name.as_deref(), Some("Llama Test"));
+        assert_eq!(m.parameter_count, Some(8_030_000_000));
         assert_eq!(m.block_count, Some(32));
         assert_eq!(m.head_count, Some(32));
         assert_eq!(m.head_count_kv, Some(8));
         assert_eq!(m.embedding_length, Some(4096));
         assert_eq!(m.context_length, Some(131072));
+        assert_eq!(m.expert_count, Some(8));
+        assert_eq!(m.expert_used_count, Some(2));
+    }
+
+    #[test]
+    fn parameter_count_and_expert_counts_parsed() {
+        let bytes = GgufBuilder::new()
+            .string("general.architecture", "qwen3moe")
+            .u64("general.parameter_count", 30_500_000_000)
+            .u32("qwen3moe.expert_count", 128)
+            .u32("qwen3moe.expert_used_count", 8)
+            .build();
+        let m = parse_gguf_header(&bytes).unwrap();
+        assert_eq!(m.parameter_count, Some(30_500_000_000));
+        assert_eq!(m.expert_count, Some(128));
+        assert_eq!(m.expert_used_count, Some(8));
+        // `.expert_used_count` must not also fill `.expert_count` (or vice
+        // versa) through the suffix matching.
+        let dense = GgufBuilder::new()
+            .string("general.architecture", "llama")
+            .build();
+        let m = parse_gguf_header(&dense).unwrap();
+        assert_eq!(m.parameter_count, None);
+        assert_eq!(m.expert_count, None);
+        assert_eq!(m.expert_used_count, None);
     }
 
     #[test]

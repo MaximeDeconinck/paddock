@@ -55,18 +55,19 @@ runtimes    ollama 0.30.6 (running)
 
 ```text
 $ paddock sync
-synced: 78 curated (461 ollama tags), 85 huggingface, 20 mlx
+synced: 78 curated (461 ollama tags), 43 discovered, 85 huggingface, 20 mlx
 ```
 
-Three sources:
+Four sources:
 
 1. **Curated Ollama models** — an embedded list of ~78 popular text-generation models with hand-checked architecture parameters (layers, KV heads, context). Always works offline.
-2. **Hugging Face GGUF** — the most-downloaded GGUF repos, with architecture details read from GGUF headers via HTTP Range requests (no full downloads).
-3. **mlx-community** — Apple-native MLX quantizations.
+2. **Discovered Ollama models** — the top of the Ollama library *beyond* the curated list, fully automatic: for each model, sync reads the tag list, fetches one OCI manifest from `registry.ollama.ai`, and Range-reads the first 256 KiB of the weights blob to parse the real GGUF header (architecture, layers, KV heads, parameter count, context). No curation needed — brand-new architectures show up with correct fit estimates. Cloud-only builds (`*-cloud`) and embedding/vision-encoder architectures are skipped.
+3. **Hugging Face GGUF** — the most-downloaded GGUF repos, with architecture details read from GGUF headers via HTTP Range requests (no full downloads).
+4. **mlx-community** — Apple-native MLX quantizations.
 
 On top of the curated list, sync enriches each model with the **live tag list of the Ollama library** (one request per model family): it extracts tag names from the URL pattern on `ollama.com/library/{model}/tags` and keeps one tag per known quantization (`8b-instruct-q4_K_M`, `8b-instruct-q8_0`, …), so `paddock run` launches the exact tag instead of the library default. This step is best-effort — registry errors degrade to warnings and the curated data stands.
 
-Flags: `--hf-limit N` (default 100) and `--mlx-limit N` (default 60) bound the network sources; `--no-ollama-registry` skips the live tag enrichment for a fully offline-friendly sync.
+Flags: `--hf-limit N` (default 100) and `--mlx-limit N` (default 60) bound the network sources; `--discover-limit N` (default 60) bounds library auto-discovery and `--no-discover` turns it off; `--no-ollama-registry` skips the live tag enrichment for a fully offline-friendly sync.
 
 ### `paddock fit` — what fits, ranked
 

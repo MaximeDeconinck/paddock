@@ -15,8 +15,22 @@
 //! anonymously and returns layer sizes.
 
 use super::hf::HttpClient;
-use super::{quant_bpw, CatalogModel, CatalogVariant, RuntimeKind};
+use super::{quant_bpw, CatalogModel, CatalogVariant, RuntimeKind, Source};
 use crate::PaddockError;
+
+const REGISTRY: &str = "https://registry.ollama.ai/v2/library";
+/// PRE-VERIFIED (live curl, 2026-06-10): manifests require this Accept header
+/// and answer anonymously with the layer list (digest + size per layer).
+const MANIFEST_ACCEPT: &str = "application/vnd.docker.distribution.manifest.v2+json";
+/// PRE-VERIFIED (live curl, 2026-06-10): a blob GET with `Range:
+/// bytes=0-262143` returns HTTP 206 (after a redirect reqwest follows by
+/// default) whose first bytes are a parseable GGUF v3 header.
+const BLOB_PROBE_BYTES: u64 = 256 * 1024;
+/// Plain library tags (`8b`) conventionally alias the q4_K_M build; the
+/// manifest does not name the quant, so discovery assumes the convention.
+const DEFAULT_LIBRARY_QUANT: &str = "Q4_K_M";
+/// Embeddings/vision architectures are out of scope for a text-gen catalog.
+const ARCH_SKIPLIST: &[&str] = &["bert", "nomic-bert", "clip"];
 
 /// One Ollama library tag kept for a curated model size.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +65,187 @@ pub async fn fetch_model_tags(
         }
     }
     Ok(tags)
+}
+
+/// Fetch the library index page and extract every model name, in page order
+/// (= popularity order), deduplicated.
+///
+/// PRE-VERIFIED (live curl, 2026-06-10): `https://ollama.com/library` exposes
+/// 234 model names via the URL pattern `href="/library/{name}"` — same
+/// semi-stable URL-scheme extraction as `fetch_model_tags`.
+pub async fn fetch_library_index(http: &dyn HttpClient) -> Result<Vec<String>, PaddockError> {
+    let html = http.get_text("https://ollama.com/library").await?;
+    let needle = "href=\"/library/";
+    let mut names: Vec<String> = Vec::new();
+    for (idx, _) in html.match_indices(needle) {
+        let tail = &html[idx + needle.len()..];
+        // A name stops at any char outside the Ollama name alphabet — note
+        // ':' is excluded, so tag links (`/library/{name}:{tag}`) still yield
+        // the bare name and deduplicate away.
+        let name: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            .collect();
+        if !name.is_empty() && !names.iter().any(|n| n == &name) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// Fetch the OCI manifest of `{base}:{tag}` and return the (digest, size) of
+/// its model-weights layer (mediaType `application/vnd.ollama.image.model`).
+pub async fn fetch_manifest_model_blob(
+    http: &dyn HttpClient,
+    base: &str,
+    tag: &str,
+) -> Result<(String, u64), PaddockError> {
+    let manifest = http
+        .get_json_with_accept(
+            &format!("{REGISTRY}/{base}/manifests/{tag}"),
+            MANIFEST_ACCEPT,
+        )
+        .await?;
+    for layer in manifest["layers"].as_array().unwrap_or(&Vec::new()) {
+        if !layer["mediaType"].as_str().unwrap_or("").contains("model") {
+            continue;
+        }
+        let Some(digest) = layer["digest"].as_str() else {
+            continue;
+        };
+        return Ok((digest.to_string(), layer["size"].as_u64().unwrap_or(0)));
+    }
+    Err(PaddockError::Network(format!(
+        "{base}:{tag}: manifest has no model layer"
+    )))
+}
+
+/// Parse a library size token (`8b`, `1.2b`, `350m`) into a parameter count.
+fn params_from_size_token(size: &str) -> Option<u64> {
+    let digits = size.strip_suffix('b').or_else(|| size.strip_suffix('m'))?;
+    let v: f64 = digits.parse().ok()?;
+    if !(v.is_finite() && v > 0.0) {
+        return None;
+    }
+    let scale = if size.ends_with('b') { 1e9 } else { 1e6 };
+    Some((v * scale) as u64)
+}
+
+/// Discover one uncurated library model from its tags page + one registry
+/// manifest + one 256 KiB GGUF header probe. `Ok(None)` = deliberately
+/// skipped (cloud-only, embeddings/vision architecture, unusable header);
+/// `Err` = network failure worth reporting.
+///
+/// v1 probes ONLY the first-seen (most popular) size and creates that one
+/// model; other sizes are skipped — arch params can differ per size, so each
+/// size would need its own header probe. Per-size probes are a
+/// request-budget tradeoff; revisit.
+pub async fn discover_model(
+    http: &dyn HttpClient,
+    name: &str,
+) -> Result<Option<CatalogModel>, PaddockError> {
+    let tags = fetch_model_tags(http, name).await?;
+    // Ollama Cloud builds are excluded by user decision: they do not run
+    // locally. A model whose every quant-bearing tag is cloud yields None.
+    let tags: Vec<String> = tags
+        .into_iter()
+        .filter(|t| !t.ends_with("-cloud"))
+        .collect();
+    // First-seen size prefix = first tag segment carrying a digit ("8b",
+    // "1.2b", "e2b", …); "latest" and word-only tags ("instruct") skipped.
+    let Some(size) = tags
+        .iter()
+        .filter(|t| *t != "latest")
+        .map(|t| t.split('-').next().unwrap_or(t))
+        .find(|s| s.chars().any(|c| c.is_ascii_digit()))
+        .map(String::from)
+    else {
+        return Ok(None);
+    };
+    let selected = select_variant_tags(&tags, &size, DEFAULT_LIBRARY_QUANT);
+    let Some(probe) = selected.first() else {
+        return Ok(None);
+    };
+    let (digest, blob_size) = fetch_manifest_model_blob(http, name, &probe.tag).await?;
+    let bytes = http
+        .get_range(
+            &format!("{REGISTRY}/{name}/blobs/{digest}"),
+            0,
+            BLOB_PROBE_BYTES - 1,
+        )
+        .await?;
+    let Ok(meta) = super::gguf::parse_gguf_header(&bytes) else {
+        return Ok(None);
+    };
+    let arch = meta.architecture.clone();
+    if let Some(a) = arch.as_deref() {
+        if ARCH_SKIPLIST.contains(&a) {
+            return Ok(None);
+        }
+    }
+    let layers = meta.block_count.unwrap_or(0) as u32;
+    let kv_heads = meta.head_count_kv.or(meta.head_count).unwrap_or(0) as u32;
+    let head_dim = meta.head_dim().unwrap_or(0) as u32;
+    let embedding_dim = meta.embedding_length.unwrap_or(0) as u32;
+    if layers == 0 || kv_heads == 0 || head_dim == 0 || embedding_dim == 0 {
+        return Ok(None); // cannot estimate without the attention shape
+    }
+    // Param fallback chain: exact header count → weights-blob size divided by
+    // the probed quant's bits-per-weight → the size token itself.
+    let Some(params_total) = meta
+        .parameter_count
+        .filter(|p| *p > 0)
+        .or_else(|| {
+            quant_bpw(&probe.quant)
+                .filter(|_| blob_size > 0)
+                .map(|bpw| (blob_size as f64 * 8.0 / bpw) as u64)
+        })
+        .or_else(|| params_from_size_token(&size))
+    else {
+        return Ok(None);
+    };
+    let params_active = match (meta.expert_count, meta.expert_used_count) {
+        // Rough MoE approximation: active ≈ total × used/total experts
+        // (ignores the dense shared layers — good enough for fit estimates).
+        (Some(experts), Some(used)) if used > 0 && used < experts => {
+            (params_total as f64 * used as f64 / experts as f64) as u64
+        }
+        _ => params_total,
+    };
+    let variants: Vec<CatalogVariant> = selected
+        .iter()
+        .filter_map(|t| {
+            quant_bpw(&t.quant).map(|bpw| CatalogVariant {
+                quant: t.quant.clone(),
+                bpw,
+                // Only the probed tag's weights-blob size is known; other
+                // tags would each cost a manifest request.
+                file_size_bytes: (t.tag == probe.tag && blob_size > 0).then_some(blob_size),
+                layers,
+                kv_heads,
+                head_dim,
+                embedding_dim,
+                runtime_compat: vec![RuntimeKind::Ollama],
+                source_tag: Some(t.tag.clone()),
+            })
+        })
+        .collect();
+    if variants.is_empty() {
+        return Ok(None);
+    }
+    let context_max = meta.context_length.unwrap_or(0) as u32;
+    Ok(Some(CatalogModel {
+        id: 0,
+        name: format!("{name}:{size}"),
+        family: arch.clone(),
+        source: Source::Ollama,
+        repo: None,
+        params_total,
+        params_active,
+        architecture: arch,
+        context_max: if context_max == 0 { 4096 } else { context_max },
+        variants,
+    }))
 }
 
 /// Map a lowercased tag quant suffix to a catalog quant known to `quant_bpw`.
@@ -182,19 +377,27 @@ mod tests {
     use std::collections::HashMap;
 
     use async_trait::async_trait;
-    use serde_json::Value;
+    use serde_json::{json, Value};
 
     use super::*;
-    use crate::catalog::Source;
+    use crate::catalog::gguf::tests::GgufBuilder;
 
+    #[derive(Default)]
     struct MockHttp {
         text: HashMap<String, String>,
+        json: HashMap<String, Value>,
+        ranges: HashMap<String, Vec<u8>>,
     }
 
     #[async_trait]
     impl HttpClient for MockHttp {
+        // `get_json_with_accept` keeps the trait's default impl, which must
+        // delegate here — manifest fixtures are registered as plain json.
         async fn get_json(&self, url: &str) -> Result<Value, PaddockError> {
-            Err(PaddockError::Network(format!("mock: no json for {url}")))
+            self.json
+                .get(url)
+                .cloned()
+                .ok_or_else(|| PaddockError::Network(format!("mock: no json for {url}")))
         }
 
         async fn get_text(&self, url: &str) -> Result<String, PaddockError> {
@@ -210,7 +413,10 @@ mod tests {
             _start: u64,
             _end: u64,
         ) -> Result<Vec<u8>, PaddockError> {
-            Err(PaddockError::Network(format!("mock: no range for {url}")))
+            self.ranges
+                .get(url)
+                .cloned()
+                .ok_or_else(|| PaddockError::Network(format!("mock: no range for {url}")))
         }
     }
 
@@ -234,12 +440,12 @@ mod tests {
 </body></html>"#;
 
     fn http_with_llama31() -> MockHttp {
-        let mut text = HashMap::new();
-        text.insert(
+        let mut http = MockHttp::default();
+        http.text.insert(
             "https://ollama.com/library/llama3.1/tags".to_string(),
             LLAMA31_TAGS_HTML.to_string(),
         );
-        MockHttp { text }
+        http
     }
 
     #[tokio::test]
@@ -265,9 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_model_tags_propagates_network_error() {
-        let http = MockHttp {
-            text: HashMap::new(),
-        };
+        let http = MockHttp::default();
         assert!(fetch_model_tags(&http, "llama3.1").await.is_err());
     }
 
@@ -478,6 +682,251 @@ mod tests {
         assert_eq!(m.variants[0].quant, "Q4_K_M");
         assert_eq!(m.variants[0].source_tag, None);
         assert_eq!(m.variants[0].file_size_bytes, Some(4_920_000_000));
+    }
+
+    /// Realistic excerpt of https://ollama.com/library — names appear once
+    /// per card, sometimes again as tag links; non-library links are noise.
+    const LIBRARY_INDEX_HTML: &str = r#"<!DOCTYPE html>
+<html><body>
+<a href="/library/gemma3"><h2>gemma3</h2></a>
+<a href="/library/deepseek-r1"><h2>deepseek-r1</h2></a>
+<a href="/library/llama3.1"><h2>llama3.1</h2></a>
+<a href="/library/gemma3">duplicate card link</a>
+<a href="/library/lfm2.5:1.2b">tag link must dedup to the base name</a>
+<a href="/library/lfm2.5"><h2>lfm2.5</h2></a>
+<a href="/blog/new-models">blog link</a>
+<a href="/download">download</a>
+</body></html>"#;
+
+    #[tokio::test]
+    async fn fetch_library_index_extracts_names_deduped_in_order() {
+        let mut http = MockHttp::default();
+        http.text.insert(
+            "https://ollama.com/library".to_string(),
+            LIBRARY_INDEX_HTML.to_string(),
+        );
+        let names = fetch_library_index(&http).await.unwrap();
+        assert_eq!(names, vec!["gemma3", "deepseek-r1", "llama3.1", "lfm2.5"]);
+    }
+
+    #[tokio::test]
+    async fn fetch_library_index_propagates_network_error() {
+        let http = MockHttp::default();
+        assert!(fetch_library_index(&http).await.is_err());
+    }
+
+    /// Manifest fixture shaped like a real registry.ollama.ai answer.
+    fn manifest_json(digest: &str, size: u64) -> Value {
+        json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "digest": "sha256:config",
+                "size": 489
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.ollama.image.model",
+                    "digest": digest,
+                    "size": size
+                },
+                {
+                    "mediaType": "application/vnd.ollama.image.template",
+                    "digest": "sha256:tmpl",
+                    "size": 120
+                }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn fetch_manifest_model_blob_picks_model_layer() {
+        let mut http = MockHttp::default();
+        http.json.insert(
+            "https://registry.ollama.ai/v2/library/lfm2.5/manifests/1.2b".to_string(),
+            manifest_json("sha256:abc123", 736_000_000),
+        );
+        let (digest, size) = fetch_manifest_model_blob(&http, "lfm2.5", "1.2b")
+            .await
+            .unwrap();
+        assert_eq!(digest, "sha256:abc123");
+        assert_eq!(size, 736_000_000);
+    }
+
+    #[tokio::test]
+    async fn fetch_manifest_without_model_layer_is_error() {
+        let mut http = MockHttp::default();
+        http.json.insert(
+            "https://registry.ollama.ai/v2/library/x/manifests/1b".to_string(),
+            json!({"layers": [{"mediaType": "application/vnd.ollama.image.template",
+                               "digest": "sha256:t", "size": 1}]}),
+        );
+        assert!(fetch_manifest_model_blob(&http, "x", "1b").await.is_err());
+    }
+
+    #[test]
+    fn params_from_size_token_cases() {
+        assert_eq!(params_from_size_token("8b"), Some(8_000_000_000));
+        assert_eq!(params_from_size_token("1.2b"), Some(1_200_000_000));
+        assert_eq!(params_from_size_token("350m"), Some(350_000_000));
+        assert_eq!(params_from_size_token("e2b"), None); // gemma3n effective size
+        assert_eq!(params_from_size_token("latest"), None);
+    }
+
+    /// Full discovery fixture for an lfm2.5-like model: tags page + manifest
+    /// + blob header. `header` lets each test vary the GGUF metadata.
+    fn discovery_http(tags_html: &str, blob_size: u64, header: Vec<u8>) -> MockHttp {
+        let mut http = MockHttp::default();
+        http.text.insert(
+            "https://ollama.com/library/lfm2.5/tags".to_string(),
+            tags_html.to_string(),
+        );
+        http.json.insert(
+            "https://registry.ollama.ai/v2/library/lfm2.5/manifests/1.2b".to_string(),
+            manifest_json("sha256:blob", blob_size),
+        );
+        http.ranges.insert(
+            "https://registry.ollama.ai/v2/library/lfm2.5/blobs/sha256:blob".to_string(),
+            header,
+        );
+        http
+    }
+
+    const LFM25_TAGS_HTML: &str = r#"
+        <a href="/library/lfm2.5:latest">latest</a>
+        <a href="/library/lfm2.5:1.2b">1.2b</a>
+        <a href="/library/lfm2.5:350m">350m</a>
+        <a href="/library/lfm2.5:1.2b-q4_K_M">x</a>
+        <a href="/library/lfm2.5:1.2b-q8_0">x</a>
+        <a href="/library/lfm2.5:1.2b-cloud">cloud build must be skipped</a>
+        <a href="/library/lfm2.5:350m-q4_K_M">x</a>
+    "#;
+
+    fn lfm25_header() -> GgufBuilder {
+        GgufBuilder::new()
+            .string("general.architecture", "lfm2moe")
+            .u64("general.parameter_count", 1_170_000_000)
+            .u32("lfm2moe.block_count", 16)
+            .u32("lfm2moe.attention.head_count", 16)
+            .u32("lfm2moe.attention.head_count_kv", 4)
+            .u32("lfm2moe.embedding_length", 2048)
+            .u32("lfm2moe.context_length", 32768)
+    }
+
+    #[tokio::test]
+    async fn discover_model_builds_first_seen_size_only() {
+        let http = discovery_http(LFM25_TAGS_HTML, 736_000_000, lfm25_header().build());
+        let m = discover_model(&http, "lfm2.5").await.unwrap().unwrap();
+
+        // First-seen size only (1.2b); 350m skipped in v1.
+        assert_eq!(m.name, "lfm2.5:1.2b");
+        assert_eq!(m.source, Source::Ollama);
+        assert_eq!(m.architecture.as_deref(), Some("lfm2moe"));
+        assert_eq!(m.params_total, 1_170_000_000); // exact header count wins
+        assert_eq!(m.params_active, 1_170_000_000); // no expert keys → dense
+        assert_eq!(m.context_max, 32768);
+
+        // Plain `1.2b` aliases Q4_K_M and wins that slot; cloud tag excluded.
+        assert_eq!(m.variants.len(), 2);
+        let q4 = m.variants.iter().find(|v| v.quant == "Q4_K_M").unwrap();
+        assert_eq!(q4.source_tag.as_deref(), Some("1.2b"));
+        assert_eq!(q4.file_size_bytes, Some(736_000_000)); // probed tag only
+        assert_eq!(q4.layers, 16);
+        assert_eq!(q4.kv_heads, 4);
+        assert_eq!(q4.head_dim, 128); // 2048 / 16
+        assert_eq!(q4.embedding_dim, 2048);
+        assert_eq!(q4.runtime_compat, vec![RuntimeKind::Ollama]);
+        let q8 = m.variants.iter().find(|v| v.quant == "Q8_0").unwrap();
+        assert_eq!(q8.source_tag.as_deref(), Some("1.2b-q8_0"));
+        assert_eq!(q8.file_size_bytes, None);
+    }
+
+    #[tokio::test]
+    async fn discover_model_moe_active_params_from_expert_ratio() {
+        let header = lfm25_header()
+            .u32("lfm2moe.expert_count", 32)
+            .u32("lfm2moe.expert_used_count", 4)
+            .build();
+        let http = discovery_http(LFM25_TAGS_HTML, 736_000_000, header);
+        let m = discover_model(&http, "lfm2.5").await.unwrap().unwrap();
+        assert_eq!(m.params_total, 1_170_000_000);
+        // Rough MoE approximation: total × 4/32.
+        assert_eq!(m.params_active, 146_250_000);
+    }
+
+    #[tokio::test]
+    async fn discover_model_params_fallback_blob_size_then_size_token() {
+        // No general.parameter_count → blob_size × 8 / bpw of the probed
+        // quant (Q4_K_M, 4.83).
+        let header = GgufBuilder::new()
+            .string("general.architecture", "lfm2")
+            .u32("lfm2.block_count", 16)
+            .u32("lfm2.attention.head_count", 16)
+            .u32("lfm2.attention.head_count_kv", 4)
+            .u32("lfm2.embedding_length", 2048)
+            .u32("lfm2.context_length", 32768)
+            .build();
+        let http = discovery_http(LFM25_TAGS_HTML, 736_000_000, header.clone());
+        let m = discover_model(&http, "lfm2.5").await.unwrap().unwrap();
+        assert_eq!(m.params_total, (736_000_000f64 * 8.0 / 4.83) as u64);
+
+        // Manifest reports size 0 → last resort: the size token "1.2b".
+        let http = discovery_http(LFM25_TAGS_HTML, 0, header);
+        let m = discover_model(&http, "lfm2.5").await.unwrap().unwrap();
+        assert_eq!(m.params_total, 1_200_000_000);
+        // No blob size known on any variant.
+        assert!(m.variants.iter().all(|v| v.file_size_bytes.is_none()));
+    }
+
+    #[tokio::test]
+    async fn discover_model_cloud_only_is_none() {
+        let html = r#"
+            <a href="/library/lfm2.5:latest">latest</a>
+            <a href="/library/lfm2.5:120b-cloud">x</a>
+            <a href="/library/lfm2.5:480b-cloud">x</a>
+        "#;
+        let http = discovery_http(html, 0, Vec::new());
+        assert!(discover_model(&http, "lfm2.5").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn discover_model_skiplist_architecture_is_none() {
+        for arch in ["bert", "nomic-bert", "clip"] {
+            let header = GgufBuilder::new()
+                .string("general.architecture", arch)
+                .u32("x.block_count", 12)
+                .u32("x.attention.head_count", 12)
+                .u32("x.attention.head_count_kv", 12)
+                .u32("x.embedding_length", 768)
+                .u32("x.context_length", 512)
+                .build();
+            let http = discovery_http(LFM25_TAGS_HTML, 736_000_000, header);
+            assert!(
+                discover_model(&http, "lfm2.5").await.unwrap().is_none(),
+                "arch {arch} must be skipped"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_model_unparseable_header_is_none() {
+        let http = discovery_http(LFM25_TAGS_HTML, 736_000_000, b"not a gguf file".to_vec());
+        assert!(discover_model(&http, "lfm2.5").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn discover_model_network_errors_propagate() {
+        // Tags page missing entirely.
+        let http = MockHttp::default();
+        assert!(discover_model(&http, "lfm2.5").await.is_err());
+        // Tags OK but manifest fetch fails.
+        let mut http = MockHttp::default();
+        http.text.insert(
+            "https://ollama.com/library/lfm2.5/tags".to_string(),
+            LFM25_TAGS_HTML.to_string(),
+        );
+        assert!(discover_model(&http, "lfm2.5").await.is_err());
     }
 
     /// Live sanity check against the real Ollama library page. Run manually:

@@ -9,6 +9,14 @@ use crate::PaddockError;
 #[async_trait]
 pub trait HttpClient: Send + Sync {
     async fn get_json(&self, url: &str) -> Result<Value, PaddockError>;
+    /// GET with an explicit `Accept` header, JSON body expected. Needed by
+    /// OCI registries (`registry.ollama.ai` manifests require
+    /// `application/vnd.docker.distribution.manifest.v2+json`); plain JSON
+    /// APIs keep using `get_json`. Default impl ignores the header so test
+    /// mocks only have to implement `get_json`.
+    async fn get_json_with_accept(&self, url: &str, _accept: &str) -> Result<Value, PaddockError> {
+        self.get_json(url).await
+    }
     /// Plain GET returning the body as text (e.g. an HTML page).
     async fn get_text(&self, url: &str) -> Result<String, PaddockError>;
     /// GET with `Range: bytes=start-end` (inclusive), follows redirects.
@@ -34,6 +42,23 @@ impl ReqwestClient {
 impl HttpClient for ReqwestClient {
     async fn get_json(&self, url: &str) -> Result<Value, PaddockError> {
         let resp = self.client.get(url).send().await.map_err(net)?;
+        if !resp.status().is_success() {
+            return Err(PaddockError::Network(format!(
+                "{url}: HTTP {}",
+                resp.status()
+            )));
+        }
+        resp.json().await.map_err(net)
+    }
+
+    async fn get_json_with_accept(&self, url: &str, accept: &str) -> Result<Value, PaddockError> {
+        let resp = self
+            .client
+            .get(url)
+            .header("Accept", accept)
+            .send()
+            .await
+            .map_err(net)?;
         if !resp.status().is_success() {
             return Err(PaddockError::Network(format!(
                 "{url}: HTTP {}",

@@ -58,6 +58,12 @@ pub enum Command {
         /// Skip live Ollama library tag enrichment (offline curated data only)
         #[arg(long)]
         no_ollama_registry: bool,
+        /// Max uncurated Ollama library models to auto-discover
+        #[arg(long, default_value_t = 60)]
+        discover_limit: usize,
+        /// Skip Ollama library auto-discovery entirely
+        #[arg(long)]
+        no_discover: bool,
     },
     /// Menu bar status item showing active serve endpoints (macOS)
     Tray,
