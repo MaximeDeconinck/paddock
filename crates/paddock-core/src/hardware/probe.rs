@@ -10,6 +10,10 @@ pub trait SystemProbe: Send + Sync {
     fn run_command(&self, program: &str, args: &[&str]) -> Option<String>;
     /// Plain HTTP GET (used for localhost runtime probes only), body on 2xx.
     fn http_get_local(&self, url: &str) -> Option<String>;
+    /// HTTP POST of a JSON body (localhost only), body on 2xx. Patient read
+    /// timeout: the one caller is the Ollama warm-up, where the response
+    /// only arrives once the model finished loading (can take minutes).
+    fn http_post_local(&self, url: &str, json_body: &str) -> Option<String>;
 }
 
 pub struct RealSystemProbe;
@@ -78,6 +82,35 @@ impl SystemProbe for RealSystemProbe {
         }
         buf.split_once("\r\n\r\n").map(|(_, body)| body.to_string())
     }
+
+    fn http_post_local(&self, url: &str, json_body: &str) -> Option<String> {
+        // Same tiny TcpStream client as http_get_local, but with a read
+        // timeout sized for model loading: Ollama answers the warm-up POST
+        // only once the weights are in memory.
+        use std::io::{Read, Write};
+        use std::time::Duration;
+        let rest = url.strip_prefix("http://")?;
+        let (host_port, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let addr: std::net::SocketAddr = host_port.parse().ok()?;
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(1000)).ok()?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(600)))
+            .ok()?;
+        write!(
+            stream,
+            "POST /{path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{json_body}",
+            json_body.len()
+        )
+        .ok()?;
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf).ok()?;
+        if !buf.starts_with("HTTP/1.1 2") && !buf.starts_with("HTTP/1.0 2") {
+            return None;
+        }
+        buf.split_once("\r\n\r\n").map(|(_, body)| body.to_string())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -104,6 +137,10 @@ pub struct MockProbe {
     pub binaries: std::collections::HashMap<String, String>,
     pub commands: std::collections::HashMap<String, String>, // key: "program arg1 arg2"
     pub http: std::collections::HashMap<String, String>,
+    /// POST fixtures (url → response body) + a log of (url, body) received,
+    /// so tests can assert on what was sent.
+    pub posts: std::collections::HashMap<String, String>,
+    pub post_bodies: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 impl SystemProbe for MockProbe {
@@ -126,5 +163,12 @@ impl SystemProbe for MockProbe {
     }
     fn http_get_local(&self, url: &str) -> Option<String> {
         self.http.get(url).cloned()
+    }
+    fn http_post_local(&self, url: &str, json_body: &str) -> Option<String> {
+        self.post_bodies
+            .lock()
+            .unwrap()
+            .push((url.to_string(), json_body.to_string()));
+        self.posts.get(url).cloned()
     }
 }

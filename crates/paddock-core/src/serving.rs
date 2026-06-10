@@ -157,10 +157,54 @@ pub fn ollama_loaded_models(probe: &dyn SystemProbe) -> Option<Vec<LoadedModel>>
     )
 }
 
+const OLLAMA_GENERATE_URL: &str = "http://127.0.0.1:11434/api/generate";
+/// How long a freshly served model stays loaded without traffic. Long enough
+/// to bridge the gap between `paddock serve` and the user's first request.
+const WARM_UP_KEEP_ALIVE: &str = "30m";
+
+/// Load `model_ref` into the local Ollama daemon's memory so the first real
+/// request doesn't pay the cold start (and so the model shows up in
+/// `/api/ps` — and the tray — right away). A prompt-less `/api/generate`
+/// is Ollama's documented "just load it" call. Returns false when the
+/// daemon is unreachable or refuses; callers treat this as best-effort.
+pub fn warm_up_ollama(probe: &dyn SystemProbe, model_ref: &str) -> bool {
+    let body = serde_json::json!({
+        "model": model_ref,
+        "keep_alive": WARM_UP_KEEP_ALIVE,
+    })
+    .to_string();
+    probe.http_post_local(OLLAMA_GENERATE_URL, &body).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hardware::MockProbe;
+
+    #[test]
+    fn warm_up_posts_model_and_keep_alive() {
+        let mut probe = MockProbe::default();
+        probe.posts.insert(
+            "http://127.0.0.1:11434/api/generate".into(),
+            r#"{"done":true}"#.into(),
+        );
+        assert!(warm_up_ollama(&probe, "lfm2.5-thinking:1.2b-q8_0"));
+        let bodies = probe.post_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        let (url, body) = &bodies[0];
+        assert_eq!(url, "http://127.0.0.1:11434/api/generate");
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["model"], "lfm2.5-thinking:1.2b-q8_0");
+        assert_eq!(v["keep_alive"], "30m");
+        // No prompt: load-only, never generates tokens.
+        assert!(v.get("prompt").is_none());
+    }
+
+    #[test]
+    fn warm_up_daemon_unreachable_is_false() {
+        let probe = MockProbe::default();
+        assert!(!warm_up_ollama(&probe, "llama3.2:1b"));
+    }
 
     fn record(pid: u32) -> ServingRecord {
         ServingRecord {

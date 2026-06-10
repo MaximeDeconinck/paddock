@@ -216,6 +216,17 @@ pub(crate) fn serve_with_plan(plan: ServePlan) -> Result<()> {
         return Err(e);
     }
 
+    // Ollama loads a model only on its first request and the daemon outlives
+    // us — warm it up now so "ready" means ready (and the model shows in
+    // /api/ps + the tray). Best-effort: a failure leaves a working endpoint
+    // that simply cold-starts on first use.
+    if plan.runtime == paddock_core::catalog::RuntimeKind::Ollama {
+        eprintln!("loading {} into memory…", plan.model_ref);
+        if !paddock_core::serving::warm_up_ollama(&RealSystemProbe, &plan.model_ref) {
+            eprintln!("warning: warm-up failed — the model will load on the first request");
+        }
+    }
+
     output::print_endpoint(&plan);
 
     match child {
