@@ -6,9 +6,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
+use tetro_core::catalog::RuntimeKind;
 use tetro_core::estimate::FitVerdict;
 use tetro_core::hardware::{HardwareProfile, RuntimeStatus};
-use tetro_core::runtime::RunPlan;
+use tetro_core::runtime::{RunPlan, ServePlan};
 
 use crate::app::ScoredModel;
 use crate::output::{gib, verdict_label};
@@ -140,7 +141,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
             Style::new().fg(ACCENT),
         )),
         None => Line::from(Span::styled(
-            "↑↓ move · enter detail · x run · / search · g/c/r/h use-case · q quit",
+            "↑↓ move · enter detail · x run · s serve · / search · g/c/r/h use-case · q quit",
             Style::new().fg(Color::DarkGray),
         )),
     };
@@ -161,7 +162,11 @@ fn draw_detail(frame: &mut Frame, state: &TuiState) {
     let Some(r) = state.rows.get(state.selected) else {
         return;
     };
-    let lines = detail_lines(r, state.detail_plan.as_ref());
+    let lines = detail_lines(
+        r,
+        state.detail_plan.as_ref(),
+        state.detail_serve_plan.as_ref(),
+    );
     // +2 for the borders: the popup grows to fit its content (clipped only
     // when the terminal itself is too small).
     let content_height = (lines.len() as u16).saturating_add(2);
@@ -176,6 +181,7 @@ fn draw_detail(frame: &mut Frame, state: &TuiState) {
 fn detail_lines<'a>(
     r: &'a ScoredModel,
     plan: Option<&'a Result<RunPlan, String>>,
+    serve_plan: Option<&'a Result<ServePlan, String>>,
 ) -> Vec<Line<'a>> {
     let v = &r.model.variants[r.variant_idx];
     let section = |s: &'a str| {
@@ -257,6 +263,20 @@ fn detail_lines<'a>(
                 .add_modifier(Modifier::ITALIC),
         ))),
         None => {}
+    }
+    // One-line serve hint right under the run command, plan-derived so the
+    // endpoint shown is exactly the one `s` would serve on.
+    if let Some(Ok(sp)) = serve_plan {
+        let runtime = match sp.runtime {
+            RuntimeKind::Ollama => "ollama",
+            RuntimeKind::LlamaCpp => "llama.cpp",
+            RuntimeKind::MlxLm => "mlx-lm",
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  s to serve on ", Style::new().fg(Color::DarkGray)),
+            Span::styled(sp.endpoint.clone(), Style::new().fg(ACCENT)),
+            Span::styled(format!(" ({runtime})"), Style::new().fg(Color::DarkGray)),
+        ]));
     }
     if r.memory.verdict == FitVerdict::FitsWithSysctlTuning {
         let mb = r.memory.total_bytes / (1024 * 1024) + 1024;

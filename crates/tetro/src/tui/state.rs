@@ -2,7 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tetro_core::hardware::RuntimesStatus;
-use tetro_core::runtime::{plan_run, RunPlan};
+use tetro_core::runtime::{plan_run, plan_serve, RunPlan, ServePlan};
 use tetro_core::score::UseCase;
 
 use crate::app::ScoredModel;
@@ -20,6 +20,8 @@ pub enum Action {
     Quit,
     /// Quit the TUI and hand this plan to the launcher (after terminal restore).
     Run(RunPlan),
+    /// Quit the TUI and hand this plan to the serve lifecycle (after restore).
+    Serve(ServePlan),
     /// Re-score the catalog for a new use case (the event loop owns App + Db).
     Rescore(UseCase),
 }
@@ -41,6 +43,9 @@ pub struct TuiState {
     /// Run plan for the selected row, computed once on Detail entry so the
     /// render path never calls plan_run. Cleared when Detail closes.
     pub detail_plan: Option<Result<RunPlan, String>>,
+    /// Serve plan for the selected row, computed alongside `detail_plan` so
+    /// the detail popup can show the endpoint without calling plan_serve.
+    pub detail_serve_plan: Option<Result<ServePlan, String>>,
 }
 
 impl TuiState {
@@ -55,6 +60,7 @@ impl TuiState {
             runtimes,
             last_error: None,
             detail_plan: None,
+            detail_serve_plan: None,
         }
     }
 
@@ -108,8 +114,10 @@ impl TuiState {
                 K::Esc | K::Char('q') | K::Enter => {
                     self.mode = Mode::List;
                     self.detail_plan = None;
+                    self.detail_serve_plan = None;
                 }
                 K::Char('x') => return self.run_selected(),
+                K::Char('s') => return self.serve_selected(),
                 _ => {}
             },
             Mode::List => match key.code {
@@ -121,10 +129,12 @@ impl TuiState {
                 K::Enter => {
                     if !self.rows.is_empty() {
                         self.detail_plan = self.plan_for_selected();
+                        self.detail_serve_plan = self.serve_plan_for_selected();
                         self.mode = Mode::Detail;
                     }
                 }
                 K::Char('x') => return self.run_selected(),
+                K::Char('s') => return self.serve_selected(),
                 K::Char('/') => {
                     self.mode = Mode::Search {
                         query: String::new(),
@@ -169,11 +179,33 @@ impl TuiState {
         Some(plan_run(&row.model, variant, &self.runtimes).map_err(|e| e.to_string()))
     }
 
+    /// Single source for serve-plan computation (Detail entry and `s` both
+    /// use it), so the render path never calls plan_serve. Default port: the
+    /// TUI has no flag surface, so `port` is always None.
+    fn serve_plan_for_selected(&self) -> Option<Result<ServePlan, String>> {
+        let row = self.rows.get(self.selected)?;
+        let variant = &row.model.variants[row.variant_idx];
+        Some(plan_serve(&row.model, variant, &self.runtimes, None).map_err(|e| e.to_string()))
+    }
+
     /// Build the run plan for the selected row. A plan_run failure must not
     /// crash the TUI: it is stored and rendered in the footer.
     fn run_selected(&mut self) -> Action {
         match self.plan_for_selected() {
             Some(Ok(plan)) => Action::Run(plan),
+            Some(Err(e)) => {
+                self.last_error = Some(e);
+                Action::None
+            }
+            None => Action::None,
+        }
+    }
+
+    /// Same error contract as `run_selected`: plan_serve failures go to the
+    /// footer, never crash the TUI.
+    fn serve_selected(&mut self) -> Action {
+        match self.serve_plan_for_selected() {
+            Some(Ok(plan)) => Action::Serve(plan),
             Some(Err(e)) => {
                 self.last_error = Some(e);
                 Action::None
@@ -311,6 +343,34 @@ mod tests {
     }
 
     #[test]
+    fn s_returns_serve_action_with_endpoint() {
+        // List mode
+        let mut s = state();
+        let action = s.handle_key(key(KeyCode::Char('s')));
+        match action {
+            Action::Serve(plan) => {
+                assert!(!plan.endpoint.is_empty());
+                // Ollama-shaped plan: fixed daemon port + `ollama pull` pre-step.
+                assert!(plan.endpoint.contains("11434"));
+                assert_eq!(plan.pre_steps[0][0], "ollama");
+                // ollama not installed in the fake RuntimesStatus: the plan
+                // must carry an install step, never auto-run it.
+                assert!(plan.install.is_some());
+            }
+            other => panic!("expected Action::Serve, got {other:?}"),
+        }
+        // Detail mode: same key, same action.
+        let mut s = state();
+        s.handle_key(key(KeyCode::Enter));
+        assert_eq!(s.mode, Mode::Detail);
+        assert!(matches!(s.detail_serve_plan, Some(Ok(_))));
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Char('s'))),
+            Action::Serve(_)
+        ));
+    }
+
+    #[test]
     fn ctrl_c_quits_from_all_modes() {
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         // List
@@ -350,6 +410,7 @@ mod tests {
         s.handle_key(key(KeyCode::Esc));
         assert_eq!(s.mode, Mode::List);
         assert!(s.detail_plan.is_none());
+        assert!(s.detail_serve_plan.is_none());
     }
 
     #[test]

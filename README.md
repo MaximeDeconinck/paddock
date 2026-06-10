@@ -30,7 +30,7 @@ A Homebrew formula is coming. Requires macOS on Apple Silicon (M1 or later).
 
 ## Usage
 
-Running `tetro` with no arguments opens the interactive TUI. Five subcommands cover everything scriptable:
+Running `tetro` with no arguments opens the interactive TUI. Six subcommands cover everything scriptable:
 
 ### `tetro scan` — what is this machine?
 
@@ -98,6 +98,28 @@ $ tetro run definitely-not-a-model
 Error: model `definitely-not-a-model` not found in catalog. Run `tetro sync` or check `tetro fit` for names.
 ```
 
+### `tetro serve <model>` — OpenAI-compatible endpoint
+
+Same model resolution as `run`, but instead of an interactive chat you get an HTTP endpoint any OpenAI-compatible client can talk to:
+
+```text
+$ tetro serve llama3.2:1b
+$ ollama pull llama3.2:1b
+success
+endpoint    http://127.0.0.1:11434
+openai      http://127.0.0.1:11434/v1/chat/completions
+model       llama3.2:1b
+try it      curl -s http://127.0.0.1:11434/v1/chat/completions \
+              -d '{"model":"llama3.2:1b","messages":[{"role":"user","content":"hello"}]}'
+```
+
+The lifecycle depends on the runtime:
+
+- **Ollama models** reuse the daemon: tetro starts `ollama serve` only if it isn't already running, pulls the model, prints the endpoint and exits — the daemon keeps serving in the background on its fixed port 11434.
+- **llama.cpp / mlx-lm models** spawn a foreground server (`llama-server -hf …` / `mlx_lm.server --model …`), wait until it answers its readiness check, print the endpoint, and stay attached — **Ctrl-C stops the server**. llama-server may download the model first; tetro waits through that.
+
+`--port <N>` picks the port for foreground servers (default 8080). The Ollama daemon's port is fixed, so `--port` is ignored there with a warning. `--json` prints the full serve plan (argv, endpoint, pre-steps) without spawning or pulling anything.
+
 ### `--json` everywhere
 
 Every subcommand takes `--json` for machine-readable output; `tetro run x --json` prints the planned `argv` without launching anything:
@@ -118,6 +140,7 @@ Every subcommand takes `--json` for machine-readable output; `tetro run x --json
 | `↑`/`↓` or `j`/`k` | move selection |
 | `Enter` | open detail view (memory breakdown, run plan) |
 | `x` | run the selected model |
+| `s` | serve the selected model (OpenAI-compatible endpoint) |
 | `/` | search (type to filter, `Enter` apply, `Esc` clear) |
 | `g` / `c` / `r` / `h` | re-score for general / coding / reasoning / chat |
 | `q`, `Ctrl-C` | quit |

@@ -10,11 +10,17 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind};
 use ratatui::DefaultTerminal;
 use tetro_core::catalog::db::Db;
-use tetro_core::runtime::RunPlan;
+use tetro_core::runtime::{RunPlan, ServePlan};
 use tetro_core::score::UseCase;
 
 use crate::app::App;
 use state::{Action, TuiState};
+
+/// What to do after the terminal is restored.
+enum Exit {
+    Run(RunPlan),
+    Serve(ServePlan),
+}
 
 pub fn run(app: App) -> Result<()> {
     let db = app.open_db()?;
@@ -29,14 +35,15 @@ pub fn run(app: App) -> Result<()> {
     let result = event_loop(&mut terminal, &mut state, &app, &db);
     ratatui::restore();
 
-    // Launch AFTER restore so the child owns a clean tty. `launch` is the
-    // same confirm-install-then-exec path as `tetro run` — the never-auto-
-    // install guarantee lives in one place.
+    // Launch AFTER restore so the child owns a clean tty. `launch` and
+    // `serve_with_plan` are the same confirm-install paths as `tetro run` /
+    // `tetro serve` — the never-auto-install guarantee lives in one place.
     match result? {
-        Some(plan) => {
+        Some(Exit::Run(plan)) => {
             println!("$ {}", plan.display());
             crate::launch(plan)
         }
+        Some(Exit::Serve(plan)) => crate::serve_with_plan(plan),
         None => Ok(()),
     }
 }
@@ -46,7 +53,7 @@ fn event_loop(
     state: &mut TuiState,
     app: &App,
     db: &Db,
-) -> Result<Option<RunPlan>> {
+) -> Result<Option<Exit>> {
     loop {
         terminal.draw(|frame| draw::draw(frame, state, &app.profile))?;
         if !event::poll(Duration::from_millis(250))? {
@@ -62,7 +69,8 @@ fn event_loop(
         match state.handle_key(key) {
             Action::None => {}
             Action::Quit => return Ok(None),
-            Action::Run(plan) => return Ok(Some(plan)),
+            Action::Run(plan) => return Ok(Some(Exit::Run(plan))),
+            Action::Serve(plan) => return Ok(Some(Exit::Serve(plan))),
             Action::Rescore(uc) => {
                 let rows = app.scored_models(db, uc, false)?;
                 state.set_rows(rows, uc);
