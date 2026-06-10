@@ -48,7 +48,17 @@ pub enum Command {
         port: Option<u16>,
     },
     /// Refresh the model catalog
-    Sync,
+    Sync {
+        /// Max Hugging Face GGUF repos to index
+        #[arg(long, default_value_t = 100)]
+        hf_limit: usize,
+        /// Max mlx-community repos to index
+        #[arg(long, default_value_t = 60)]
+        mlx_limit: usize,
+        /// Skip live Ollama library tag enrichment (offline curated data only)
+        #[arg(long)]
+        no_ollama_registry: bool,
+    },
     /// Menu bar status item showing active serve endpoints (macOS)
     Tray,
 }

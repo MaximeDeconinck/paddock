@@ -113,6 +113,19 @@ fn serve_json_prints_plan_without_side_effects() {
 }
 
 #[test]
+fn sync_help_lists_catalog_flags() {
+    let (mut cmd, _dir) = tetro();
+    let out = cmd.args(["sync", "--help"]).assert().success();
+    let help = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(help.contains("--hf-limit"), "missing --hf-limit:\n{help}");
+    assert!(help.contains("--mlx-limit"), "missing --mlx-limit:\n{help}");
+    assert!(
+        help.contains("--no-ollama-registry"),
+        "missing --no-ollama-registry:\n{help}"
+    );
+}
+
+#[test]
 fn recommend_json_is_array_max_5() {
     let (mut cmd, _dir) = tetro();
     let out = cmd

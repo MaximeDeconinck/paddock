@@ -147,17 +147,21 @@ pub fn quant_from_filename(name: &str) -> Option<String> {
     None
 }
 
-/// Options for `sync`. Limits keep first sync fast; raise via CLI later if wanted.
+/// Options for `sync`. Limits keep first sync fast; raise via CLI if wanted.
 pub struct SyncOptions {
     pub hf_limit: usize,
     pub mlx_limit: usize,
+    /// Enrich curated Ollama models with the real library tag list
+    /// (one request per model base name; best-effort).
+    pub ollama_registry: bool,
 }
 
 impl Default for SyncOptions {
     fn default() -> Self {
         Self {
-            hf_limit: 30,
-            mlx_limit: 30,
+            hf_limit: 100,
+            mlx_limit: 60,
+            ollama_registry: true,
         }
     }
 }
@@ -165,6 +169,8 @@ impl Default for SyncOptions {
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct SyncReport {
     pub curated: usize,
+    /// Curated variants enriched with an exact Ollama library tag.
+    pub ollama_tags: usize,
     pub huggingface: usize,
     pub mlx: usize,
     pub errors: Vec<String>,
@@ -177,9 +183,13 @@ pub async fn sync(
     opts: &SyncOptions,
 ) -> Result<SyncReport, crate::TetroError> {
     let mut report = SyncReport::default();
-    for m in curated::curated_ollama_models() {
-        db.upsert_model(&m)?;
+    let mut curated_models = curated::curated_ollama_models();
+    for m in &curated_models {
+        db.upsert_model(m)?;
         report.curated += 1;
+    }
+    if opts.ollama_registry {
+        enrich_curated_with_registry(http, db, &mut curated_models, &mut report).await;
     }
     match hf::fetch_hf_gguf(http, opts.hf_limit).await {
         Ok(models) => {
@@ -211,6 +221,60 @@ pub async fn sync(
         .unwrap_or(0);
     db.set_last_sync(now)?;
     Ok(report)
+}
+
+/// Best-effort live tag enrichment: one tags-page fetch per curated base name
+/// (`llama3.1` for `llama3.1:8b` and `llama3.1:70b`), then per curated size
+/// keep one tag per known quant and re-upsert with `source_tag` set. Registry
+/// errors land in `report.errors`; the curated offline data always stands.
+async fn enrich_curated_with_registry(
+    http: &dyn hf::HttpClient,
+    db: &db::Db,
+    curated_models: &mut [CatalogModel],
+    report: &mut SyncReport,
+) {
+    // Base names in curated order, deduplicated (entries lacking ':' have no
+    // library page to consult and are skipped).
+    let mut bases: Vec<String> = Vec::new();
+    for m in curated_models.iter() {
+        if let Some((base, _)) = m.name.split_once(':') {
+            if !bases.iter().any(|b| b == base) {
+                bases.push(base.to_string());
+            }
+        }
+    }
+    for base in &bases {
+        let tags = match ollama_registry::fetch_model_tags(http, base).await {
+            Ok(t) => t,
+            Err(e) => {
+                report.errors.push(format!("ollama tags {base}: {e}"));
+                continue;
+            }
+        };
+        for m in curated_models.iter_mut() {
+            let Some((b, size)) = m.name.split_once(':') else {
+                continue;
+            };
+            if b != base {
+                continue;
+            }
+            let Some(default_quant) = m.variants.first().map(|v| v.quant.clone()) else {
+                continue;
+            };
+            let selected = ollama_registry::select_variant_tags(&tags, size, &default_quant);
+            if selected.is_empty() {
+                continue;
+            }
+            ollama_registry::enrich_with_tags(m, &selected);
+            match db.upsert_model(m) {
+                Ok(_) => {
+                    report.ollama_tags +=
+                        m.variants.iter().filter(|v| v.source_tag.is_some()).count();
+                }
+                Err(e) => report.errors.push(format!("ollama enrich {}: {e}", m.name)),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -310,26 +374,162 @@ mod tests {
 
         // Curated always inserted regardless of network
         assert!(
-            report.curated >= 35,
-            "expected >= 35 curated, got {}",
+            report.curated >= 70,
+            "expected >= 70 curated, got {}",
             report.curated
         );
-        // Network sources failed
-        assert_eq!(
-            report.errors.len(),
-            2,
-            "expected 2 network errors, got {:?}",
+        // Registry down: zero enriched variants, per-base errors reported,
+        // curated data stands untouched.
+        assert_eq!(report.ollama_tags, 0);
+        assert!(
+            report.errors.iter().any(|e| e.contains("ollama tags")),
+            "expected per-base registry errors, got {:?}",
             report.errors
         );
-        assert!(report.errors[0].contains("huggingface"));
-        assert!(report.errors[1].contains("mlx"));
+        assert!(report.errors.iter().any(|e| e.contains("huggingface")));
+        assert!(report.errors.iter().any(|e| e.contains("mlx")));
         // last_sync set even on network failure
         let ts = db.last_sync().unwrap();
         assert!(ts.is_some(), "last_sync should be set");
         assert!(ts.unwrap() > 0);
 
-        // Curated models actually in DB
+        // Curated models actually in DB, with the offline single variant.
         let models = db.list_models().unwrap();
-        assert!(models.len() >= 35, "expected >= 35 models in DB");
+        assert!(models.len() >= 70, "expected >= 70 models in DB");
+        let m = models.iter().find(|m| m.name == "llama3.1:8b").unwrap();
+        assert_eq!(m.variants.len(), 1);
+        assert_eq!(m.variants[0].source_tag, None);
+    }
+
+    #[tokio::test]
+    async fn sync_with_registry_disabled_skips_tag_fetches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::Db::open(dir.path().join("catalog.db")).unwrap();
+        let http = FailingHttp;
+        let opts = SyncOptions {
+            ollama_registry: false,
+            ..SyncOptions::default()
+        };
+
+        let report = sync(&http, &db, &opts).await.unwrap();
+
+        assert_eq!(report.ollama_tags, 0);
+        // Only the two non-registry network sources may fail.
+        assert_eq!(
+            report.errors.len(),
+            2,
+            "expected exactly hf+mlx errors, got {:?}",
+            report.errors
+        );
+    }
+
+    /// MockHttp serving tag pages for some bases; everything else fails.
+    struct PagesHttp {
+        pages: std::collections::HashMap<String, String>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl hf::HttpClient for PagesHttp {
+        async fn get_json(&self, url: &str) -> Result<Value, TetroError> {
+            Err(TetroError::Network(format!("mock failure: {url}")))
+        }
+
+        async fn get_text(&self, url: &str) -> Result<String, TetroError> {
+            self.calls.lock().unwrap().push(url.to_string());
+            self.pages
+                .get(url)
+                .cloned()
+                .ok_or_else(|| TetroError::Network(format!("mock failure: {url}")))
+        }
+
+        async fn get_range(
+            &self,
+            url: &str,
+            _start: u64,
+            _end: u64,
+        ) -> Result<Vec<u8>, TetroError> {
+            Err(TetroError::Network(format!("mock failure: {url}")))
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_enriches_curated_with_registry_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::Db::open(dir.path().join("catalog.db")).unwrap();
+
+        // llama3.1 covers two curated sizes (8b, 70b) sharing one base;
+        // qwen3 is a distinct base where only the 8b size has variant tags.
+        let llama_page = r#"
+            <a href="/library/llama3.1:8b">8b</a>
+            <a href="/library/llama3.1:8b-instruct-q4_K_M">x</a>
+            <a href="/library/llama3.1:8b-instruct-q8_0">x</a>
+            <a href="/library/llama3.1:70b-instruct-q4_K_M">x</a>
+            <a href="/library/llama3.1:70b-instruct-q6_K">x</a>
+        "#;
+        let qwen_page = r#"
+            <a href="/library/qwen3:8b-q4_K_M">x</a>
+            <a href="/library/qwen3:8b-fp16">x</a>
+        "#;
+        let mut pages = std::collections::HashMap::new();
+        pages.insert(
+            "https://ollama.com/library/llama3.1/tags".to_string(),
+            llama_page.to_string(),
+        );
+        pages.insert(
+            "https://ollama.com/library/qwen3/tags".to_string(),
+            qwen_page.to_string(),
+        );
+        let http = PagesHttp {
+            pages,
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let report = sync(&http, &db, &SyncOptions::default()).await.unwrap();
+
+        // 2 variants each for llama3.1:8b, llama3.1:70b and qwen3:8b.
+        assert_eq!(report.ollama_tags, 6, "errors: {:?}", report.errors);
+
+        let models = db.list_models().unwrap();
+        let m8 = models.iter().find(|m| m.name == "llama3.1:8b").unwrap();
+        assert_eq!(m8.variants.len(), 2);
+        // Plain `8b` tag aliases the curated default quant.
+        let q4 = m8.variants.iter().find(|v| v.quant == "Q4_K_M").unwrap();
+        assert_eq!(q4.source_tag.as_deref(), Some("8b"));
+        let q8 = m8.variants.iter().find(|v| v.quant == "Q8_0").unwrap();
+        assert_eq!(q8.source_tag.as_deref(), Some("8b-instruct-q8_0"));
+        // Architecture copied from the curated entry.
+        assert_eq!(q8.layers, 32);
+        assert_eq!(q8.embedding_dim, 4096);
+
+        let m70 = models.iter().find(|m| m.name == "llama3.1:70b").unwrap();
+        assert_eq!(m70.variants.len(), 2);
+        assert!(m70.variants.iter().all(|v| v.source_tag.is_some()));
+
+        let q3 = models.iter().find(|m| m.name == "qwen3:8b").unwrap();
+        assert_eq!(q3.variants.len(), 2);
+        assert!(q3
+            .variants
+            .iter()
+            .any(|v| v.source_tag.as_deref() == Some("8b-fp16")));
+
+        // Other qwen3 sizes had no matching tags: curated variant stands.
+        let q14 = models.iter().find(|m| m.name == "qwen3:14b").unwrap();
+        assert_eq!(q14.variants.len(), 1);
+        assert_eq!(q14.variants[0].source_tag, None);
+
+        // One fetch per base, even with two curated llama3.1 sizes.
+        let calls = http.calls.lock().unwrap();
+        let llama_calls = calls
+            .iter()
+            .filter(|u| u.ends_with("/library/llama3.1/tags"))
+            .count();
+        assert_eq!(llama_calls, 1, "expected one fetch per base");
+
+        // Unserved bases were reported, not fatal.
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.contains("ollama tags gemma3")));
     }
 }

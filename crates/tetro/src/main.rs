@@ -50,20 +50,26 @@ fn main() -> Result<()> {
         }
         Some(Command::Run { model }) => run_model(&app, &model, cli.json)?,
         Some(Command::Serve { model, port }) => serve_model(&app, &model, port, cli.json)?,
-        Some(Command::Sync) => {
+        Some(Command::Sync {
+            hf_limit,
+            mlx_limit,
+            no_ollama_registry,
+        }) => {
             let db = app.open_db()?;
             let http = tetro_core::catalog::hf::ReqwestClient::new()?;
-            let report = tokio::runtime::Runtime::new()?.block_on(tetro_core::catalog::sync(
-                &http,
-                &db,
-                &Default::default(),
-            ))?;
+            let opts = tetro_core::catalog::SyncOptions {
+                hf_limit,
+                mlx_limit,
+                ollama_registry: !no_ollama_registry,
+            };
+            let report = tokio::runtime::Runtime::new()?
+                .block_on(tetro_core::catalog::sync(&http, &db, &opts))?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!(
-                    "synced: {} curated, {} huggingface, {} mlx",
-                    report.curated, report.huggingface, report.mlx
+                    "synced: {} curated ({} ollama tags), {} huggingface, {} mlx",
+                    report.curated, report.ollama_tags, report.huggingface, report.mlx
                 );
                 for e in &report.errors {
                     eprintln!("warning: {e}");

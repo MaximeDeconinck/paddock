@@ -58,8 +58,8 @@ mod tests {
     fn curated_count_and_validity() {
         let models = curated_ollama_models();
         assert!(
-            models.len() >= 35,
-            "expected >= 35 entries, got {}",
+            models.len() >= 70,
+            "expected >= 70 entries, got {}",
             models.len()
         );
         for m in &models {
@@ -105,6 +105,27 @@ mod tests {
         assert_eq!(v.kv_heads, 4);
         assert_eq!(v.embedding_dim, 3584);
         assert_eq!(m.context_max, 131072);
+    }
+
+    #[test]
+    fn spot_check_starcoder2_15b() {
+        let models = curated_ollama_models();
+        let m = models.iter().find(|m| m.name == "starcoder2:15b").unwrap();
+        // From bigcode/starcoder2-15b config.json
+        let v = &m.variants[0];
+        assert_eq!(v.layers, 40);
+        assert_eq!(v.kv_heads, 4);
+        assert_eq!(v.head_dim, 128);
+        assert_eq!(v.embedding_dim, 6144);
+        assert_eq!(m.context_max, 16384);
+    }
+
+    #[test]
+    fn spot_check_qwen3_235b_moe_active_params() {
+        let models = curated_ollama_models();
+        let m = models.iter().find(|m| m.name == "qwen3:235b-a22b").unwrap();
+        assert_eq!(m.params_total, 235_000_000_000);
+        assert_eq!(m.params_active, 22_000_000_000);
     }
 
     #[test]

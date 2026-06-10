@@ -50,10 +50,18 @@ runtimes    ollama 0.30.6 (running)
 
 ```text
 $ tetro sync
-synced: 40 curated, 26 huggingface, 5 mlx
+synced: 78 curated (461 ollama tags), 85 huggingface, 20 mlx
 ```
 
-Three sources: an embedded curated list of popular Ollama models, the most-downloaded GGUF repos on Hugging Face (architecture details read from GGUF headers via HTTP Range requests — no full downloads), and `mlx-community` quantizations. Network failures degrade to warnings; the curated list always works offline.
+Three sources:
+
+1. **Curated Ollama models** — an embedded list of ~78 popular text-generation models with hand-checked architecture parameters (layers, KV heads, context). Always works offline.
+2. **Hugging Face GGUF** — the most-downloaded GGUF repos, with architecture details read from GGUF headers via HTTP Range requests (no full downloads).
+3. **mlx-community** — Apple-native MLX quantizations.
+
+On top of the curated list, sync enriches each model with the **live tag list of the Ollama library** (one request per model family): it extracts tag names from the URL pattern on `ollama.com/library/{model}/tags` and keeps one tag per known quantization (`8b-instruct-q4_K_M`, `8b-instruct-q8_0`, …), so `tetro run` launches the exact tag instead of the library default. This step is best-effort — registry errors degrade to warnings and the curated data stands.
+
+Flags: `--hf-limit N` (default 100) and `--mlx-limit N` (default 60) bound the network sources; `--no-ollama-registry` skips the live tag enrichment for a fully offline-friendly sync.
 
 ### `tetro fit` — what fits, ranked
 
