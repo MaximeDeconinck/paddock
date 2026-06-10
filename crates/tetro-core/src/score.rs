@@ -362,8 +362,8 @@ mod tests {
         let s_small = score_of(&small, UseCase::General);
         let s_moe = score_of(&moe, UseCase::General);
         assert!(
-            s_moe.total > s_small.total,
-            "MoE {} must beat small dense {}",
+            s_moe.total > s_small.total + 10.0,
+            "expected ≥10pt gap, got moe={} small={}",
             s_moe.total,
             s_small.total
         );
