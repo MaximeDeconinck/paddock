@@ -222,20 +222,6 @@ pub(crate) fn serve_with_plan(plan: ServePlan) -> Result<()> {
     }
 }
 
-/// Which runtime a ServePlan spawns, derived from its argv (registry label).
-fn serve_runtime_kind(plan: &ServePlan) -> RuntimeKind {
-    match plan
-        .server_argv
-        .as_ref()
-        .and_then(|a| a.first())
-        .map(String::as_str)
-    {
-        Some("llama-server") => RuntimeKind::LlamaCpp,
-        Some("mlx_lm.server") => RuntimeKind::MlxLm,
-        _ => RuntimeKind::Ollama,
-    }
-}
-
 /// RAII wrapper around the serving registry: best-effort register on
 /// creation, unregister on drop (normal return and `?` early-returns alike).
 struct RegistryGuard {
@@ -252,7 +238,7 @@ impl RegistryGuard {
             .unwrap_or(0);
         let record = ServingRecord {
             pid,
-            runtime: serve_runtime_kind(plan),
+            runtime: plan.runtime,
             endpoint: plan.endpoint.clone(),
             openai_url: plan.openai_url.clone(),
             model_ref: plan.model_ref.clone(),
@@ -279,9 +265,12 @@ fn wait_ready(plan: &ServePlan, mut child: Option<&mut std::process::Child>) -> 
     use std::time::{Duration, Instant};
 
     let url = format!("{}{}", plan.endpoint, plan.ready_path);
-    let is_llama = serve_runtime_kind(plan) == RuntimeKind::LlamaCpp;
+    let is_llama = plan.runtime == RuntimeKind::LlamaCpp;
     let timeout = if is_llama {
         Duration::from_secs(600)
+    } else if child.is_none() {
+        // No child spawned: daemon expected up already; refusal is instant.
+        Duration::from_secs(3)
     } else {
         Duration::from_secs(15)
     };

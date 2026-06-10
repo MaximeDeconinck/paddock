@@ -127,6 +127,8 @@ pub struct ServePlan {
     /// True when caller requested a port but the plan uses Ollama's fixed
     /// daemon port (11434) instead.
     pub port_ignored: bool,
+    /// Runtime this plan serves with (registry label, readiness policy).
+    pub runtime: RuntimeKind,
 }
 
 /// Serve strategy mirrors `plan_run`, plus a llama.cpp fallback for HF GGUF
@@ -178,6 +180,7 @@ pub fn plan_serve(
                     argv: s(&["uv", "tool", "install", "mlx-lm"]),
                 }),
                 port_ignored: false,
+                runtime: RuntimeKind::MlxLm,
             })
         }
         Source::Ollama | Source::HuggingFace => {
@@ -208,6 +211,7 @@ pub fn plan_serve(
                         ready_path: "/health".to_string(),
                         install: None,
                         port_ignored: false,
+                        runtime: RuntimeKind::LlamaCpp,
                     });
                 }
             }
@@ -228,6 +232,7 @@ pub fn plan_serve(
                 ready_path: "/api/version".to_string(),
                 install: (!rt.ollama.installed).then(ollama_install),
                 port_ignored: port_requested,
+                runtime: RuntimeKind::Ollama,
             })
         }
     }
@@ -439,6 +444,7 @@ mod tests {
         );
         assert_eq!(p.ready_path, "/api/version");
         assert!(p.install.is_none());
+        assert_eq!(p.runtime, RuntimeKind::Ollama);
     }
 
     #[test]
@@ -452,6 +458,7 @@ mod tests {
         // pull still listed: the binary runs pre_steps AFTER readiness
         assert_eq!(p.pre_steps.len(), 1);
         assert_eq!(p.endpoint, "http://127.0.0.1:11434");
+        assert_eq!(p.runtime, RuntimeKind::Ollama);
     }
 
     #[test]
@@ -472,6 +479,7 @@ mod tests {
         assert_eq!(p.endpoint, "http://127.0.0.1:8080");
         assert_eq!(p.ready_path, "/health");
         assert!(p.install.is_none());
+        assert_eq!(p.runtime, RuntimeKind::LlamaCpp);
     }
 
     #[test]
@@ -521,6 +529,7 @@ mod tests {
         assert_eq!(p.openai_url, "http://127.0.0.1:8080/v1/chat/completions");
         assert_eq!(p.model_ref, "mlx-community/Llama-3.1-8B-Instruct-4bit");
         assert_eq!(p.ready_path, "/v1/models");
+        assert_eq!(p.runtime, RuntimeKind::MlxLm);
     }
 
     #[test]
