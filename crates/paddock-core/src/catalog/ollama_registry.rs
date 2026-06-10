@@ -50,6 +50,12 @@ pub async fn fetch_model_tags(
     let html = http
         .get_text(&format!("https://ollama.com/library/{base}/tags"))
         .await?;
+    Ok(extract_tag_names(&html, base))
+}
+
+/// Pure extraction of every `{base}` tag from a library tags page, in page
+/// order, deduplicated.
+fn extract_tag_names(html: &str, base: &str) -> Vec<String> {
     let needle = format!("/library/{base}:");
     let mut tags: Vec<String> = Vec::new();
     for (idx, _) in html.match_indices(&needle) {
@@ -64,7 +70,7 @@ pub async fn fetch_model_tags(
             tags.push(tag);
         }
     }
-    Ok(tags)
+    tags
 }
 
 /// Fetch the library index page and extract every model name, in page order
@@ -140,11 +146,19 @@ fn params_from_size_token(size: &str) -> Option<u64> {
 /// model; other sizes are skipped — arch params can differ per size, so each
 /// size would need its own header probe. Per-size probes are a
 /// request-budget tradeoff; revisit.
+///
+/// `now` (epoch seconds) anchors the page's relative dates ("8 months ago");
+/// the OLDEST one on the tags page becomes the approximate release date.
 pub async fn discover_model(
     http: &dyn HttpClient,
     name: &str,
+    now: i64,
 ) -> Result<Option<CatalogModel>, PaddockError> {
-    let tags = fetch_model_tags(http, name).await?;
+    let html = http
+        .get_text(&format!("https://ollama.com/library/{name}/tags"))
+        .await?;
+    let tags = extract_tag_names(&html, name);
+    let released_at = super::dates::oldest_relative_date(&html, now);
     // Ollama Cloud builds are excluded by user decision: they do not run
     // locally. A model whose every quant-bearing tag is cloud yields None.
     let tags: Vec<String> = tags
@@ -244,8 +258,8 @@ pub async fn discover_model(
         params_active,
         architecture: arch,
         context_max: if context_max == 0 { 4096 } else { context_max },
-        released_at: None,
-        released_approx: false,
+        released_at,
+        released_approx: released_at.is_some(),
         variants,
     }))
 }
@@ -797,7 +811,23 @@ mod tests {
         http
     }
 
+    /// Tags page with realistic date markup: a page-level "updated" span and
+    /// per-tag rows `digest&nbsp;·&nbsp;N months ago`. Oldest = 8 months ago.
     const LFM25_TAGS_HTML: &str = r#"
+        <span x-test-updated>2 months ago</span>
+        <a href="/library/lfm2.5:latest">latest</a>
+        <div>46e0c10c039e&nbsp;&middot;&nbsp;731MB&nbsp;&middot;&nbsp;2 months ago</div>
+        <a href="/library/lfm2.5:1.2b">1.2b</a>
+        <a href="/library/lfm2.5:350m">350m</a>
+        <a href="/library/lfm2.5:1.2b-q4_K_M">x</a>
+        <div>46e0c10c039e&nbsp;·&nbsp;8 months ago</div>
+        <a href="/library/lfm2.5:1.2b-q8_0">x</a>
+        <a href="/library/lfm2.5:1.2b-cloud">cloud build must be skipped</a>
+        <a href="/library/lfm2.5:350m-q4_K_M">x</a>
+    "#;
+
+    /// Same tag set, no date markup anywhere (degraded/changed page layout).
+    const LFM25_TAGS_HTML_NO_DATES: &str = r#"
         <a href="/library/lfm2.5:latest">latest</a>
         <a href="/library/lfm2.5:1.2b">1.2b</a>
         <a href="/library/lfm2.5:350m">350m</a>
@@ -806,6 +836,9 @@ mod tests {
         <a href="/library/lfm2.5:1.2b-cloud">cloud build must be skipped</a>
         <a href="/library/lfm2.5:350m-q4_K_M">x</a>
     "#;
+
+    /// Fixed "now" for discovery tests so relative-date math is deterministic.
+    const NOW: i64 = 1_780_000_000;
 
     fn lfm25_header() -> GgufBuilder {
         GgufBuilder::new()
@@ -821,7 +854,7 @@ mod tests {
     #[tokio::test]
     async fn discover_model_builds_first_seen_size_only() {
         let http = discovery_http(LFM25_TAGS_HTML, 736_000_000, lfm25_header().build());
-        let m = discover_model(&http, "lfm2.5").await.unwrap().unwrap();
+        let m = discover_model(&http, "lfm2.5", NOW).await.unwrap().unwrap();
 
         // First-seen size only (1.2b); 350m skipped in v1.
         assert_eq!(m.name, "lfm2.5:1.2b");
@@ -830,6 +863,11 @@ mod tests {
         assert_eq!(m.params_total, 1_170_000_000); // exact header count wins
         assert_eq!(m.params_active, 1_170_000_000); // no expert keys → dense
         assert_eq!(m.context_max, 32768);
+
+        // Oldest relative date on the page ("8 months ago") is the release
+        // proxy — always approximate.
+        assert_eq!(m.released_at, Some(NOW - 8 * 30 * 86_400));
+        assert!(m.released_approx);
 
         // Plain `1.2b` aliases Q4_K_M and wins that slot; cloud tag excluded.
         assert_eq!(m.variants.len(), 2);
@@ -853,10 +891,22 @@ mod tests {
             .u32("lfm2moe.expert_used_count", 4)
             .build();
         let http = discovery_http(LFM25_TAGS_HTML, 736_000_000, header);
-        let m = discover_model(&http, "lfm2.5").await.unwrap().unwrap();
+        let m = discover_model(&http, "lfm2.5", NOW).await.unwrap().unwrap();
         assert_eq!(m.params_total, 1_170_000_000);
         // Rough MoE approximation: total × 4/32.
         assert_eq!(m.params_active, 146_250_000);
+    }
+
+    #[tokio::test]
+    async fn discover_model_without_page_dates_has_no_release_date() {
+        let http = discovery_http(
+            LFM25_TAGS_HTML_NO_DATES,
+            736_000_000,
+            lfm25_header().build(),
+        );
+        let m = discover_model(&http, "lfm2.5", NOW).await.unwrap().unwrap();
+        assert_eq!(m.released_at, None);
+        assert!(!m.released_approx);
     }
 
     #[tokio::test]
@@ -872,12 +922,12 @@ mod tests {
             .u32("lfm2.context_length", 32768)
             .build();
         let http = discovery_http(LFM25_TAGS_HTML, 736_000_000, header.clone());
-        let m = discover_model(&http, "lfm2.5").await.unwrap().unwrap();
+        let m = discover_model(&http, "lfm2.5", NOW).await.unwrap().unwrap();
         assert_eq!(m.params_total, (736_000_000f64 * 8.0 / 4.83) as u64);
 
         // Manifest reports size 0 → last resort: the size token "1.2b".
         let http = discovery_http(LFM25_TAGS_HTML, 0, header);
-        let m = discover_model(&http, "lfm2.5").await.unwrap().unwrap();
+        let m = discover_model(&http, "lfm2.5", NOW).await.unwrap().unwrap();
         assert_eq!(m.params_total, 1_200_000_000);
         // No blob size known on any variant.
         assert!(m.variants.iter().all(|v| v.file_size_bytes.is_none()));
@@ -891,7 +941,10 @@ mod tests {
             <a href="/library/lfm2.5:480b-cloud">x</a>
         "#;
         let http = discovery_http(html, 0, Vec::new());
-        assert!(discover_model(&http, "lfm2.5").await.unwrap().is_none());
+        assert!(discover_model(&http, "lfm2.5", NOW)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -907,7 +960,10 @@ mod tests {
                 .build();
             let http = discovery_http(LFM25_TAGS_HTML, 736_000_000, header);
             assert!(
-                discover_model(&http, "lfm2.5").await.unwrap().is_none(),
+                discover_model(&http, "lfm2.5", NOW)
+                    .await
+                    .unwrap()
+                    .is_none(),
                 "arch {arch} must be skipped"
             );
         }
@@ -916,21 +972,24 @@ mod tests {
     #[tokio::test]
     async fn discover_model_unparseable_header_is_none() {
         let http = discovery_http(LFM25_TAGS_HTML, 736_000_000, b"not a gguf file".to_vec());
-        assert!(discover_model(&http, "lfm2.5").await.unwrap().is_none());
+        assert!(discover_model(&http, "lfm2.5", NOW)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
     async fn discover_model_network_errors_propagate() {
         // Tags page missing entirely.
         let http = MockHttp::default();
-        assert!(discover_model(&http, "lfm2.5").await.is_err());
+        assert!(discover_model(&http, "lfm2.5", NOW).await.is_err());
         // Tags OK but manifest fetch fails.
         let mut http = MockHttp::default();
         http.text.insert(
             "https://ollama.com/library/lfm2.5/tags".to_string(),
             LFM25_TAGS_HTML.to_string(),
         );
-        assert!(discover_model(&http, "lfm2.5").await.is_err());
+        assert!(discover_model(&http, "lfm2.5", NOW).await.is_err());
     }
 
     /// Live sanity check against the real Ollama library page. Run manually:

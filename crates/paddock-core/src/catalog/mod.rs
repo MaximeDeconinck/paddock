@@ -238,8 +238,14 @@ pub async fn sync(
                 .push(format!("curated upsert {}: {e}", m.name)),
         }
     }
+    // One clock read per sync: anchors discovered models' relative dates AND
+    // the last-sync stamp below.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     if let Some(limit) = opts.discover_limit {
-        discover_library_models(http, db, &curated_models, limit, &mut report).await;
+        discover_library_models(http, db, &curated_models, limit, now, &mut report).await;
     }
     match hf::fetch_hf_gguf(http, opts.hf_limit).await {
         Ok(models) => {
@@ -265,10 +271,6 @@ pub async fn sync(
         }
         Err(e) => report.errors.push(format!("mlx: {e}")),
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
     db.set_last_sync(now)?;
     Ok(report)
 }
@@ -349,6 +351,7 @@ async fn discover_library_models(
     db: &db::Db,
     curated_models: &[CatalogModel],
     limit: usize,
+    now: i64,
     report: &mut SyncReport,
 ) {
     let index = match ollama_registry::fetch_library_index(http).await {
@@ -367,7 +370,7 @@ async fn discover_library_models(
         .filter(|n| !curated_bases.contains(n.as_str()))
         .take(limit)
     {
-        match ollama_registry::discover_model(http, name).await {
+        match ollama_registry::discover_model(http, name, now).await {
             Ok(Some(m)) => match db.upsert_model(&m) {
                 Ok(_) => report.discovered += 1,
                 Err(e) => report
@@ -863,6 +866,9 @@ mod tests {
         assert_eq!(m.params_total, 1_170_000_000);
         assert_eq!(m.variants.len(), 2);
         assert!(m.variants.iter().all(|v| v.source_tag.is_some()));
+        // Fixture tags page carries no relative dates → no release proxy.
+        assert_eq!(m.released_at, None);
+        assert!(!m.released_approx);
     }
 
     #[tokio::test]
