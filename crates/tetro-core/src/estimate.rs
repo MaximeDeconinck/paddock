@@ -8,10 +8,16 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Fraction of theoretical bandwidth actually achieved by llama.cpp/MLX kernels.
-/// Default calibrated on community benchmarks; a future `tetro bench` module
-/// will recalibrate this per-machine.
+/// Fraction of theoretical bandwidth actually achieved by llama.cpp/MLX kernels
+/// for dense models. Default calibrated on community benchmarks; a future
+/// `tetro bench` module will recalibrate this per-machine.
 pub const SPEED_EFFICIENCY: f64 = 0.75;
+/// Fraction of theoretical bandwidth achieved for MoE models: expert routing
+/// scatters weight reads, so kernels reach far less of peak bandwidth than the
+/// dense streaming case. Measured ≈0.29 on M5 (Qwen3.6-35B-A3B UD-Q4_K_XL,
+/// 2026-06) and ≈0.3 implied by community Qwen3-30B-A3B numbers on M3 Max;
+/// to be refined by the future bench module.
+pub const MOE_SPEED_EFFICIENCY: f64 = 0.3;
 /// Flat runtime overhead (buffers, tokenizer, Metal heaps).
 pub const OVERHEAD_BASE_BYTES: u64 = 500 * 1024 * 1024;
 /// Activation overhead proportional to weights.
@@ -169,9 +175,14 @@ pub fn estimate_speed(v: &ModelVariant, bandwidth_gbps: f64) -> SpeedEstimate {
     } else {
         0.0
     };
+    let efficiency = if v.params_active < v.params_total {
+        MOE_SPEED_EFFICIENCY
+    } else {
+        SPEED_EFFICIENCY
+    };
     let bytes_per_token = v.params_active as f64 * bpw / 8.0;
     let generation_tps = if bytes_per_token > 0.0 {
-        safe_bw * 1e9 / bytes_per_token * SPEED_EFFICIENCY
+        safe_bw * 1e9 / bytes_per_token * efficiency
     } else {
         0.0
     };
@@ -301,14 +312,50 @@ mod tests {
         );
     }
 
+    /// MoE speed = bandwidth over *active* params at the MoE efficiency (0.3),
+    /// and remains far faster than a dense model of the same *total* size.
     #[test]
     fn moe_uses_active_params_for_speed() {
         let mut moe = llama31_8b_q4km();
         moe.params_total = 30_000_000_000;
         moe.params_active = 3_000_000_000;
-        let dense_speed = estimate_speed(&llama31_8b_q4km(), 400.0).generation_tps;
         let moe_speed = estimate_speed(&moe, 400.0).generation_tps;
-        assert!(moe_speed > dense_speed * 2.0);
+        // (a) 400e9 / (3e9 × 4.83 / 8) × 0.3 ≈ 66 tok/s
+        assert!(moe_speed > 60.0 && moe_speed < 72.0, "got {moe_speed}");
+        // (b) a dense model of the same TOTAL size would crawl (~16.5 tok/s);
+        // the MoE must beat it by a wide margin.
+        let mut dense_30b = llama31_8b_q4km();
+        dense_30b.params_total = 30_000_000_000;
+        dense_30b.params_active = 30_000_000_000;
+        let dense_speed = estimate_speed(&dense_30b, 400.0).generation_tps;
+        assert!(
+            moe_speed > dense_speed * 3.0,
+            "moe={moe_speed} dense={dense_speed}"
+        );
+    }
+
+    /// Field truth (2026-06): Qwen3.6-35B-A3B UD-Q4_K_XL on M5 (153.6 GB/s)
+    /// measured 22.6 tok/s generation via llama-cli Metal.
+    #[test]
+    fn moe_qwen36_35b_on_m5_matches_measurement() {
+        let moe = ModelVariant {
+            model_name: "qwen3.6-35b-a3b".into(),
+            quant: "UD-Q4_K_XL".into(),
+            bpw: 5.18,
+            params_total: 35_505_251_456,
+            params_active: 3_000_000_000,
+            layers: 48,
+            kv_heads: 4,
+            head_dim: 128,
+            embedding_dim: 2048,
+            context_max: 262_144,
+        };
+        let s = estimate_speed(&moe, 153.6);
+        assert!(
+            s.generation_tps > 18.0 && s.generation_tps < 28.0,
+            "measured 22.6 tok/s, estimated {}",
+            s.generation_tps
+        );
     }
 
     #[test]

@@ -178,12 +178,12 @@ The KV cache uses `kv_heads`, not the full attention head count: grouped-query-a
 Token generation on Apple Silicon is memory-bandwidth bound: every generated token streams all active weights through the memory bus once. So:
 
 ```text
-tps = bandwidth / (params_active × bpw / 8) × 0.75
+tps = bandwidth / (params_active × bpw / 8) × efficiency
 ```
 
-`params_active` equals total parameters for dense models and the active-expert count for MoE models — which is why a 30B-A3B MoE generates faster than a dense 8B. The **0.75 efficiency factor** is the fraction of theoretical bandwidth that llama.cpp/MLX kernels actually sustain, calibrated against community benchmarks (e.g. Llama 3.1 8B Q4_K_M on an M2 Max: predicted ~62 tok/s, field reports 55–70). Prompt processing is compute-bound, not bandwidth-bound; tetro reports it as a rough 5–10× multiple of generation speed.
+`params_active` equals total parameters for dense models and the active-expert count for MoE models — which is why a 30B-A3B MoE generates faster than a dense 8B. The efficiency factor is the fraction of theoretical bandwidth that llama.cpp/MLX kernels actually sustain, and it differs by architecture: **0.75 for dense models** (calibrated against community benchmarks, e.g. Llama 3.1 8B Q4_K_M on an M2 Max: predicted ~62 tok/s, field reports 55–70) and **0.3 for MoE models** (calibrated on a real measurement: Qwen3.6-35B-A3B UD-Q4_K_XL on an M5 measured 22.6 tok/s vs ~23.7 predicted; community Qwen3-30B-A3B numbers on M3 Max imply the same ≈0.3). Expert routing scatters weight reads across memory, so MoE kernels get nowhere near the dense streaming case — and MoE estimates carry more variance than dense ones. Prompt processing is compute-bound, not bandwidth-bound; tetro reports it as a rough 5–10× multiple of generation speed.
 
-**Stated plainly:** these are bandwidth-bound theoretical estimates at a fixed 75% efficiency. They are good enough to rank models and avoid wasted downloads; they are not a benchmark. A real `tetro bench` module that measures *your* machine and recalibrates the factor per-device is on the roadmap.
+**Stated plainly:** these are bandwidth-bound theoretical estimates at fixed efficiency factors. They are good enough to rank models and avoid wasted downloads; they are not a benchmark. A real `tetro bench` module that measures *your* machine and recalibrates the factors per-device is on the roadmap.
 
 ### Bits per weight
 
