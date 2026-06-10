@@ -264,7 +264,7 @@ mod tests {
         let mv = model.to_model_variant(&model.variants[0]);
         let memory = estimate_memory(&mv, DEFAULT_CONTEXT, &budget);
         let speed = estimate_speed(&mv, 400.0);
-        let score = score_variant(&mv, &memory, &speed, UseCase::General);
+        let score = score_variant(&mv, &memory, &speed, UseCase::General, None);
         ScoredModel {
             model,
             variant_idx: 0,

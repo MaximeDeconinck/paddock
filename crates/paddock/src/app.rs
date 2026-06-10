@@ -49,6 +49,10 @@ impl App {
         include_unfit: bool,
     ) -> Result<Vec<ScoredModel>> {
         let models = db.list_models().context("reading catalog")?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         let mut rows = Vec::new();
         for model in models {
             let mvs: Vec<_> = model
@@ -87,7 +91,8 @@ impl App {
                 continue;
             }
             let speed = estimate_speed(mv, self.profile.bandwidth_gbps);
-            let score = score_variant(mv, &memory, &speed, use_case);
+            let age_days = model.released_at.map(|r| (now - r) as f64 / 86_400.0);
+            let score = score_variant(mv, &memory, &speed, use_case, age_days);
             rows.push(ScoredModel {
                 model,
                 variant_idx,

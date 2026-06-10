@@ -75,6 +75,19 @@ const QUALITY_MALUS_SUB_Q4: f64 = 12.0;
 const QUALITY_MALUS_SUB_Q3_BPW: f64 = 3.6;
 const QUALITY_MALUS_SUB_Q3: f64 = 25.0;
 
+/// Age malus on quality: 6-month grace, then 10 pts/year, capped.
+const AGE_GRACE_YEARS: f64 = 0.5;
+const AGE_MALUS_PER_YEAR: f64 = 10.0;
+const AGE_MALUS_CAP: f64 = 20.0;
+
+/// Quality penalty for model age (days since release). None (unknown
+/// release date) = no malus — absence of data must not punish a model.
+fn age_malus(age_days: Option<f64>) -> f64 {
+    let Some(days) = age_days else { return 0.0 };
+    let years = (days / 365.25).max(0.0);
+    (AGE_MALUS_PER_YEAR * (years - AGE_GRACE_YEARS).max(0.0)).min(AGE_MALUS_CAP)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Score {
     pub total: f64,
@@ -89,10 +102,11 @@ pub fn score_variant(
     mem: &MemoryEstimate,
     speed: &SpeedEstimate,
     uc: UseCase,
+    age_days: Option<f64>,
 ) -> Score {
     let fit = fit_subscore(mem);
     let speed_s = speed_subscore(speed.generation_tps);
-    let quality = quality_subscore(v);
+    let quality = quality_subscore(v, age_days);
     let context = context_subscore(v.context_max);
     let w = weights(uc);
     // Weighted geometric mean (see module docs): a bad component drags the total
@@ -157,19 +171,20 @@ fn speed_subscore(tps: f64) -> f64 {
 const QUALITY_LOG10_MIN: f64 = 9.0;
 const QUALITY_LOG10_MAX: f64 = 10.85;
 
-/// v0.1 proxy: log10(params) normalized 1B->0, ~70B->100, minus low-quant malus.
-fn quality_subscore(v: &ModelVariant) -> f64 {
+/// v0.1 proxy: log10(params) normalized 1B->0, ~70B->100, minus low-quant
+/// malus and age malus (days since release; None = no malus).
+fn quality_subscore(v: &ModelVariant, age_days: Option<f64>) -> f64 {
     let p = (v.params_total.max(1)) as f64;
     let base = ((p.log10() - QUALITY_LOG10_MIN) / (QUALITY_LOG10_MAX - QUALITY_LOG10_MIN) * 100.0)
         .clamp(0.0, 100.0);
-    let malus = if v.bpw < QUALITY_MALUS_SUB_Q3_BPW {
+    let quant_malus = if v.bpw < QUALITY_MALUS_SUB_Q3_BPW {
         QUALITY_MALUS_SUB_Q3
     } else if v.bpw < QUALITY_MALUS_SUB_Q4_BPW {
         QUALITY_MALUS_SUB_Q4
     } else {
         0.0
     };
-    (base - malus).max(0.0)
+    (base - quant_malus - age_malus(age_days)).max(0.0)
 }
 
 /// log2 normalized: 4k -> 0, 128k -> 100.
@@ -250,10 +265,11 @@ mod tests {
         }
     }
 
+    /// No-age helper: passes `None` so existing behavior is unchanged.
     fn score_of(v: &ModelVariant, uc: UseCase) -> Score {
         let mem = estimate_memory(v, DEFAULT_CONTEXT, &budget());
         let speed = estimate_speed(v, 400.0);
-        score_variant(v, &mem, &speed, uc)
+        score_variant(v, &mem, &speed, uc, None)
     }
 
     #[test]
@@ -367,6 +383,35 @@ mod tests {
             s_moe.total,
             s_small.total
         );
+    }
+
+    #[test]
+    fn age_malus_values() {
+        assert_eq!(age_malus(None), 0.0);
+        assert_eq!(age_malus(Some(0.0)), 0.0);
+        assert_eq!(age_malus(Some(182.0)), 0.0); // inside 6-month grace
+        let one_year = age_malus(Some(365.25));
+        assert!((one_year - 5.0).abs() < 0.1, "1y → ~5, got {one_year}");
+        let two_years = age_malus(Some(2.0 * 365.25));
+        assert!((two_years - 15.0).abs() < 0.1, "2y → ~15, got {two_years}");
+        assert_eq!(age_malus(Some(10.0 * 365.25)), 20.0); // cap
+        assert_eq!(age_malus(Some(-50.0)), 0.0); // future date clamps
+    }
+
+    #[test]
+    fn older_same_size_model_scores_lower() {
+        let v = variant("Q4_K_M", 4.83, 8_030_000_000);
+        let mem = estimate_memory(&v, DEFAULT_CONTEXT, &budget());
+        let speed = estimate_speed(&v, 400.0);
+        let fresh = score_variant(&v, &mem, &speed, UseCase::General, None);
+        let stale = score_variant(&v, &mem, &speed, UseCase::General, Some(2.0 * 365.25));
+        assert!(
+            stale.total < fresh.total - 1.0,
+            "2-year-old model must lose ground: fresh={} stale={}",
+            fresh.total,
+            stale.total
+        );
+        assert!(stale.quality < fresh.quality);
     }
 
     #[test]
