@@ -14,9 +14,9 @@ serde_json = "1"
 thiserror = "2"
 anyhow = "1"
 tokio = { version = "1", features = ["rt", "macros"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
