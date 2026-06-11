@@ -11,13 +11,13 @@ mod macos {
 
     use paddock_core::hardware::runtimes::detect_runtimes;
     use paddock_core::hardware::{RealSystemProbe, RuntimesStatus};
-    use paddock_core::serving::{ollama_loaded_models, Registry};
+    use paddock_core::serving::{Registry, ollama_loaded_models};
     use tao::event::{Event, StartCause};
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
     use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
     use tray_icon::{TrayIcon, TrayIconBuilder};
 
-    use super::menu_model::{build_menu_model, MenuEntry, MenuModel};
+    use super::menu_model::{MenuEntry, MenuModel, build_menu_model};
 
     const REFRESH_EVERY: Duration = Duration::from_secs(5);
 

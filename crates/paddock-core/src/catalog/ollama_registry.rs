@@ -15,7 +15,7 @@
 //! anonymously and returns layer sizes.
 
 use super::hf::HttpClient;
-use super::{quant_bpw, CatalogModel, CatalogVariant, RuntimeKind, Source};
+use super::{CatalogModel, CatalogVariant, RuntimeKind, Source, quant_bpw};
 use crate::PaddockError;
 
 const REGISTRY: &str = "https://registry.ollama.ai/v2/library";
@@ -393,7 +393,7 @@ mod tests {
     use std::collections::HashMap;
 
     use async_trait::async_trait;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::catalog::gguf::tests::GgufBuilder;
@@ -941,10 +941,12 @@ mod tests {
             <a href="/library/lfm2.5:480b-cloud">x</a>
         "#;
         let http = discovery_http(html, 0, Vec::new());
-        assert!(discover_model(&http, "lfm2.5", NOW)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            discover_model(&http, "lfm2.5", NOW)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -972,10 +974,12 @@ mod tests {
     #[tokio::test]
     async fn discover_model_unparseable_header_is_none() {
         let http = discovery_http(LFM25_TAGS_HTML, 736_000_000, b"not a gguf file".to_vec());
-        assert!(discover_model(&http, "lfm2.5", NOW)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            discover_model(&http, "lfm2.5", NOW)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

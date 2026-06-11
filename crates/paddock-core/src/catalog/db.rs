@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use super::{CatalogModel, CatalogVariant, RuntimeKind, Source};
 use crate::PaddockError;

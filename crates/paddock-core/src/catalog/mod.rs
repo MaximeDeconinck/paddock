@@ -494,10 +494,12 @@ mod tests {
         );
         // Discovery degrades to a single index error, nothing discovered.
         assert_eq!(report.discovered, 0);
-        assert!(report
-            .errors
-            .iter()
-            .any(|e| e.contains("ollama discovery index")));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("ollama discovery index"))
+        );
         assert!(report.errors.iter().any(|e| e.contains("huggingface")));
         assert!(report.errors.iter().any(|e| e.contains("mlx")));
         // last_sync set even on network failure
@@ -621,10 +623,11 @@ mod tests {
 
         let q3 = models.iter().find(|m| m.name == "qwen3:8b").unwrap();
         assert_eq!(q3.variants.len(), 2);
-        assert!(q3
-            .variants
-            .iter()
-            .any(|v| v.source_tag.as_deref() == Some("8b-fp16")));
+        assert!(
+            q3.variants
+                .iter()
+                .any(|v| v.source_tag.as_deref() == Some("8b-fp16"))
+        );
 
         // Other qwen3 sizes had no matching tags: curated variant stands.
         let q14 = models.iter().find(|m| m.name == "qwen3:14b").unwrap();
@@ -640,10 +643,12 @@ mod tests {
         assert_eq!(llama_calls, 1, "expected one fetch per base");
 
         // Unserved bases were reported, not fatal.
-        assert!(report
-            .errors
-            .iter()
-            .any(|e| e.contains("ollama tags gemma3")));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("ollama tags gemma3"))
+        );
     }
 
     #[tokio::test]
@@ -692,10 +697,11 @@ mod tests {
             2,
             "enriched variants must survive a registry-down re-sync"
         );
-        assert!(m
-            .variants
-            .iter()
-            .any(|v| v.source_tag.as_deref() == Some("8b-instruct-q8_0")));
+        assert!(
+            m.variants
+                .iter()
+                .any(|v| v.source_tag.as_deref() == Some("8b-instruct-q8_0"))
+        );
     }
 
     #[tokio::test]
@@ -730,10 +736,11 @@ mod tests {
         let models = db.list_models().unwrap();
         let m = models.iter().find(|m| m.name == "llama3.1:8b").unwrap();
         assert_eq!(m.variants.len(), 2);
-        assert!(m
-            .variants
-            .iter()
-            .any(|v| v.source_tag.as_deref() == Some("8b-instruct-q8_0")));
+        assert!(
+            m.variants
+                .iter()
+                .any(|v| v.source_tag.as_deref() == Some("8b-instruct-q8_0"))
+        );
     }
 
     #[tokio::test]

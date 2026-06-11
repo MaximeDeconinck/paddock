@@ -2,14 +2,14 @@
 //! Used by both the CLI subcommands and (Task 7) the TUI.
 
 use anyhow::{Context, Result};
-use paddock_core::catalog::db::{default_db_path, Db};
 use paddock_core::catalog::CatalogModel;
+use paddock_core::catalog::db::{Db, default_db_path};
 use paddock_core::estimate::{
-    estimate_memory, estimate_speed, FitVerdict, MemoryBudget, MemoryEstimate, SpeedEstimate,
-    DEFAULT_CONTEXT,
+    DEFAULT_CONTEXT, FitVerdict, MemoryBudget, MemoryEstimate, SpeedEstimate, estimate_memory,
+    estimate_speed,
 };
-use paddock_core::hardware::{scan, HardwareProfile, RealSystemProbe};
-use paddock_core::score::{best_variant, score_variant, Score, UseCase};
+use paddock_core::hardware::{HardwareProfile, RealSystemProbe, scan};
+use paddock_core::score::{Score, UseCase, best_variant, score_variant};
 
 #[derive(Clone)]
 pub struct ScoredModel {

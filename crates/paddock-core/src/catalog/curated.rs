@@ -2,7 +2,7 @@
 //! public API and scraping is brittle; any HF GGUF repo remains runnable via
 //! `ollama run hf.co/{repo}:{quant}` regardless of this list.
 
-use super::{quant_bpw, CatalogModel, CatalogVariant, RuntimeKind, Source};
+use super::{CatalogModel, CatalogVariant, RuntimeKind, Source, quant_bpw};
 
 #[derive(serde::Deserialize)]
 struct Entry {

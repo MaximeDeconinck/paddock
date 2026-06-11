@@ -5,9 +5,7 @@ use thiserror::Error;
 pub enum PaddockError {
     #[error("sysctl `{name}` unavailable ({reason}); is this a macOS machine?")]
     Sysctl { name: String, reason: String },
-    #[error(
-        "catalog database error: {0}. Try deleting the catalog and re-running `paddock sync`."
-    )]
+    #[error("catalog database error: {0}. Try deleting the catalog and re-running `paddock sync`.")]
     Db(#[from] rusqlite::Error),
     #[error("network error: {0}. Check your connection and retry `paddock sync`.")]
     Network(String),

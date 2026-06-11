@@ -18,8 +18,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::estimate::{
-    estimate_memory, FitVerdict, MemoryBudget, MemoryEstimate, ModelVariant, SpeedEstimate,
-    DEFAULT_CONTEXT,
+    DEFAULT_CONTEXT, FitVerdict, MemoryBudget, MemoryEstimate, ModelVariant, SpeedEstimate,
+    estimate_memory,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -240,7 +240,7 @@ pub fn best_variant<'a>(
 mod tests {
     use super::*;
     use crate::estimate::{
-        estimate_memory, estimate_speed, MemoryBudget, ModelVariant, DEFAULT_CONTEXT,
+        DEFAULT_CONTEXT, MemoryBudget, ModelVariant, estimate_memory, estimate_speed,
     };
 
     fn variant(quant: &str, bpw: f64, params: u64) -> ModelVariant {

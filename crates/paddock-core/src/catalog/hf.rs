@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use super::{quant_bpw, quant_from_filename, CatalogModel, CatalogVariant, RuntimeKind, Source};
+use super::{CatalogModel, CatalogVariant, RuntimeKind, Source, quant_bpw, quant_from_filename};
 use crate::PaddockError;
 
 #[async_trait]
@@ -392,10 +392,10 @@ mod tests {
     use std::collections::HashMap;
 
     use async_trait::async_trait;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::*;
-    use crate::catalog::gguf::tests::{llama_header, GgufBuilder};
+    use crate::catalog::gguf::tests::{GgufBuilder, llama_header};
 
     /// Mock HTTP client for unit tests.
     struct MockHttp {
@@ -634,7 +634,7 @@ mod tests {
         assert_eq!(v.layers, 32);
         assert_eq!(v.kv_heads, 8);
         assert_eq!(v.head_dim, 128); // 4096 / 32
-                                     // createdAt from the list item → released_at (exact, day precision)
+        // createdAt from the list item → released_at (exact, day precision)
         assert_eq!(
             m.released_at,
             crate::catalog::dates::ymd_to_epoch(2024, 3, 7)

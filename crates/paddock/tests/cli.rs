@@ -15,7 +15,7 @@ fn paddock() -> (Command, TempDir) {
 /// Seed the test catalog with one small Ollama-source model so serve/run
 /// planning works without network or a real sync.
 fn seed_one_model(dir: &std::path::Path) {
-    use paddock_core::catalog::{db::Db, CatalogModel, CatalogVariant, RuntimeKind, Source};
+    use paddock_core::catalog::{CatalogModel, CatalogVariant, RuntimeKind, Source, db::Db};
     let db = Db::open(dir.join("catalog.db")).unwrap();
     db.upsert_model(&CatalogModel {
         id: 0,
@@ -101,14 +101,18 @@ fn serve_json_prints_plan_without_side_effects() {
         .assert()
         .success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    assert!(v["endpoint"]
-        .as_str()
-        .unwrap()
-        .starts_with("http://127.0.0.1:"));
-    assert!(v["openai_url"]
-        .as_str()
-        .unwrap()
-        .ends_with("/v1/chat/completions"));
+    assert!(
+        v["endpoint"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://127.0.0.1:")
+    );
+    assert!(
+        v["openai_url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/v1/chat/completions")
+    );
     assert!(v["model_ref"].is_string());
     // zero side effects: no serving record was written
     assert!(!dir.path().join("serving").exists());

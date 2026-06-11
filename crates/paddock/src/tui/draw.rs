@@ -5,15 +5,15 @@ use paddock_core::catalog::RuntimeKind;
 use paddock_core::estimate::FitVerdict;
 use paddock_core::hardware::{HardwareProfile, RuntimeStatus};
 use paddock_core::runtime::{RunPlan, ServePlan};
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState};
-use ratatui::Frame;
 
 use crate::app::ScoredModel;
 use crate::output::{age_label, gib, verdict_label};
-use crate::tui::state::{use_case_label, Mode, TuiState};
+use crate::tui::state::{Mode, TuiState, use_case_label};
 
 /// Accent palette sampled from the paddock wordmark (deep indigo banner).
 /// ACCENT for accented text on dark terminals (readable royal blue),

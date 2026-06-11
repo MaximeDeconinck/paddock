@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::PaddockError;
 use crate::catalog::RuntimeKind;
 use crate::hardware::SystemProbe;
-use crate::PaddockError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServingRecord {
@@ -126,7 +126,7 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 // Tiny extern to avoid adding the libc crate for one syscall.
-extern "C" {
+unsafe extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }

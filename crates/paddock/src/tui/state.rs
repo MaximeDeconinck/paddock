@@ -2,7 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use paddock_core::hardware::RuntimesStatus;
-use paddock_core::runtime::{plan_run, plan_serve, RunPlan, ServePlan};
+use paddock_core::runtime::{RunPlan, ServePlan, plan_run, plan_serve};
 use paddock_core::score::UseCase;
 
 use crate::app::ScoredModel;
@@ -229,7 +229,7 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     use paddock_core::catalog::{CatalogModel, CatalogVariant, RuntimeKind, Source};
-    use paddock_core::estimate::{estimate_memory, estimate_speed, MemoryBudget, DEFAULT_CONTEXT};
+    use paddock_core::estimate::{DEFAULT_CONTEXT, MemoryBudget, estimate_memory, estimate_speed};
     use paddock_core::score::score_variant;
 
     fn fake_row(name: &str) -> ScoredModel {

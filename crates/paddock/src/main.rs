@@ -6,14 +6,14 @@ mod tui;
 
 use std::io::Write;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
+use paddock_core::PaddockError;
 use paddock_core::catalog::CatalogModel;
 use paddock_core::hardware::{RealSystemProbe, SystemProbe};
-use paddock_core::runtime::{plan_run, plan_serve, InstallPlan, RunPlan, ServePlan};
-use paddock_core::score::{best_variant, UseCase};
+use paddock_core::runtime::{InstallPlan, RunPlan, ServePlan, plan_run, plan_serve};
+use paddock_core::score::{UseCase, best_variant};
 use paddock_core::serving::{Registry, ServingRecord};
-use paddock_core::PaddockError;
 
 use crate::app::App;
 use crate::cli::{Cli, Command};

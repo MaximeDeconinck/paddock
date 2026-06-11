@@ -87,11 +87,7 @@ pub fn age_label(released_at: Option<i64>, approx: bool, now: i64) -> String {
     } else {
         format!("{:.1}y", days / 365.25)
     };
-    if approx {
-        format!("~{core}")
-    } else {
-        core
-    }
+    if approx { format!("~{core}") } else { core }
 }
 
 pub fn print_fit_table(rows: &[ScoredModel]) {
