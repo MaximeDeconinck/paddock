@@ -17,7 +17,7 @@ Picking a local model today means answering three questions by hand:
 paddock answers all three with one command, and it is **Apple Silicon-first** by design:
 
 - **Unified memory** — there is no separate VRAM pool to reason about, but there *is* a Metal working-set limit (`recommendedMaxWorkingSetSize`, typically ~75% of RAM) that silently decides whether a model runs fully on the GPU. paddock reads it directly and budgets against it.
-- **Per-chip bandwidth** — token generation on Apple Silicon is memory-bandwidth bound, and bandwidth varies 12× across the lineup (68 GB/s on a base M1 vs 819 GB/s on an M3 Ultra). paddock ships a per-chip table covering M1 through M5 — including the perf-core-dependent M3/M4/M5 Max variants — sourced from Apple newsroom specs. Unreleased chips (M4/M5 Ultra) fall back to conservative estimates and are flagged as such.
+- **Per-chip bandwidth** — token generation on Apple Silicon is memory-bandwidth bound, and bandwidth varies 12× across the lineup (68 GB/s on a base M1 vs 819 GB/s on an M3 Ultra). paddock ships a per-chip table covering M1 through M5 — including the perf-core-dependent M3/M4/M5 Max variants — sourced from Apple newsroom specs. Unreleased chips (M4/M5 Ultra) fall back to conservative estimates and are flagged as such. Speed estimates model the per-token traffic as active weights plus the KV cache at 8k-deep context, so the TOK/S column reflects real long-context decoding, not the empty-context best case.
 - **First-class MLX** — Apple's own framework is a peer of Ollama and llama.cpp, not an afterthought: the catalog indexes `mlx-community` quantizations and `paddock run` can plan an `mlx_lm` launch.
 
 ## Install

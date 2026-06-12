@@ -164,7 +164,14 @@ pub fn estimate_memory(
 
 /// Estimate generation speed given memory bandwidth.
 /// `bandwidth_gbps`: must be finite and ≥ 0; non-finite/negative values are treated as 0.0.
-pub fn estimate_speed(v: &ModelVariant, bandwidth_gbps: f64) -> SpeedEstimate {
+/// `kv_cache_bytes`: every decoded token re-streams the KV cache built so far
+/// on top of the active weights, so speed decays with context depth. Callers
+/// pass the DEFAULT_CONTEXT cache from `estimate_memory`, keeping the MEMORY
+/// and TOK/S columns consistent at the same 8k depth; 0 models an empty
+/// context. NOTE: SPEED_EFFICIENCY/MOE_SPEED_EFFICIENCY were calibrated on
+/// shallow-context benchmarks — recalibrate both when `paddock bench` lands,
+/// not before, to avoid double-counting the decay.
+pub fn estimate_speed(v: &ModelVariant, bandwidth_gbps: f64, kv_cache_bytes: u64) -> SpeedEstimate {
     let bpw = if v.bpw.is_finite() && v.bpw > 0.0 {
         v.bpw
     } else {
@@ -180,7 +187,7 @@ pub fn estimate_speed(v: &ModelVariant, bandwidth_gbps: f64) -> SpeedEstimate {
     } else {
         SPEED_EFFICIENCY
     };
-    let bytes_per_token = v.params_active as f64 * bpw / 8.0;
+    let bytes_per_token = v.params_active as f64 * bpw / 8.0 + kv_cache_bytes as f64;
     let generation_tps = if bytes_per_token > 0.0 {
         safe_bw * 1e9 / bytes_per_token * efficiency
     } else {
@@ -239,8 +246,24 @@ mod tests {
     }
 
     #[test]
+    fn speed_decays_with_kv_cache_depth() {
+        let v = llama31_8b_q4km();
+        let empty = estimate_speed(&v, 400.0, 0).generation_tps;
+        let deep = estimate_speed(&v, 400.0, 1_000_000_000).generation_tps; // ~8k ctx
+        assert!(deep < empty);
+        // 8B Q4_K_M: ~4.85 GB of weights + ~1 GB of cache per token.
+        let weights = 8_030_000_000.0 * 4.83 / 8.0;
+        let expected_ratio = weights / (weights + 1_000_000_000.0);
+        assert!(
+            (deep / empty - expected_ratio).abs() < 0.02,
+            "deep/empty = {}, expected ~{expected_ratio}",
+            deep / empty
+        );
+    }
+
+    #[test]
     fn speed_8b_q4km_on_m2_max_within_field_range() {
-        let s = estimate_speed(&llama31_8b_q4km(), 400.0);
+        let s = estimate_speed(&llama31_8b_q4km(), 400.0, 0);
         assert!(
             s.generation_tps > 55.0 && s.generation_tps < 70.0,
             "got {}",
@@ -319,7 +342,7 @@ mod tests {
         let mut moe = llama31_8b_q4km();
         moe.params_total = 30_000_000_000;
         moe.params_active = 3_000_000_000;
-        let moe_speed = estimate_speed(&moe, 400.0).generation_tps;
+        let moe_speed = estimate_speed(&moe, 400.0, 0).generation_tps;
         // (a) 400e9 / (3e9 × 4.83 / 8) × 0.3 ≈ 66 tok/s
         assert!(moe_speed > 60.0 && moe_speed < 72.0, "got {moe_speed}");
         // (b) a dense model of the same TOTAL size would crawl (~16.5 tok/s);
@@ -327,7 +350,7 @@ mod tests {
         let mut dense_30b = llama31_8b_q4km();
         dense_30b.params_total = 30_000_000_000;
         dense_30b.params_active = 30_000_000_000;
-        let dense_speed = estimate_speed(&dense_30b, 400.0).generation_tps;
+        let dense_speed = estimate_speed(&dense_30b, 400.0, 0).generation_tps;
         assert!(
             moe_speed > dense_speed * 3.0,
             "moe={moe_speed} dense={dense_speed}"
@@ -350,7 +373,7 @@ mod tests {
             embedding_dim: 2048,
             context_max: 262_144,
         };
-        let s = estimate_speed(&moe, 153.6);
+        let s = estimate_speed(&moe, 153.6, 0);
         assert!(
             s.generation_tps > 18.0 && s.generation_tps < 28.0,
             "measured 22.6 tok/s, estimated {}",
@@ -372,10 +395,10 @@ mod tests {
         bad.bpw = f64::NAN;
         let m = estimate_memory(&bad, 8192, &m2_max_36gb());
         assert_eq!(m.weights_bytes, 0);
-        let s = estimate_speed(&bad, 400.0);
+        let s = estimate_speed(&bad, 400.0, 0);
         assert_eq!(s.generation_tps, 0.0);
         assert_eq!(s.tier, SpeedTier::Slow);
-        let s2 = estimate_speed(&llama31_8b_q4km(), f64::NAN);
+        let s2 = estimate_speed(&llama31_8b_q4km(), f64::NAN, 0);
         assert!(s2.generation_tps == 0.0);
     }
 

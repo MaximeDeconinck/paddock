@@ -268,7 +268,7 @@ mod tests {
     /// No-age helper: passes `None` so existing behavior is unchanged.
     fn score_of(v: &ModelVariant, uc: UseCase) -> Score {
         let mem = estimate_memory(v, DEFAULT_CONTEXT, &budget());
-        let speed = estimate_speed(v, 400.0);
+        let speed = estimate_speed(v, 400.0, mem.kv_cache_bytes);
         score_variant(v, &mem, &speed, uc, None)
     }
 
@@ -402,7 +402,7 @@ mod tests {
     fn older_same_size_model_scores_lower() {
         let v = variant("Q4_K_M", 4.83, 8_030_000_000);
         let mem = estimate_memory(&v, DEFAULT_CONTEXT, &budget());
-        let speed = estimate_speed(&v, 400.0);
+        let speed = estimate_speed(&v, 400.0, mem.kv_cache_bytes);
         let fresh = score_variant(&v, &mem, &speed, UseCase::General, None);
         let stale = score_variant(&v, &mem, &speed, UseCase::General, Some(2.0 * 365.25));
         assert!(

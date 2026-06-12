@@ -90,7 +90,7 @@ impl App {
             if !include_unfit && memory.verdict == FitVerdict::DoesNotFit {
                 continue;
             }
-            let speed = estimate_speed(mv, self.profile.bandwidth_gbps);
+            let speed = estimate_speed(mv, self.profile.bandwidth_gbps, memory.kv_cache_bytes);
             let age_days = model.released_at.map(|r| (now - r) as f64 / 86_400.0);
             let score = score_variant(mv, &memory, &speed, use_case, age_days);
             rows.push(ScoredModel {
