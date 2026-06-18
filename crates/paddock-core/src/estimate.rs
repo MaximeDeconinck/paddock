@@ -116,6 +116,18 @@ pub struct SpeedEstimate {
     pub tier: SpeedTier,
 }
 
+/// KV cache size at a given context depth: K + V (×2), per layer, per KV
+/// head, head_dim wide, fp16 (×2 bytes). Linear in `context_len` — this is
+/// also the slope of the speed decay, since every decoded token re-streams
+/// the whole cache.
+pub fn kv_cache_bytes(v: &ModelVariant, context_len: u32) -> u64 {
+    2u64.saturating_mul(v.layers as u64)
+        .saturating_mul(v.kv_heads as u64)
+        .saturating_mul(v.head_dim as u64)
+        .saturating_mul(context_len as u64)
+        .saturating_mul(2)
+}
+
 pub fn estimate_memory(
     v: &ModelVariant,
     context_len: u32,
@@ -127,12 +139,7 @@ pub fn estimate_memory(
         0.0
     };
     let weights_bytes = (v.params_total as f64 * bpw / 8.0) as u64;
-    let kv_cache_bytes = 2u64
-        .saturating_mul(v.layers as u64)
-        .saturating_mul(v.kv_heads as u64)
-        .saturating_mul(v.head_dim as u64)
-        .saturating_mul(context_len as u64)
-        .saturating_mul(2);
+    let kv_cache_bytes = kv_cache_bytes(v, context_len);
     let overhead_bytes =
         OVERHEAD_BASE_BYTES + (weights_bytes as f64 * OVERHEAD_WEIGHTS_FRACTION) as u64;
     let total_bytes = weights_bytes

@@ -2,14 +2,16 @@
 //! Palette: DarkGray/Gray/White + a single deep-blue accent.
 
 use paddock_core::catalog::RuntimeKind;
-use paddock_core::estimate::FitVerdict;
+use paddock_core::estimate::{FitVerdict, estimate_speed, kv_cache_bytes};
 use paddock_core::hardware::{HardwareProfile, RuntimeStatus};
 use paddock_core::runtime::{RunPlan, ServePlan};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Axis, Block, Cell, Chart, Clear, Dataset, GraphType};
+use ratatui::widgets::{Paragraph, Row, Table, TableState};
 
 use crate::app::ScoredModel;
 use crate::output::{age_label, gib, verdict_label};
@@ -35,7 +37,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, profile: &HardwareProfile) {
     draw_table(frame, table, state);
     draw_footer(frame, footer, state);
     if state.mode == Mode::Detail {
-        draw_detail(frame, state);
+        draw_detail(frame, state, profile);
     }
 }
 
@@ -208,7 +210,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
     );
 }
 
-fn draw_detail(frame: &mut Frame, state: &TuiState) {
+/// Rows reserved for the tok/s-vs-context chart inside the detail popup.
+const SPEED_CHART_HEIGHT: u16 = 9;
+
+fn draw_detail(frame: &mut Frame, state: &TuiState, profile: &HardwareProfile) {
     let Some(r) = state.rows.get(state.selected) else {
         return;
     };
@@ -219,13 +224,84 @@ fn draw_detail(frame: &mut Frame, state: &TuiState) {
     );
     // +2 for the borders: the popup grows to fit its content (clipped only
     // when the terminal itself is too small).
-    let content_height = (lines.len() as u16).saturating_add(2);
+    let content_height = (lines.len() as u16)
+        .saturating_add(SPEED_CHART_HEIGHT)
+        .saturating_add(2);
     let area = centered(frame.area(), 70, content_height);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
         .border_style(Style::new().fg(Color::DarkGray))
         .title(Span::styled(" detail ", Style::new().fg(ACCENT)));
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [text_area, chart_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(SPEED_CHART_HEIGHT)]).areas(inner);
+    frame.render_widget(Paragraph::new(lines), text_area);
+    draw_speed_chart(frame, chart_area, r, profile.bandwidth_gbps);
+}
+
+/// Generation speed as a function of context depth — the KV cache is
+/// re-streamed every token, so tok/s decays as the conversation grows.
+/// Sampled from the same estimator the table uses (anchored at 8k there).
+fn draw_speed_chart(frame: &mut Frame, area: Rect, r: &ScoredModel, bandwidth_gbps: f64) {
+    let v = r.model.to_model_variant(&r.model.variants[r.variant_idx]);
+    let max_ctx = r.model.context_max.clamp(8_192, 131_072);
+    const SAMPLES: u32 = 64;
+    let points: Vec<(f64, f64)> = (0..=SAMPLES)
+        .map(|i| {
+            let ctx = max_ctx as u64 * i as u64 / SAMPLES as u64;
+            let tps =
+                estimate_speed(&v, bandwidth_gbps, kv_cache_bytes(&v, ctx as u32)).generation_tps;
+            (ctx as f64, tps)
+        })
+        .collect();
+    let y_max = points.first().map(|p| p.1).unwrap_or(0.0).max(1.0);
+    let ctx_label = |c: f64| {
+        if c >= 1024.0 {
+            format!("{}k", (c / 1024.0).round() as u64)
+        } else {
+            format!("{}", c as u64)
+        }
+    };
+    let dataset = Dataset::default()
+        .marker(symbols::Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::new().fg(ACCENT))
+        .data(&points);
+    let x_axis = Axis::default()
+        .style(Style::new().fg(Color::DarkGray))
+        .bounds([0.0, max_ctx as f64])
+        .labels(vec![
+            Span::styled("0", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                ctx_label(max_ctx as f64 / 2.0),
+                Style::new().fg(Color::DarkGray),
+            ),
+            Span::styled(ctx_label(max_ctx as f64), Style::new().fg(Color::DarkGray)),
+        ]);
+    let y_axis = Axis::default()
+        .style(Style::new().fg(Color::DarkGray))
+        .bounds([0.0, y_max])
+        .labels(vec![
+            Span::styled("0", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:.0}", y_max / 2.0),
+                Style::new().fg(Color::DarkGray),
+            ),
+            Span::styled(format!("{y_max:.0}"), Style::new().fg(Color::DarkGray)),
+        ]);
+    let chart = Chart::new(vec![dataset])
+        .block(
+            Block::default().title(Span::styled(
+                "tok/s by context depth",
+                Style::new()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        )
+        .x_axis(x_axis)
+        .y_axis(y_axis);
+    frame.render_widget(chart, area);
 }
 
 fn detail_lines<'a>(
@@ -343,6 +419,8 @@ fn detail_lines<'a>(
         lines.push(section("tuning"));
         lines.push(kv("hint", format!("sudo sysctl iogpu.wired_limit_mb={mb}")));
     }
+    // Trailing gap before the speed chart rendered in the area below.
+    lines.push(Line::default());
     lines
 }
 
