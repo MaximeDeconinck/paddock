@@ -179,16 +179,16 @@ async fn fetch_hf_repo(
     // Infallible: `files.is_empty()` returned `Ok(None)` above.
     let probe_file = &files.iter().min_by_key(|f| f.2).unwrap().0.clone();
     let url = format!("https://huggingface.co/{repo}/resolve/main/{probe_file}");
-    if let Ok(bytes) = http.get_range(&url, 0, GGUF_HEADER_PROBE_BYTES - 1).await {
-        if let Ok(meta) = super::gguf::parse_gguf_header(&bytes) {
-            architecture = architecture.or(meta.architecture.clone());
-            layers = meta.block_count.unwrap_or(0) as u32;
-            kv_heads = meta.head_count_kv.or(meta.head_count).unwrap_or(0) as u32;
-            head_dim = meta.head_dim().unwrap_or(0) as u32;
-            embedding_dim = meta.embedding_length.unwrap_or(0) as u32;
-            if context_max == 0 {
-                context_max = meta.context_length.unwrap_or(0) as u32;
-            }
+    if let Ok(bytes) = http.get_range(&url, 0, GGUF_HEADER_PROBE_BYTES - 1).await
+        && let Ok(meta) = super::gguf::parse_gguf_header(&bytes)
+    {
+        architecture = architecture.or(meta.architecture.clone());
+        layers = meta.block_count.unwrap_or(0) as u32;
+        kv_heads = meta.head_count_kv.or(meta.head_count).unwrap_or(0) as u32;
+        head_dim = meta.head_dim().unwrap_or(0) as u32;
+        embedding_dim = meta.embedding_length.unwrap_or(0) as u32;
+        if context_max == 0 {
+            context_max = meta.context_length.unwrap_or(0) as u32;
         }
     }
     if layers == 0 || kv_heads == 0 || head_dim == 0 || params_total == 0 {
@@ -264,10 +264,11 @@ fn moe_active_params(repo: &str, params_total: u64) -> u64 {
             .chars()
             .take_while(|c| c.is_ascii_digit() || *c == '.')
             .collect();
-        if !digits.is_empty() && tail[digits.len()..].starts_with('b') {
-            if let Ok(billions) = digits.parse::<f64>() {
-                return (billions * 1e9) as u64;
-            }
+        if !digits.is_empty()
+            && tail[digits.len()..].starts_with('b')
+            && let Ok(billions) = digits.parse::<f64>()
+        {
+            return (billions * 1e9) as u64;
         }
     }
     params_total
@@ -360,25 +361,24 @@ fn params_from_name(repo: &str) -> Option<u64> {
             if i < bytes.len()
                 && bytes[i] == b'b'
                 && (i + 1 == bytes.len() || !bytes[i + 1].is_ascii_alphanumeric())
+                && let Ok(v) = lower[start..i].parse::<f64>()
             {
-                if let Ok(v) = lower[start..i].parse::<f64>() {
-                    // MoE "NxMb" pattern (e.g. "8x7b"): the token is preceded
-                    // by "<digits>x", total params are N * M billions.
-                    let mut val = v;
-                    if start >= 2 && bytes[start - 1] == b'x' {
-                        let x = start - 1;
-                        let mut k = x;
-                        while k > 0 && bytes[k - 1].is_ascii_digit() {
-                            k -= 1;
-                        }
-                        if k < x {
-                            if let Ok(n) = lower[k..x].parse::<f64>() {
-                                val = n * v;
-                            }
-                        }
+                // MoE "NxMb" pattern (e.g. "8x7b"): the token is preceded
+                // by "<digits>x", total params are N * M billions.
+                let mut val = v;
+                if start >= 2 && bytes[start - 1] == b'x' {
+                    let x = start - 1;
+                    let mut k = x;
+                    while k > 0 && bytes[k - 1].is_ascii_digit() {
+                        k -= 1;
                     }
-                    best = Some(best.map_or(val, |b: f64| b.max(val)));
+                    if k < x
+                        && let Ok(n) = lower[k..x].parse::<f64>()
+                    {
+                        val = n * v;
+                    }
                 }
+                best = Some(best.map_or(val, |b: f64| b.max(val)));
             }
         } else {
             i += 1;

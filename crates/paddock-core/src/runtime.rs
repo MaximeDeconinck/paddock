@@ -241,10 +241,11 @@ pub fn plan_serve(
             }
             // Prefer Ollama; fall back to llama-server for HF GGUF when only
             // llama.cpp is installed.
-            if !rt.ollama.installed && rt.llama_cpp.installed {
-                if let Some(hf_ref) = hf_ref.take() {
-                    return Ok(llama_server_plan(hf_ref, port, &local, None));
-                }
+            if !rt.ollama.installed
+                && rt.llama_cpp.installed
+                && let Some(hf_ref) = hf_ref.take()
+            {
+                return Ok(llama_server_plan(hf_ref, port, &local, None));
             }
             let model_ref = match hf_ref {
                 Some(hf_ref) => format!("hf.co/{hf_ref}"),

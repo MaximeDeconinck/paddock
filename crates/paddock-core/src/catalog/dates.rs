@@ -102,10 +102,10 @@ pub fn oldest_relative_date(html: &str, now: i64) -> Option<i64> {
     for (idx, _) in html.match_indices(" ago") {
         // Require a word boundary after "ago" so "3 days agonizing" doesn't
         // count: the next byte (if any) must not be alphanumeric.
-        if let Some(&b) = html.as_bytes().get(idx + 4) {
-            if b.is_ascii_alphanumeric() {
-                continue;
-            }
+        if let Some(&b) = html.as_bytes().get(idx + 4)
+            && b.is_ascii_alphanumeric()
+        {
+            continue;
         }
         // Walk back over "N unit " (max ~20 chars: "59 minutes").
         let start = html[..idx]
@@ -118,11 +118,11 @@ pub fn oldest_relative_date(html: &str, now: i64) -> Option<i64> {
         let window = &html[start..idx + 4];
         // Try every suffix of the window that starts at a digit.
         for (i, c) in window.char_indices() {
-            if c.is_ascii_digit() {
-                if let Some(e) = parse_relative_ago(&window[i..], now) {
-                    oldest = Some(oldest.map_or(e, |o| o.min(e)));
-                    break;
-                }
+            if c.is_ascii_digit()
+                && let Some(e) = parse_relative_ago(&window[i..], now)
+            {
+                oldest = Some(oldest.map_or(e, |o| o.min(e)));
+                break;
             }
         }
     }

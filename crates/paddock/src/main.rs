@@ -316,19 +316,19 @@ fn wait_ready(plan: &ServePlan, mut child: Option<&mut std::process::Child>) -> 
         if RealSystemProbe.http_get_local(&url).is_some() {
             return Ok(());
         }
-        if let Some(c) = child.as_deref_mut() {
-            if let Some(status) = c.try_wait()? {
-                let argv = plan.server_argv.as_deref().unwrap_or_default().join(" ");
-                bail!(
-                    "server exited with {status} before becoming ready — \
+        if let Some(c) = child.as_deref_mut()
+            && let Some(status) = c.try_wait()?
+        {
+            let argv = plan.server_argv.as_deref().unwrap_or_default().join(" ");
+            bail!(
+                "server exited with {status} before becoming ready — \
                      run `{argv}` manually to see the error"
-                );
-            }
+            );
         }
-        if let Some(deadline) = deadline {
-            if start.elapsed() >= deadline {
-                bail!("ollama daemon not reachable on 11434 — is it running?");
-            }
+        if let Some(deadline) = deadline
+            && start.elapsed() >= deadline
+        {
+            bail!("ollama daemon not reachable on 11434 — is it running?");
         }
         if !notified && start.elapsed() >= Duration::from_secs(5) {
             eprintln!("downloading/loading model — this can take a while");

@@ -296,10 +296,10 @@ async fn enrich_curated_with_registry(
     // library page to consult and are skipped).
     let mut bases: Vec<String> = Vec::new();
     for m in curated_models.iter() {
-        if let Some((base, _)) = m.name.split_once(':') {
-            if !bases.iter().any(|b| b == base) {
-                bases.push(base.to_string());
-            }
+        if let Some((base, _)) = m.name.split_once(':')
+            && !bases.iter().any(|b| b == base)
+        {
+            bases.push(base.to_string());
         }
     }
     for base in &bases {

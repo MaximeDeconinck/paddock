@@ -192,10 +192,10 @@ pub async fn discover_model(
         return Ok(None);
     };
     let arch = meta.architecture.clone();
-    if let Some(a) = arch.as_deref() {
-        if ARCH_SKIPLIST.contains(&a) {
-            return Ok(None);
-        }
+    if let Some(a) = arch.as_deref()
+        && ARCH_SKIPLIST.contains(&a)
+    {
+        return Ok(None);
     }
     let layers = meta.block_count.unwrap_or(0) as u32;
     let kv_heads = meta.head_count_kv.or(meta.head_count).unwrap_or(0) as u32;

@@ -60,20 +60,20 @@ impl Db {
         conn.execute_batch(SCHEMA)?;
         // Migration for DBs created before source_tag existed. SQLite has no
         // ADD COLUMN IF NOT EXISTS, so ignore the duplicate-column error.
-        if let Err(e) = conn.execute("ALTER TABLE variants ADD COLUMN source_tag TEXT", []) {
-            if !e.to_string().contains("duplicate column name") {
-                return Err(e.into());
-            }
+        if let Err(e) = conn.execute("ALTER TABLE variants ADD COLUMN source_tag TEXT", [])
+            && !e.to_string().contains("duplicate column name")
+        {
+            return Err(e.into());
         }
         // Migration for DBs created before model release dates existed.
         for ddl in [
             "ALTER TABLE models ADD COLUMN released_at INTEGER",
             "ALTER TABLE models ADD COLUMN released_approx INTEGER NOT NULL DEFAULT 0",
         ] {
-            if let Err(e) = conn.execute(ddl, []) {
-                if !e.to_string().contains("duplicate column name") {
-                    return Err(e.into());
-                }
+            if let Err(e) = conn.execute(ddl, [])
+                && !e.to_string().contains("duplicate column name")
+            {
+                return Err(e.into());
             }
         }
         Ok(Self { conn })
