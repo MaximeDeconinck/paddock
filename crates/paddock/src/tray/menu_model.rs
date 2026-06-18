@@ -12,7 +12,7 @@ const OLLAMA_OPENAI_URL: &str = "http://127.0.0.1:11434/v1/chat/completions";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum MenuEntry {
-    /// Disabled section header, e.g. "Ollama — 127.0.0.1:11434".
+    /// Disabled section header, e.g. "Ollama - 127.0.0.1:11434".
     Header(String),
     /// Clickable model row; activating copies `copy_url`.
     Model {
@@ -46,19 +46,19 @@ pub fn build_menu_model(
     if runtimes.ollama.installed {
         match ollama_ps {
             Some(models) if !models.is_empty() => {
-                entries.push(MenuEntry::Header(format!("Ollama — {OLLAMA_HOST}")));
+                entries.push(MenuEntry::Header(format!("Ollama - {OLLAMA_HOST}")));
                 for m in models {
                     entries.push(MenuEntry::Model {
-                        label: format!("{} — {}", m.name, gib(m.size_bytes)),
+                        label: format!("{} - {}", m.name, gib(m.size_bytes)),
                         copy_url: OLLAMA_OPENAI_URL.to_string(),
                     });
                 }
             }
             Some(_) => {
-                entries.push(MenuEntry::Header(format!("Ollama — {OLLAMA_HOST}")));
+                entries.push(MenuEntry::Header(format!("Ollama - {OLLAMA_HOST}")));
                 entries.push(MenuEntry::Info("no model loaded".into()));
             }
-            None => entries.push(MenuEntry::Info("Ollama — injoignable".into())),
+            None => entries.push(MenuEntry::Info("Ollama - unreachable".into())),
         }
     }
 
@@ -73,7 +73,7 @@ pub fn build_menu_model(
             entries.push(MenuEntry::Separator);
         }
         entries.push(MenuEntry::Header(format!(
-            "{label} — {}",
+            "{label} - {}",
             host_port(&r.endpoint)
         )));
         entries.push(MenuEntry::Model {
@@ -83,11 +83,11 @@ pub fn build_menu_model(
     }
 
     if entries.is_empty() {
-        entries.push(MenuEntry::Info("Aucun serveur actif".into()));
+        entries.push(MenuEntry::Info("no active server".into()));
     }
     if !runtimes.ollama.installed && !runtimes.llama_cpp.installed && !runtimes.mlx.installed {
         entries.push(MenuEntry::Info(
-            "Aucun runtime installé — lance `paddock run` pour installer".into(),
+            "no runtime installed - run `paddock run` to install".into(),
         ));
     }
 
@@ -138,9 +138,9 @@ mod tests {
         assert_eq!(
             m.entries,
             vec![
-                MenuEntry::Header("Ollama — 127.0.0.1:11434".into()),
+                MenuEntry::Header("Ollama - 127.0.0.1:11434".into()),
                 MenuEntry::Model {
-                    label: "qwen3:30b-a3b — 18.0 GiB".into(),
+                    label: "qwen3:30b-a3b - 18.0 GiB".into(),
                     copy_url: "http://127.0.0.1:11434/v1/chat/completions".into(),
                 },
             ]
@@ -153,18 +153,18 @@ mod tests {
         assert_eq!(
             m.entries,
             vec![
-                MenuEntry::Header("Ollama — 127.0.0.1:11434".into()),
+                MenuEntry::Header("Ollama - 127.0.0.1:11434".into()),
                 MenuEntry::Info("no model loaded".into()),
             ]
         );
     }
 
     #[test]
-    fn ollama_unreachable_shows_injoignable() {
+    fn ollama_unreachable_shows_unreachable() {
         let m = build_menu_model(&[], None, &runtimes(true, false, false));
         assert_eq!(
             m.entries,
-            vec![MenuEntry::Info("Ollama — injoignable".into())]
+            vec![MenuEntry::Info("Ollama - unreachable".into())]
         );
     }
 
@@ -176,10 +176,7 @@ mod tests {
         }];
         // Even with /api/ps data, no Ollama section when it is not installed.
         let m = build_menu_model(&[], Some(&ps), &runtimes(false, true, false));
-        assert_eq!(
-            m.entries,
-            vec![MenuEntry::Info("Aucun serveur actif".into())]
-        );
+        assert_eq!(m.entries, vec![MenuEntry::Info("no active server".into())]);
     }
 
     #[test]
@@ -192,13 +189,13 @@ mod tests {
         assert_eq!(
             m.entries,
             vec![
-                MenuEntry::Header("llama-server — 127.0.0.1:8080".into()),
+                MenuEntry::Header("llama-server - 127.0.0.1:8080".into()),
                 MenuEntry::Model {
                     label: "unsloth/Qwen3-8B-GGUF:Q4_K_M".into(),
                     copy_url: "http://127.0.0.1:8080/v1/chat/completions".into(),
                 },
                 MenuEntry::Separator,
-                MenuEntry::Header("mlx-lm — 127.0.0.1:8081".into()),
+                MenuEntry::Header("mlx-lm - 127.0.0.1:8081".into()),
                 MenuEntry::Model {
                     label: "mlx-community/Qwen3-8B-4bit".into(),
                     copy_url: "http://127.0.0.1:8081/v1/chat/completions".into(),
@@ -220,9 +217,9 @@ mod tests {
         assert_eq!(
             m.entries,
             vec![
-                MenuEntry::Header("Ollama — 127.0.0.1:11434".into()),
+                MenuEntry::Header("Ollama - 127.0.0.1:11434".into()),
                 MenuEntry::Model {
-                    label: "qwen3:30b-a3b — 18.0 GiB".into(),
+                    label: "qwen3:30b-a3b - 18.0 GiB".into(),
                     copy_url: "http://127.0.0.1:11434/v1/chat/completions".into(),
                 },
             ]
@@ -236,10 +233,8 @@ mod tests {
         assert_eq!(
             m.entries,
             vec![
-                MenuEntry::Info("Aucun serveur actif".into()),
-                MenuEntry::Info(
-                    "Aucun runtime installé — lance `paddock run` pour installer".into()
-                ),
+                MenuEntry::Info("no active server".into()),
+                MenuEntry::Info("no runtime installed - run `paddock run` to install".into()),
             ]
         );
     }
@@ -255,7 +250,7 @@ mod tests {
             panic!("expected a model row, got {:?}", m.entries[1]);
         };
         // Same binary-GiB formatting as the rest of the CLI (output::gib).
-        assert_eq!(label, &format!("llama3.2:1b — {}", gib(1_400_000_000)));
-        assert_eq!(label, "llama3.2:1b — 1.3 GiB");
+        assert_eq!(label, &format!("llama3.2:1b - {}", gib(1_400_000_000)));
+        assert_eq!(label, "llama3.2:1b - 1.3 GiB");
     }
 }

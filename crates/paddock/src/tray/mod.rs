@@ -65,7 +65,7 @@ mod macos {
                             .with_menu(Box::new(menu))
                             .with_icon(template_icon())
                             .with_icon_as_template(true)
-                            .with_tooltip("paddock — serve endpoints")
+                            .with_tooltip("paddock - serve endpoints")
                             .build()
                             .expect("failed to create the menu bar item"),
                     );
