@@ -15,7 +15,7 @@ use paddock_core::score::UseCase;
 use ratatui::DefaultTerminal;
 
 use crate::app::App;
-use state::{Action, TuiState};
+use state::{Action, SyncStatus, TuiState};
 
 /// What to do after the terminal is restored.
 enum Exit {
@@ -26,14 +26,31 @@ enum Exit {
 pub fn run(app: App) -> Result<()> {
     let db = app.open_db()?;
     let rows = app.scored_models(&db, UseCase::default(), false)?;
-    if rows.is_empty() {
-        anyhow::bail!("catalog is empty — run `paddock sync` first");
-    }
     let mut state = TuiState::new(rows, UseCase::default(), app.profile.runtimes.clone());
+
+    // Stale (>24h) or empty catalog -> kick off a background refresh. The TUI
+    // opens immediately against whatever snapshot exists (possibly empty).
+    const STALE_AFTER_SECS: i64 = 24 * 60 * 60;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let stale = match db.last_sync() {
+        Ok(Some(ts)) => now - ts > STALE_AFTER_SECS,
+        _ => true, // never synced
+    };
+    let mut sync_rx = if stale || state.all_rows.is_empty() {
+        state.sync_status = SyncStatus::Running;
+        Some(sync_task::spawn_sync(
+            paddock_core::catalog::SyncOptions::default(),
+        ))
+    } else {
+        None
+    };
 
     // ratatui 0.29 helpers: raw mode + alternate screen + panic hook.
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut state, &app, &db);
+    let result = event_loop(&mut terminal, &mut state, &app, &db, &mut sync_rx);
     ratatui::restore();
 
     // Launch AFTER restore so the child owns a clean tty. `launch` and
@@ -54,9 +71,36 @@ fn event_loop(
     state: &mut TuiState,
     app: &App,
     db: &Db,
+    sync_rx: &mut Option<std::sync::mpsc::Receiver<sync_task::SyncMsg>>,
 ) -> Result<Option<Exit>> {
+    use std::sync::mpsc::TryRecvError;
+    use sync_task::SyncMsg;
     loop {
+        state.tick = state.tick.wrapping_add(1);
         terminal.draw(|frame| draw::draw(frame, state, &app.profile))?;
+
+        // Drain background-sync messages (non-blocking).
+        if let Some(rx) = sync_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(SyncMsg::Done(_)) => {
+                    let rows = app.scored_models(db, state.use_case, false)?;
+                    state.set_rows_preserving(rows, state.use_case);
+                    state.sync_status = SyncStatus::Idle.on_done();
+                    *sync_rx = None;
+                }
+                Ok(SyncMsg::Failed(e)) => {
+                    state.sync_status = SyncStatus::Idle.on_failed(e);
+                    *sync_rx = None;
+                }
+                Ok(SyncMsg::Progress { .. }) => {} // not emitted in v1
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    state.sync_status = SyncStatus::Idle.on_failed("sync thread died".into());
+                    *sync_rx = None;
+                }
+            }
+        }
+
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
@@ -75,6 +119,14 @@ fn event_loop(
             Action::Rescore(uc) => {
                 let rows = app.scored_models(db, uc, false)?;
                 state.set_rows(rows, uc);
+            }
+            Action::StartSync => {
+                if sync_rx.is_none() {
+                    state.sync_status = SyncStatus::Running;
+                    *sync_rx = Some(sync_task::spawn_sync(
+                        paddock_core::catalog::SyncOptions::default(),
+                    ));
+                }
             }
         }
     }

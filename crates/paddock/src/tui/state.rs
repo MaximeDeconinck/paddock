@@ -17,7 +17,7 @@ pub enum Mode {
 /// Background-sync lifecycle as seen by the UI. Pure data; the event loop owns
 /// the channel and drives the transitions.
 // Variant payloads (`Done.at`, `Failed.0`) are read by the footer renderer,
-// wired in by Task 5/6; tests exercise them but don't count for dead_code.
+// wired in by Task 6; tests exercise them but don't count for dead_code.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum SyncStatus {
@@ -31,10 +31,10 @@ pub enum SyncStatus {
     Failed(String),
 }
 
-// Wired in by Task 5/6; the transition methods are exercised by tests but
-// uncalled in the binary crate until the event loop drives them.
-#[allow(dead_code)]
 impl SyncStatus {
+    // The event loop assigns `SyncStatus::Running` directly (avoids moving out
+    // of a borrowed field); this transition exists for symmetry and is tested.
+    #[allow(dead_code)]
     pub fn advance_running(self) -> SyncStatus {
         SyncStatus::Running
     }
@@ -58,6 +58,8 @@ pub enum Action {
     Serve(ServePlan),
     /// Re-score the catalog for a new use case (the event loop owns App + Db).
     Rescore(UseCase),
+    /// Kick off a background catalog sync (the event loop owns the thread).
+    StartSync,
 }
 
 pub struct TuiState {
@@ -81,11 +83,9 @@ pub struct TuiState {
     /// the detail popup can show the endpoint without calling plan_serve.
     pub detail_serve_plan: Option<Result<ServePlan, String>>,
     /// Background catalog-sync status, shown in the footer.
-    // Read by the event loop + footer renderer, wired in by Task 5/6.
-    #[allow(dead_code)]
     pub sync_status: SyncStatus,
     /// Spinner animation frame, advanced once per event-loop tick.
-    // Read by the event loop + footer renderer, wired in by Task 5/6.
+    // Advanced by the event loop; read by the footer renderer in Task 6.
     #[allow(dead_code)]
     pub tick: u64,
 }
@@ -122,9 +122,6 @@ impl TuiState {
     /// Replace rows after a background sync. Like `set_rows` but preserves the
     /// selected model *by name* across the swap (cursor follows the model, not
     /// the index) and re-applies the active search filter.
-    // Wired into the event loop by the background-sync integration task; the
-    // binary crate flags it as unused until then.
-    #[allow(dead_code)]
     pub fn set_rows_preserving(&mut self, rows: Vec<ScoredModel>, use_case: UseCase) {
         let selected_name = self.rows.get(self.selected).map(|r| r.model.name.clone());
         self.all_rows = rows;
@@ -206,6 +203,7 @@ impl TuiState {
                 K::Char('c') => return self.set_use_case(UseCase::Coding),
                 K::Char('r') => return self.set_use_case(UseCase::Reasoning),
                 K::Char('h') => return self.set_use_case(UseCase::Chat),
+                K::Char('R') => return Action::StartSync,
                 _ => {}
             },
         }

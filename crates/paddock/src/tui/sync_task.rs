@@ -10,22 +10,20 @@ use paddock_core::catalog::{SyncOptions, SyncReport, sync};
 
 /// Terminal-only in v1: `Progress` is reserved for a future per-source counter
 /// (see the design's "Progress granularity"); it is never sent today.
-// wired into the event loop by Task 5
-#[allow(dead_code)]
 pub enum SyncMsg {
     #[allow(dead_code)]
     Progress {
         source: &'static str,
         count: usize,
     },
-    Done(Box<SyncReport>),
+    // The loop refreshes by re-reading the DB, so the report payload is
+    // signalling only; carried for a future "synced N models" footer line.
+    Done(#[allow(dead_code)] Box<SyncReport>),
     Failed(String),
 }
 
 /// Spawn the catalog sync on a background thread. The returned receiver yields
 /// exactly one terminal message (`Done` or `Failed`) then disconnects.
-// wired into the event loop by Task 5
-#[allow(dead_code)]
 pub fn spawn_sync(opts: SyncOptions) -> Receiver<SyncMsg> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
