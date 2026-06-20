@@ -57,6 +57,11 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        // WAL + busy_timeout: the TUI reads while a background sync writes the
+        // same file (docs/superpowers/specs/2026-06-20-background-sync-design.md).
+        // query_row, not execute_batch: journal_mode returns the resulting mode.
+        let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
         conn.execute_batch(SCHEMA)?;
         // Migration for DBs created before source_tag existed. SQLite has no
         // ADD COLUMN IF NOT EXISTS, so ignore the duplicate-column error.
@@ -256,6 +261,25 @@ fn parse_source(s: &str) -> Source {
 mod tests {
     use super::*;
     use crate::catalog::{CatalogModel, CatalogVariant, RuntimeKind, Source};
+
+    #[test]
+    fn open_enables_wal_and_allows_concurrent_read_during_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        let writer = Db::open(&path).unwrap();
+
+        // WAL is actually on.
+        let mode: String = writer
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+
+        // A second connection can read while the first holds data.
+        writer.set_last_sync(1_700_000_000).unwrap();
+        let reader = Db::open(&path).unwrap();
+        assert_eq!(reader.last_sync().unwrap(), Some(1_700_000_000));
+    }
 
     fn sample_model() -> CatalogModel {
         CatalogModel {
