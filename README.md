@@ -31,7 +31,9 @@ A Homebrew formula is coming. Requires macOS on Apple Silicon (M1 or later).
 
 ## Usage
 
-Running `paddock` with no arguments opens the interactive TUI. Six subcommands cover everything scriptable:
+Running `paddock` with no arguments opens the interactive TUI. It opens instantly against the last catalog snapshot and refreshes in the background when that snapshot is more than 24h old (or empty): a spinner shows in the footer while the refresh runs, the list stays fully usable, and it swaps in the new catalog atomically when done (keeping your selection and search). Press `R` to force a refresh on demand. The blocking `paddock sync` command below is still there for scripts and cron.
+
+Six subcommands cover everything scriptable:
 
 ### `paddock scan`: what is this machine?
 
