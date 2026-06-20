@@ -75,6 +75,24 @@ impl TuiState {
         self.selected = cursor.min(self.rows.len().saturating_sub(1));
     }
 
+    /// Replace rows after a background sync. Like `set_rows` but preserves the
+    /// selected model *by name* across the swap (cursor follows the model, not
+    /// the index) and re-applies the active search filter.
+    // Wired into the event loop by the background-sync integration task; the
+    // binary crate flags it as unused until then.
+    #[allow(dead_code)]
+    pub fn set_rows_preserving(&mut self, rows: Vec<ScoredModel>, use_case: UseCase) {
+        let selected_name = self.rows.get(self.selected).map(|r| r.model.name.clone());
+        self.all_rows = rows;
+        self.use_case = use_case;
+        let q = self.query.clone();
+        self.apply_search(&q);
+        self.selected = selected_name
+            .and_then(|name| self.rows.iter().position(|r| r.model.name == name))
+            .unwrap_or(0)
+            .min(self.rows.len().saturating_sub(1));
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         use KeyCode as K;
         self.last_error = None;
@@ -435,6 +453,58 @@ mod tests {
         // Fewer rows: cursor clamped to the last one.
         s.set_rows(vec![fake_row("Llama3-8B")], UseCase::Chat);
         assert_eq!(s.selected, 0);
+    }
+
+    #[test]
+    fn set_rows_preserving_keeps_selection_by_name() {
+        let mut s = state();
+        s.selected = 2;
+        let name = s.rows[2].model.name.clone();
+        assert_eq!(name, "Mistral-7B");
+        // Same three models, reversed order.
+        s.set_rows_preserving(
+            vec![
+                fake_row("Mistral-7B"),
+                fake_row("Qwen2.5-Coder"),
+                fake_row("Llama3-8B"),
+            ],
+            UseCase::Coding,
+        );
+        assert_eq!(s.rows[s.selected].model.name, name);
+        assert_eq!(s.selected, 0);
+    }
+
+    #[test]
+    fn set_rows_preserving_clamps_when_model_gone() {
+        let mut s = state();
+        s.selected = 2;
+        // The selected model is gone; only the first remains.
+        s.set_rows_preserving(vec![fake_row("Llama3-8B")], UseCase::Coding);
+        assert!(s.selected < s.rows.len());
+        assert_eq!(s.selected, 0);
+    }
+
+    #[test]
+    fn set_rows_preserving_reapplies_active_query() {
+        let mut s = state();
+        s.apply_search("qwen");
+        assert_eq!(s.rows.len(), 1);
+        // Fresh full rows arrive; the "qwen" filter must still apply.
+        s.set_rows_preserving(
+            vec![
+                fake_row("Llama3-8B"),
+                fake_row("Qwen2.5-Coder"),
+                fake_row("Qwen2.5-7B"),
+                fake_row("Mistral-7B"),
+            ],
+            UseCase::Coding,
+        );
+        assert_eq!(s.rows.len(), 2);
+        assert!(
+            s.rows
+                .iter()
+                .all(|r| r.model.name.to_lowercase().contains("qwen"))
+        );
     }
 
     #[test]
