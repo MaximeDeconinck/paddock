@@ -14,6 +14,40 @@ pub enum Mode {
     Search { query: String },
 }
 
+/// Background-sync lifecycle as seen by the UI. Pure data; the event loop owns
+/// the channel and drives the transitions.
+// Variant payloads (`Done.at`, `Failed.0`) are read by the footer renderer,
+// wired in by Task 5/6; tests exercise them but don't count for dead_code.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum SyncStatus {
+    /// No sync this session, or never triggered.
+    Idle,
+    /// A background sync is in flight (v1: spinner only, no count).
+    Running,
+    /// Finished at this instant (used to show "catalog updated" briefly).
+    Done { at: std::time::Instant },
+    /// Failed; the message is shown in the footer.
+    Failed(String),
+}
+
+// Wired in by Task 5/6; the transition methods are exercised by tests but
+// uncalled in the binary crate until the event loop drives them.
+#[allow(dead_code)]
+impl SyncStatus {
+    pub fn advance_running(self) -> SyncStatus {
+        SyncStatus::Running
+    }
+    pub fn on_done(self) -> SyncStatus {
+        SyncStatus::Done {
+            at: std::time::Instant::now(),
+        }
+    }
+    pub fn on_failed(self, msg: String) -> SyncStatus {
+        SyncStatus::Failed(msg)
+    }
+}
+
 #[derive(Debug)]
 pub enum Action {
     None,
@@ -46,6 +80,14 @@ pub struct TuiState {
     /// Serve plan for the selected row, computed alongside `detail_plan` so
     /// the detail popup can show the endpoint without calling plan_serve.
     pub detail_serve_plan: Option<Result<ServePlan, String>>,
+    /// Background catalog-sync status, shown in the footer.
+    // Read by the event loop + footer renderer, wired in by Task 5/6.
+    #[allow(dead_code)]
+    pub sync_status: SyncStatus,
+    /// Spinner animation frame, advanced once per event-loop tick.
+    // Read by the event loop + footer renderer, wired in by Task 5/6.
+    #[allow(dead_code)]
+    pub tick: u64,
 }
 
 impl TuiState {
@@ -61,6 +103,8 @@ impl TuiState {
             last_error: None,
             detail_plan: None,
             detail_serve_plan: None,
+            sync_status: SyncStatus::Idle,
+            tick: 0,
         }
     }
 
@@ -505,6 +549,24 @@ mod tests {
                 .iter()
                 .all(|r| r.model.name.to_lowercase().contains("qwen"))
         );
+    }
+
+    #[test]
+    fn sync_status_default_is_idle() {
+        let s = state();
+        assert!(matches!(s.sync_status, SyncStatus::Idle));
+    }
+
+    #[test]
+    fn running_then_done_and_failed() {
+        assert!(matches!(
+            SyncStatus::Idle.advance_running(),
+            SyncStatus::Running
+        ));
+        let done = SyncStatus::Running.on_done();
+        assert!(matches!(done, SyncStatus::Done { .. }));
+        let failed = SyncStatus::Running.on_failed("boom".into());
+        assert!(matches!(failed, SyncStatus::Failed(m) if m == "boom"));
     }
 
     #[test]
