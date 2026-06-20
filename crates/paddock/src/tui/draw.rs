@@ -15,7 +15,7 @@ use ratatui::widgets::{Paragraph, Row, Table, TableState};
 
 use crate::app::ScoredModel;
 use crate::output::{age_label, gib, verdict_label};
-use crate::tui::state::{Mode, TuiState, use_case_label};
+use crate::tui::state::{Mode, SyncStatus, TuiState, use_case_label};
 
 /// Accent palette sampled from the paddock wordmark (deep indigo banner).
 /// ACCENT for accented text on dark terminals (readable royal blue),
@@ -187,21 +187,39 @@ fn draw_table(frame: &mut Frame, area: Rect, state: &TuiState) {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
-    let left = match &state.last_error {
-        Some(err) => Line::from(Span::styled(
+    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let sync_seg = match &state.sync_status {
+        SyncStatus::Running => {
+            let frame = SPINNER[(state.tick as usize) % SPINNER.len()];
+            Some(format!("{frame} syncing…"))
+        }
+        SyncStatus::Done { at } if at.elapsed().as_secs() < 5 => Some("catalog updated".into()),
+        _ => None,
+    };
+
+    let left = match (&state.last_error, &state.sync_status) {
+        (Some(err), _) => Line::from(Span::styled(
             format!("error: {err}"),
             Style::new().fg(ACCENT),
         )),
-        None => Line::from(Span::styled(
-            "↑↓ move · enter detail · x run · s serve · / search · g/c/r/h use-case · q quit",
+        (None, SyncStatus::Failed(msg)) => Line::from(Span::styled(
+            format!("sync failed: {msg}"),
+            Style::new().fg(ACCENT),
+        )),
+        (None, _) => Line::from(Span::styled(
+            "↑↓ move · enter detail · x run · s serve · / search · g/c/r/h use-case · R sync · q quit",
             Style::new().fg(Color::DarkGray),
         )),
     };
     let uc = use_case_label(state.use_case);
-    let right = match &state.mode {
+    let base = match &state.mode {
         Mode::Search { query } => format!("{uc} · /{query}▌"),
         _ if !state.query.is_empty() => format!("{uc} · /{}", state.query),
         _ => uc.to_string(),
+    };
+    let right = match sync_seg {
+        Some(seg) => format!("{seg} · {base}"),
+        None => base,
     };
     frame.render_widget(Paragraph::new(left), area);
     frame.render_widget(

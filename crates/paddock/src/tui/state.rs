@@ -16,9 +16,7 @@ pub enum Mode {
 
 /// Background-sync lifecycle as seen by the UI. Pure data; the event loop owns
 /// the channel and drives the transitions.
-// Variant payloads (`Done.at`, `Failed.0`) are read by the footer renderer,
-// wired in by Task 6; tests exercise them but don't count for dead_code.
-#[allow(dead_code)]
+// Variant payloads (`Done.at`, `Failed.0`) are read by the footer renderer.
 #[derive(Debug)]
 pub enum SyncStatus {
     /// No sync this session, or never triggered.
@@ -85,8 +83,7 @@ pub struct TuiState {
     /// Background catalog-sync status, shown in the footer.
     pub sync_status: SyncStatus,
     /// Spinner animation frame, advanced once per event-loop tick.
-    // Advanced by the event loop; read by the footer renderer in Task 6.
-    #[allow(dead_code)]
+    // Advanced by the event loop; read by the footer renderer.
     pub tick: u64,
 }
 
