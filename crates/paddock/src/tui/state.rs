@@ -85,6 +85,9 @@ pub struct TuiState {
     /// Spinner animation frame, advanced once per event-loop tick.
     // Advanced by the event loop; read by the footer renderer.
     pub tick: u64,
+    /// Catalog `last_sync` epoch (seconds), read from the DB at launch and
+    /// after each background sync; the footer shows it as "synced Xm ago".
+    pub last_sync: Option<i64>,
 }
 
 impl TuiState {
@@ -102,6 +105,7 @@ impl TuiState {
             detail_serve_plan: None,
             sync_status: SyncStatus::Idle,
             tick: 0,
+            last_sync: None,
         }
     }
 

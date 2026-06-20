@@ -90,6 +90,20 @@ pub fn age_label(released_at: Option<i64>, approx: bool, now: i64) -> String {
     if approx { format!("~{core}") } else { core }
 }
 
+/// Compact "time since" for the sync indicator: `5s` / `1m` / `3h` / `2d`.
+pub fn humanize_since(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < 86400 {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}d", s / 86400)
+    }
+}
+
 pub fn print_fit_table(rows: &[ScoredModel]) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -220,6 +234,15 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn humanize_since_buckets() {
+        assert_eq!(humanize_since(5), "5s");
+        assert_eq!(humanize_since(90), "1m");
+        assert_eq!(humanize_since(3 * 3600 + 5), "3h");
+        assert_eq!(humanize_since(2 * 86400), "2d");
+        assert_eq!(humanize_since(-10), "0s"); // clock skew clamps
+    }
 
     #[test]
     fn age_label_cases() {

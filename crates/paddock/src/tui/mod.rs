@@ -35,9 +35,10 @@ pub fn run(app: App) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let stale = match db.last_sync() {
-        Ok(Some(ts)) => now - ts > STALE_AFTER_SECS,
-        _ => true, // never synced
+    state.last_sync = db.last_sync().ok().flatten();
+    let stale = match state.last_sync {
+        Some(ts) => now - ts > STALE_AFTER_SECS,
+        None => true, // never synced
     };
     let mut sync_rx = if stale || state.all_rows.is_empty() {
         state.sync_status = SyncStatus::Running;
@@ -85,6 +86,7 @@ fn event_loop(
                 Ok(SyncMsg::Done(_)) => {
                     let rows = app.scored_models(db, state.use_case, false)?;
                     state.set_rows_preserving(rows, state.use_case);
+                    state.last_sync = db.last_sync().ok().flatten();
                     state.sync_status = SyncStatus::Idle.on_done();
                     *sync_rx = None;
                 }

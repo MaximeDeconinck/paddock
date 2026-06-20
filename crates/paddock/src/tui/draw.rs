@@ -194,7 +194,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
             Some(format!("{frame} syncing…"))
         }
         SyncStatus::Done { at } if at.elapsed().as_secs() < 5 => Some("catalog updated".into()),
-        _ => None,
+        // Idle / flash expired / failed: show how old the catalog is, when known.
+        // draw_table already reads the wall clock here for the AGE column.
+        _ => state.last_sync.map(|ts| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            format!("synced {} ago", crate::output::humanize_since(now - ts))
+        }),
     };
 
     let left = match (&state.last_error, &state.sync_status) {
