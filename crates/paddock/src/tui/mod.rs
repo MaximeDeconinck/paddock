@@ -3,6 +3,7 @@
 
 mod draw;
 mod state;
+mod sync_task;
 
 use std::time::Duration;
 
