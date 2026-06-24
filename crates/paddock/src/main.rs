@@ -154,7 +154,7 @@ fn resolve_model(app: &App, query: &str) -> Result<(CatalogModel, usize)> {
 }
 
 /// Resolve the launch context for a chosen model variant: explicit `--ctx`
-/// wins, otherwise auto-size against this machine's GPU budget.
+/// wins, otherwise auto-size against this machine's memory budget.
 fn resolved_ctx(app: &App, model: &CatalogModel, idx: usize, ctx: Option<u32>) -> u32 {
     let mv = model.to_model_variant(&model.variants[idx]);
     paddock_core::estimate::resolve_ctx(ctx, &mv, &app.budget, model.context_max)
