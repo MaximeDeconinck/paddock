@@ -153,11 +153,19 @@ fn resolve_model(app: &App, query: &str) -> Result<(CatalogModel, usize)> {
     Ok((model, best_idx))
 }
 
+/// Resolve the launch context for a chosen model variant: explicit `--ctx`
+/// wins, otherwise auto-size against this machine's GPU budget.
+fn resolved_ctx(app: &App, model: &CatalogModel, idx: usize, ctx: Option<u32>) -> u32 {
+    let mv = model.to_model_variant(&model.variants[idx]);
+    paddock_core::estimate::resolve_ctx(ctx, &mv, &app.budget, model.context_max)
+}
+
 fn run_model(app: &App, query: &str, ctx: Option<u32>, json: bool) -> Result<()> {
     let (model, idx) = resolve_model(app, query)?;
 
     // API delta vs the original plan: plan_run is fallible (repo-less HF/MLX
     // models, non-GGUF quants). Surface the actionable error and exit non-zero.
+    let ctx = Some(resolved_ctx(app, &model, idx, ctx));
     let plan: RunPlan = plan_run(&model, &model.variants[idx], &app.profile.runtimes, ctx)?;
 
     if json {
@@ -178,6 +186,7 @@ fn serve_model(
     json: bool,
 ) -> Result<()> {
     let (model, idx) = resolve_model(app, query)?;
+    let ctx = Some(resolved_ctx(app, &model, idx, ctx));
     let plan = plan_serve(&model, &model.variants[idx], &app.profile.runtimes, port, ctx)?;
 
     if json {
