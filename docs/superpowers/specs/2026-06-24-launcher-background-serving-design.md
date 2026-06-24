@@ -40,7 +40,7 @@ lifecycle built here.
 
 - `paddock serve <model> [--port N] [--ctx N] [--foreground|-f]`
 - `paddock ps [--json]`
-- `paddock stop <model|pid|all>`
+- `paddock stop <model|pid|all> [--yes|-y]`
 - `paddock logs <model|pid> [-f]`
 
 ## Components
@@ -104,6 +104,10 @@ Resolve target against live records:
 - `all` → every live record;
 - otherwise → substring/name match against `model_ref`, with the same
   ambiguity-listing UX as `resolve_model` (list candidates, exit non-zero).
+
+`all` prompts for confirmation before stopping (lists the servers it will stop,
+requires explicit y/N); `--yes`/`-y` skips the prompt for scripting. Stopping a
+single named/pid target does not prompt.
 
 Per record: child runtimes → `SIGTERM` to pid (`libc::kill`) then unregister;
 Ollama → `ollama stop <model_ref>` then unregister. Report what was stopped.
