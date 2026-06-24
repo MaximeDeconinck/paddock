@@ -128,6 +128,40 @@ pub fn kv_cache_bytes(v: &ModelVariant, context_len: u32) -> u64 {
         .saturating_mul(2)
 }
 
+/// Step size for auto-sized context — round to a 4k boundary.
+const CTX_STEP: u32 = 4096;
+/// Never auto-size below this; a variant that cannot hold 4k would not have
+/// been selected by `best_variant`.
+const CTX_FLOOR: u32 = 4096;
+
+/// Largest context whose total memory (weights + KV cache + overhead) still
+/// fits the GPU budget, rounded down to a 4k step and clamped to
+/// `[CTX_FLOOR, context_max]`. Falls back to the floor when even 4k overflows.
+pub fn auto_ctx(v: &ModelVariant, budget: &MemoryBudget, context_max: u32) -> u32 {
+    let ceil = context_max.max(CTX_FLOOR);
+    let start = (ceil / CTX_STEP) * CTX_STEP;
+    let mut ctx = start.max(CTX_FLOOR);
+    loop {
+        if estimate_memory(v, ctx, budget).total_bytes <= budget.gpu_effective_bytes {
+            return ctx.min(context_max).max(CTX_FLOOR);
+        }
+        if ctx <= CTX_FLOOR {
+            return CTX_FLOOR;
+        }
+        ctx = ctx.saturating_sub(CTX_STEP).max(CTX_FLOOR);
+    }
+}
+
+/// Resolve the context to launch with: explicit `--ctx` wins, else auto-size.
+pub fn resolve_ctx(
+    explicit: Option<u32>,
+    v: &ModelVariant,
+    budget: &MemoryBudget,
+    context_max: u32,
+) -> u32 {
+    explicit.unwrap_or_else(|| auto_ctx(v, budget, context_max))
+}
+
 pub fn estimate_memory(
     v: &ModelVariant,
     context_len: u32,
@@ -418,5 +452,43 @@ mod tests {
         let m = estimate_memory(&huge, u32::MAX, &m2_max_36gb());
         assert_eq!(m.kv_cache_bytes, u64::MAX);
         assert_eq!(m.verdict, FitVerdict::DoesNotFit);
+    }
+
+    #[test]
+    fn auto_ctx_picks_largest_fitting_context() {
+        // Small model on a roomy budget → should reach context_max.
+        let mut v = llama31_8b_q4km();
+        v.context_max = 32_768;
+        let budget = MemoryBudget {
+            gpu_effective_bytes: 24 * 1024 * 1024 * 1024,
+            ram_total_bytes: 32 * 1024 * 1024 * 1024,
+        };
+        assert_eq!(auto_ctx(&v, &budget, v.context_max), 32_768);
+    }
+
+    #[test]
+    fn auto_ctx_clamps_down_when_kv_cache_is_huge() {
+        // Tiny GPU budget → auto_ctx must drop below context_max but never below 4096.
+        let mut v = llama31_70b_q4km();
+        v.context_max = 131_072;
+        let budget = MemoryBudget {
+            gpu_effective_bytes: 40 * 1024 * 1024 * 1024,
+            ram_total_bytes: 64 * 1024 * 1024 * 1024,
+        };
+        let c = auto_ctx(&v, &budget, v.context_max);
+        assert!(c >= CTX_FLOOR, "never below the floor");
+        assert!(c < 131_072, "must actually clamp below context_max");
+        assert!(c % CTX_STEP == 0, "rounded to a 4k step");
+    }
+
+    #[test]
+    fn resolve_ctx_prefers_explicit_flag() {
+        let v = llama31_8b_q4km();
+        let budget = MemoryBudget {
+            gpu_effective_bytes: 24 * 1024 * 1024 * 1024,
+            ram_total_bytes: 32 * 1024 * 1024 * 1024,
+        };
+        assert_eq!(resolve_ctx(Some(16_384), &v, &budget, v.context_max), 16_384);
+        assert!(resolve_ctx(None, &v, &budget, v.context_max) >= 4096);
     }
 }
