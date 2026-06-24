@@ -74,8 +74,11 @@ Default path for **spawned-child runtimes** (llama.cpp, mlx-lm):
 Ctrl-C stops, drop-guard unregisters on exit.
 
 **Ollama path** is already daemon-backed (no terminal blocked today): pull,
-register the record, return. Nothing to detach. `stop` for it means
-`ollama stop <model>` (unload), not killing the daemon.
+return. Nothing to detach, and it is **not** added to paddock's registry — the
+daemon owns the model and `ollama ps` / `ollama stop` already manage it. paddock's
+`ps`/`stop`/`logs` therefore cover the spawned (llama.cpp/mlx) servers, which are
+the ones that used to pin a terminal. (The `stop` handler keeps a defensive
+`ollama stop` branch in case a legacy record carries the Ollama runtime.)
 
 ### 2. Registry extension (`crates/paddock-core/src/serving.rs`)
 
@@ -94,8 +97,9 @@ removed.
 ### 3. `paddock ps`
 
 `Registry::list_live(&probe)` → table `MODEL · RUNTIME · ENDPOINT · CTX · UPTIME ·
-PID`. UPTIME derived from `started_at`. `--json` prints the records for scripting.
-Empty → a short "no servers running" line.
+PID` for paddock-spawned (llama.cpp/mlx) servers. UPTIME derived from
+`started_at`. `--json` prints the records for scripting. Empty → a short "no
+servers running" line. (Ollama-loaded models are visible via `ollama ps`.)
 
 ### 4. `paddock stop <model|pid|all>`
 
