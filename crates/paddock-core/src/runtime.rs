@@ -68,7 +68,11 @@ pub fn plan_run(
     model: &CatalogModel,
     variant: &CatalogVariant,
     rt: &RuntimesStatus,
+    ctx: Option<u32>,
 ) -> Result<RunPlan, PaddockError> {
+    // `-c` size for llama.cpp paths; None falls back to the fit-verdict default.
+    // Ollama/MLX are unaffected — they manage their own context window.
+    let ctx = ctx.unwrap_or(DEFAULT_CONTEXT);
     match model.source {
         Source::Mlx => {
             let repo = model.repo.as_deref().ok_or_else(|| no_repo(&model.name))?;
@@ -103,7 +107,7 @@ pub fn plan_run(
                         "-hf",
                         &model_ref,
                         "-c",
-                        &DEFAULT_CONTEXT.to_string(),
+                        &ctx.to_string(),
                         "--no-mmproj",
                     ]),
                     install: (!rt.llama_cpp.installed).then(llama_cpp_install),
@@ -185,7 +189,10 @@ pub fn plan_serve(
     variant: &CatalogVariant,
     rt: &RuntimesStatus,
     port: Option<u16>,
+    ctx: Option<u32>,
 ) -> Result<ServePlan, PaddockError> {
+    // llama-server `-c` size; None → fit-verdict default. Ollama/MLX ignore it.
+    let ctx = ctx.unwrap_or(DEFAULT_CONTEXT);
     if port == Some(0) {
         return Err(PaddockError::Other(
             "port 0 is not supported; pick a fixed port so the endpoint is known upfront"
@@ -237,7 +244,7 @@ pub fn plan_serve(
                 // Infallible: the HF arm above always sets `hf_ref`.
                 let hf_ref = hf_ref.take().unwrap();
                 let install = (!rt.llama_cpp.installed).then(llama_cpp_install);
-                return Ok(llama_server_plan(hf_ref, port, &local, install));
+                return Ok(llama_server_plan(hf_ref, port, ctx, &local, install));
             }
             // Prefer Ollama; fall back to llama-server for HF GGUF when only
             // llama.cpp is installed.
@@ -245,7 +252,7 @@ pub fn plan_serve(
                 && rt.llama_cpp.installed
                 && let Some(hf_ref) = hf_ref.take()
             {
-                return Ok(llama_server_plan(hf_ref, port, &local, None));
+                return Ok(llama_server_plan(hf_ref, port, ctx, &local, None));
             }
             let model_ref = match hf_ref {
                 Some(hf_ref) => format!("hf.co/{hf_ref}"),
@@ -288,6 +295,7 @@ fn llama_cpp_install() -> InstallPlan {
 fn llama_server_plan(
     hf_ref: String,
     port: u16,
+    ctx: u32,
     local: &str,
     install: Option<InstallPlan>,
 ) -> ServePlan {
@@ -305,7 +313,7 @@ fn llama_server_plan(
             "--port",
             &port.to_string(),
             "-c",
-            &DEFAULT_CONTEXT.to_string(),
+            &ctx.to_string(),
             "--no-mmproj",
         ])),
         pre_steps: vec![],
@@ -373,7 +381,7 @@ mod tests {
     #[test]
     fn hf_gguf_with_ollama_uses_hf_co_ref() {
         let m = hf_model();
-        let plan = plan_run(&m, &m.variants[0], &with_ollama()).unwrap();
+        let plan = plan_run(&m, &m.variants[0], &with_ollama(), None).unwrap();
         assert_eq!(
             plan.argv,
             vec![
@@ -391,7 +399,7 @@ mod tests {
         m.source = Source::Ollama;
         m.repo = None;
         m.name = "llama3.1:8b".into();
-        let plan = plan_run(&m, &m.variants[0], &with_ollama()).unwrap();
+        let plan = plan_run(&m, &m.variants[0], &with_ollama(), None).unwrap();
         assert_eq!(plan.argv, vec!["ollama", "run", "llama3.1:8b"]);
     }
 
@@ -408,7 +416,7 @@ mod tests {
     #[test]
     fn run_enriched_ollama_variant_uses_exact_source_tag() {
         let m = enriched_ollama_model();
-        let plan = plan_run(&m, &m.variants[0], &with_ollama()).unwrap();
+        let plan = plan_run(&m, &m.variants[0], &with_ollama(), None).unwrap();
         assert_eq!(
             plan.argv,
             vec!["ollama", "run", "llama3.1:8b-instruct-q4_K_M"]
@@ -418,7 +426,7 @@ mod tests {
     #[test]
     fn serve_enriched_ollama_variant_pulls_exact_source_tag() {
         let m = enriched_ollama_model();
-        let p = plan_serve(&m, &m.variants[0], &with_ollama(), None).unwrap();
+        let p = plan_serve(&m, &m.variants[0], &with_ollama(), None, None).unwrap();
         assert_eq!(
             p.pre_steps,
             vec![vec![
@@ -444,7 +452,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let plan = plan_run(&m, &m.variants[0], &rt).unwrap();
+        let plan = plan_run(&m, &m.variants[0], &rt, None).unwrap();
         assert_eq!(
             plan.argv,
             vec![
@@ -458,7 +466,7 @@ mod tests {
     #[test]
     fn no_runtime_yields_install_plan_never_auto_runs() {
         let m = hf_model();
-        let plan = plan_run(&m, &m.variants[0], &RuntimesStatus::default()).unwrap();
+        let plan = plan_run(&m, &m.variants[0], &RuntimesStatus::default(), None).unwrap();
         let install = plan.install.expect("must propose an install");
         assert_eq!(install.argv, vec!["brew", "install", "ollama"]);
         // run command still present so the UI can show what WILL run after install
@@ -471,7 +479,7 @@ mod tests {
         m.source = Source::Mlx;
         m.repo = None;
         m.variants = vec![variant("MLX_4BIT", vec![RuntimeKind::MlxLm])];
-        let err = plan_run(&m, &m.variants[0], &RuntimesStatus::default()).unwrap_err();
+        let err = plan_run(&m, &m.variants[0], &RuntimesStatus::default(), None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no HuggingFace repo reference"), "{msg}");
         assert!(msg.contains("paddock sync"), "{msg}");
@@ -481,7 +489,7 @@ mod tests {
     fn hf_without_repo_errors() {
         let mut m = hf_model();
         m.repo = None;
-        let err = plan_run(&m, &m.variants[0], &with_ollama()).unwrap_err();
+        let err = plan_run(&m, &m.variants[0], &with_ollama(), None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no HuggingFace repo reference"), "{msg}");
         assert!(msg.contains("paddock sync"), "{msg}");
@@ -491,14 +499,14 @@ mod tests {
     fn hf_with_mlx_quant_errors() {
         let mut m = hf_model();
         m.variants = vec![variant("MLX_4BIT", vec![RuntimeKind::MlxLm])];
-        let err = plan_run(&m, &m.variants[0], &with_ollama()).unwrap_err();
+        let err = plan_run(&m, &m.variants[0], &with_ollama(), None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not a GGUF quant tag"), "{msg}");
         assert!(msg.contains("MLX_4BIT"), "{msg}");
 
         // DB-roundtripped garbage (unknown quant) must also be refused
         m.variants = vec![variant("Q4_BOGUS", vec![RuntimeKind::Ollama])];
-        let err = plan_run(&m, &m.variants[0], &with_ollama()).unwrap_err();
+        let err = plan_run(&m, &m.variants[0], &with_ollama(), None).unwrap_err();
         assert!(err.to_string().contains("not a GGUF quant tag"));
     }
 
@@ -538,7 +546,7 @@ mod tests {
     #[test]
     fn serve_hf_with_running_ollama_pulls_and_reuses_daemon() {
         let m = hf_model();
-        let p = plan_serve(&m, &m.variants[0], &ollama_running(), None).unwrap();
+        let p = plan_serve(&m, &m.variants[0], &ollama_running(), None, None).unwrap();
         assert!(p.server_argv.is_none());
         assert_eq!(
             p.pre_steps,
@@ -562,7 +570,7 @@ mod tests {
     #[test]
     fn serve_hf_with_stopped_ollama_boots_the_daemon() {
         let m = hf_model();
-        let p = plan_serve(&m, &m.variants[0], &ollama_stopped(), None).unwrap();
+        let p = plan_serve(&m, &m.variants[0], &ollama_stopped(), None, None).unwrap();
         assert_eq!(
             p.server_argv,
             Some(vec!["ollama".to_string(), "serve".to_string()])
@@ -576,7 +584,7 @@ mod tests {
     #[test]
     fn serve_hf_without_ollama_falls_back_to_llama_server() {
         let m = hf_model();
-        let p = plan_serve(&m, &m.variants[0], &llama_cpp_only(), None).unwrap();
+        let p = plan_serve(&m, &m.variants[0], &llama_cpp_only(), None, None).unwrap();
         assert_eq!(
             p.server_argv,
             Some(vec![
@@ -598,14 +606,32 @@ mod tests {
     }
 
     #[test]
+    fn serve_ctx_override_applies_to_llama_server() {
+        let m = hf_model();
+        let p = plan_serve(&m, &m.variants[0], &llama_cpp_only(), None, Some(32768)).unwrap();
+        let argv = p.server_argv.expect("llama-server argv");
+        // `-c` immediately followed by the requested ctx, default replaced.
+        let c = argv.iter().position(|a| a == "-c").expect("-c flag");
+        assert_eq!(argv[c + 1], "32768");
+    }
+
+    #[test]
+    fn run_ctx_override_applies_to_llama_cli() {
+        let m = mmproj_model();
+        let plan = plan_run(&m, &m.variants[0], &ollama_and_llama_cpp(), Some(16384)).unwrap();
+        let c = plan.argv.iter().position(|a| a == "-c").expect("-c flag");
+        assert_eq!(plan.argv[c + 1], "16384");
+    }
+
+    #[test]
     fn serve_port_override_applies_to_non_ollama_servers() {
         let m = hf_model();
-        let p = plan_serve(&m, &m.variants[0], &llama_cpp_only(), Some(9999)).unwrap();
+        let p = plan_serve(&m, &m.variants[0], &llama_cpp_only(), Some(9999), None).unwrap();
         assert_eq!(p.endpoint, "http://127.0.0.1:9999");
         assert!(p.server_argv.unwrap().contains(&"9999".to_string()));
         assert!(!p.port_ignored);
         // ollama ignores --port (fixed daemon port)
-        let p2 = plan_serve(&m, &m.variants[0], &ollama_running(), Some(9999)).unwrap();
+        let p2 = plan_serve(&m, &m.variants[0], &ollama_running(), Some(9999), None).unwrap();
         assert_eq!(p2.endpoint, "http://127.0.0.1:11434");
         assert!(p2.port_ignored);
     }
@@ -613,7 +639,7 @@ mod tests {
     #[test]
     fn serve_rejects_port_zero() {
         let m = hf_model();
-        assert!(plan_serve(&m, &m.variants[0], &llama_cpp_only(), Some(0)).is_err());
+        assert!(plan_serve(&m, &m.variants[0], &llama_cpp_only(), Some(0), None).is_err());
     }
 
     #[test]
@@ -630,7 +656,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let p = plan_serve(&m, &m.variants[0], &rt, None).unwrap();
+        let p = plan_serve(&m, &m.variants[0], &rt, None, None).unwrap();
         assert_eq!(
             p.server_argv,
             Some(vec![
@@ -650,7 +676,7 @@ mod tests {
     #[test]
     fn serve_without_any_runtime_proposes_install() {
         let m = hf_model();
-        let p = plan_serve(&m, &m.variants[0], &RuntimesStatus::default(), None).unwrap();
+        let p = plan_serve(&m, &m.variants[0], &RuntimesStatus::default(), None, None).unwrap();
         let install = p.install.expect("must propose install");
         assert_eq!(install.argv, vec!["brew", "install", "ollama"]);
         // plan still describes what will happen post-install (ollama path)
@@ -661,10 +687,10 @@ mod tests {
     fn serve_rejects_repo_less_and_bad_quants_like_run() {
         let mut m = hf_model();
         m.repo = None;
-        assert!(plan_serve(&m, &m.variants[0], &ollama_running(), None).is_err());
+        assert!(plan_serve(&m, &m.variants[0], &ollama_running(), None, None).is_err());
         let m2 = hf_model();
         let bad = variant("MLX_4BIT", vec![RuntimeKind::MlxLm]);
-        assert!(plan_serve(&m2, &bad, &ollama_running(), None).is_err());
+        assert!(plan_serve(&m2, &bad, &ollama_running(), None, None).is_err());
     }
 
     /// HF model whose repo ships a separate mmproj file: llama.cpp-only.
@@ -689,7 +715,7 @@ mod tests {
     #[test]
     fn serve_llama_cpp_only_variant_never_uses_ollama_even_if_running() {
         let m = mmproj_model();
-        let p = plan_serve(&m, &m.variants[0], &ollama_and_llama_cpp(), None).unwrap();
+        let p = plan_serve(&m, &m.variants[0], &ollama_and_llama_cpp(), None, None).unwrap();
         assert_eq!(
             p.server_argv,
             Some(vec![
@@ -715,7 +741,7 @@ mod tests {
     #[test]
     fn serve_llama_cpp_only_variant_without_runtimes_proposes_llama_cpp_install() {
         let m = mmproj_model();
-        let p = plan_serve(&m, &m.variants[0], &RuntimesStatus::default(), None).unwrap();
+        let p = plan_serve(&m, &m.variants[0], &RuntimesStatus::default(), None, None).unwrap();
         let install = p.install.expect("must propose install");
         assert_eq!(install.kind, RuntimeKind::LlamaCpp);
         assert_eq!(install.argv, vec!["brew", "install", "llama.cpp"]);
@@ -730,7 +756,7 @@ mod tests {
     #[test]
     fn serve_llama_cpp_only_variant_with_only_ollama_running_still_llama_server() {
         let m = mmproj_model();
-        let p = plan_serve(&m, &m.variants[0], &ollama_running(), None).unwrap();
+        let p = plan_serve(&m, &m.variants[0], &ollama_running(), None, None).unwrap();
         assert_eq!(p.runtime, RuntimeKind::LlamaCpp);
         assert!(p.pre_steps.is_empty());
         let install = p.install.expect("llama.cpp not installed → propose it");
@@ -740,7 +766,7 @@ mod tests {
     #[test]
     fn run_llama_cpp_only_variant_uses_llama_cli() {
         let m = mmproj_model();
-        let plan = plan_run(&m, &m.variants[0], &ollama_and_llama_cpp()).unwrap();
+        let plan = plan_run(&m, &m.variants[0], &ollama_and_llama_cpp(), None).unwrap();
         assert_eq!(
             plan.argv,
             vec![
@@ -758,7 +784,7 @@ mod tests {
     #[test]
     fn run_llama_cpp_only_variant_without_runtimes_proposes_llama_cpp_install() {
         let m = mmproj_model();
-        let plan = plan_run(&m, &m.variants[0], &RuntimesStatus::default()).unwrap();
+        let plan = plan_run(&m, &m.variants[0], &RuntimesStatus::default(), None).unwrap();
         assert_eq!(plan.argv[0], "llama-cli");
         let install = plan.install.expect("must propose install");
         assert_eq!(install.kind, RuntimeKind::LlamaCpp);
@@ -774,7 +800,7 @@ mod tests {
             "UD-Q4_K_M",
             vec![RuntimeKind::Ollama, RuntimeKind::LlamaCpp],
         )];
-        let plan = plan_run(&m, &m.variants[0], &with_ollama()).unwrap();
+        let plan = plan_run(&m, &m.variants[0], &with_ollama(), None).unwrap();
         assert_eq!(
             plan.argv,
             vec![

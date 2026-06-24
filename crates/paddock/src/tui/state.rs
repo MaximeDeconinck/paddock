@@ -237,7 +237,8 @@ impl TuiState {
     fn plan_for_selected(&self) -> Option<Result<RunPlan, String>> {
         let row = self.rows.get(self.selected)?;
         let variant = &row.model.variants[row.variant_idx];
-        Some(plan_run(&row.model, variant, &self.runtimes).map_err(|e| e.to_string()))
+        // TUI has no flag surface, so ctx is always the default.
+        Some(plan_run(&row.model, variant, &self.runtimes, None).map_err(|e| e.to_string()))
     }
 
     /// Single source for serve-plan computation (Detail entry and `s` both
@@ -246,7 +247,7 @@ impl TuiState {
     fn serve_plan_for_selected(&self) -> Option<Result<ServePlan, String>> {
         let row = self.rows.get(self.selected)?;
         let variant = &row.model.variants[row.variant_idx];
-        Some(plan_serve(&row.model, variant, &self.runtimes, None).map_err(|e| e.to_string()))
+        Some(plan_serve(&row.model, variant, &self.runtimes, None, None).map_err(|e| e.to_string()))
     }
 
     /// Build the run plan for the selected row. A plan_run failure must not

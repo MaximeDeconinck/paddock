@@ -48,8 +48,10 @@ fn main() -> Result<()> {
                 output::print_recommendations(&rows);
             }
         }
-        Some(Command::Run { model }) => run_model(&app, &model, cli.json)?,
-        Some(Command::Serve { model, port }) => serve_model(&app, &model, port, cli.json)?,
+        Some(Command::Run { model, ctx }) => run_model(&app, &model, ctx, cli.json)?,
+        Some(Command::Serve { model, port, ctx }) => {
+            serve_model(&app, &model, port, ctx, cli.json)?
+        }
         Some(Command::Sync {
             hf_limit,
             mlx_limit,
@@ -151,12 +153,12 @@ fn resolve_model(app: &App, query: &str) -> Result<(CatalogModel, usize)> {
     Ok((model, best_idx))
 }
 
-fn run_model(app: &App, query: &str, json: bool) -> Result<()> {
+fn run_model(app: &App, query: &str, ctx: Option<u32>, json: bool) -> Result<()> {
     let (model, idx) = resolve_model(app, query)?;
 
     // API delta vs the original plan: plan_run is fallible (repo-less HF/MLX
     // models, non-GGUF quants). Surface the actionable error and exit non-zero.
-    let plan: RunPlan = plan_run(&model, &model.variants[idx], &app.profile.runtimes)?;
+    let plan: RunPlan = plan_run(&model, &model.variants[idx], &app.profile.runtimes, ctx)?;
 
     if json {
         // Machine mode never launches interactive processes.
@@ -168,9 +170,15 @@ fn run_model(app: &App, query: &str, json: bool) -> Result<()> {
     launch(plan)
 }
 
-fn serve_model(app: &App, query: &str, port: Option<u16>, json: bool) -> Result<()> {
+fn serve_model(
+    app: &App,
+    query: &str,
+    port: Option<u16>,
+    ctx: Option<u32>,
+    json: bool,
+) -> Result<()> {
     let (model, idx) = resolve_model(app, query)?;
-    let plan = plan_serve(&model, &model.variants[idx], &app.profile.runtimes, port)?;
+    let plan = plan_serve(&model, &model.variants[idx], &app.profile.runtimes, port, ctx)?;
 
     if json {
         // Machine mode: print the plan, zero side effects (no spawn, no pull).

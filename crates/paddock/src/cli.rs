@@ -39,13 +39,21 @@ pub enum Command {
         use_case: UseCaseArg,
     },
     /// Launch a model with the best available runtime
-    Run { model: String },
+    Run {
+        model: String,
+        /// Context window in tokens (llama.cpp only; Ollama/MLX manage their own)
+        #[arg(long)]
+        ctx: Option<u32>,
+    },
     /// Serve a model over HTTP and print the endpoint (OpenAI-compatible)
     Serve {
         model: String,
         /// Port for llama.cpp / mlx servers (Ollama always uses 11434)
         #[arg(long)]
         port: Option<u16>,
+        /// Context window in tokens (llama.cpp only; Ollama/MLX manage their own)
+        #[arg(long)]
+        ctx: Option<u32>,
     },
     /// Refresh the model catalog
     Sync {
