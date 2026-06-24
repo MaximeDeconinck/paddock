@@ -18,6 +18,15 @@ pub struct ServingRecord {
     pub model_ref: String,
     pub ready_path: String,
     pub started_at: i64,
+    /// Resolved context window the server was launched with (0 for legacy records).
+    #[serde(default)]
+    pub ctx: u32,
+    /// Log file for detached spawned children; None for foreground / Ollama.
+    #[serde(default)]
+    pub log_path: Option<PathBuf>,
+    /// Port for spawned servers (None for the Ollama daemon).
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 pub struct Registry {
@@ -177,6 +186,47 @@ pub fn warm_up_ollama(probe: &dyn SystemProbe, model_ref: &str) -> bool {
 }
 
 #[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    #[test]
+    fn record_roundtrips_new_fields() {
+        let r = ServingRecord {
+            pid: 42,
+            runtime: RuntimeKind::LlamaCpp,
+            endpoint: "http://127.0.0.1:8080".into(),
+            openai_url: "http://127.0.0.1:8080/v1/chat/completions".into(),
+            model_ref: "repo:Q4_K_M".into(),
+            ready_path: "/health".into(),
+            started_at: 1000,
+            ctx: 32768,
+            log_path: Some(std::path::PathBuf::from("/tmp/42.log")),
+            port: Some(8080),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: ServingRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ctx, 32768);
+        assert_eq!(back.log_path, Some(std::path::PathBuf::from("/tmp/42.log")));
+        assert_eq!(back.port, Some(8080));
+    }
+
+    #[test]
+    fn old_record_without_new_fields_still_deserializes() {
+        let old = r#"{
+            "pid": 7, "runtime": "ollama",
+            "endpoint": "http://127.0.0.1:11434",
+            "openai_url": "http://127.0.0.1:11434/v1/chat/completions",
+            "model_ref": "llama3.2:1b", "ready_path": "/api/version",
+            "started_at": 5
+        }"#;
+        let r: ServingRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(r.ctx, 0);
+        assert_eq!(r.log_path, None);
+        assert_eq!(r.port, None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::hardware::MockProbe;
@@ -215,6 +265,9 @@ mod tests {
             model_ref: "repo:Q4_K_M".into(),
             ready_path: "/health".into(),
             started_at: 1_770_000_000,
+            ctx: 0,
+            log_path: None,
+            port: None,
         }
     }
 

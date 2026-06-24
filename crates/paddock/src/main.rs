@@ -278,6 +278,9 @@ impl RegistryGuard {
             model_ref: plan.model_ref.clone(),
             ready_path: plan.ready_path.clone(),
             started_at,
+            ctx: 0,
+            log_path: None,
+            port: None,
         };
         if let Err(e) = registry.register(&record) {
             eprintln!("warning: could not record serving state: {e}");
