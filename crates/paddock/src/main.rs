@@ -49,9 +49,12 @@ fn main() -> Result<()> {
             }
         }
         Some(Command::Run { model, ctx }) => run_model(&app, &model, ctx, cli.json)?,
-        Some(Command::Serve { model, port, ctx }) => {
-            serve_model(&app, &model, port, ctx, cli.json)?
-        }
+        Some(Command::Serve {
+            model,
+            port,
+            ctx,
+            foreground,
+        }) => serve_model(&app, &model, port, ctx, foreground, cli.json)?,
         Some(Command::Sync {
             hf_limit,
             mlx_limit,
@@ -183,6 +186,7 @@ fn serve_model(
     query: &str,
     port: Option<u16>,
     ctx: Option<u32>,
+    foreground: bool,
     json: bool,
 ) -> Result<()> {
     let (model, idx) = resolve_model(app, query)?;
@@ -195,13 +199,13 @@ fn serve_model(
         return Ok(());
     }
 
-    serve_with_plan(plan)
+    serve_with_plan(plan, foreground)
 }
 
 /// Full serve lifecycle: confirm install, spawn the server child when needed,
 /// wait for readiness, run pre-steps (e.g. `ollama pull`), print the endpoint
 /// block, then wait on the child. Shared with the TUI (Task 3).
-pub(crate) fn serve_with_plan(plan: ServePlan) -> Result<()> {
+pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
     if plan.port_ignored {
         eprintln!("warning: --port is ignored for the Ollama daemon (fixed 11434)");
     }
@@ -209,10 +213,23 @@ pub(crate) fn serve_with_plan(plan: ServePlan) -> Result<()> {
         confirm_and_install(install)?;
     }
 
+    let log_dir = paddock_core::serving::default_serving_dir().join("logs");
+
     let mut child = match &plan.server_argv {
         Some(argv) => {
             eprintln!("$ {}", argv.join(" "));
-            Some(spawn_checked(argv)?)
+            if foreground {
+                Some(spawn_checked(argv)?)
+            } else {
+                // Detached: spawn to a per-invocation placeholder (our own pid
+                // makes it unique across concurrent `serve`s), then rename to
+                // <child-pid>.log once the child pid is known.
+                let tmp_log = log_dir.join(format!("pending-{}.log", std::process::id()));
+                let c = spawn_detached(argv, &tmp_log)?;
+                let final_log = log_dir.join(format!("{}.log", c.id()));
+                let _ = std::fs::rename(&tmp_log, &final_log);
+                Some(c)
+            }
         }
         None => None,
     };
@@ -247,12 +264,12 @@ pub(crate) fn serve_with_plan(plan: ServePlan) -> Result<()> {
     output::print_endpoint(&plan);
 
     match child {
-        Some(mut c) => {
+        Some(mut c) if foreground => {
             // Best-effort registry entry for tray/UIs; the guard unregisters
             // on every exit path including `?`. SIGINT kills paddock and the
             // child together (default tty behavior) without running Drop —
             // the stale file is reaped by the next `list_live`.
-            let _guard = RegistryGuard::register(&plan, c.id());
+            let _guard = RegistryGuard::register(&plan, c.id(), plan.ctx, None);
             eprintln!("serving — press Ctrl-C to stop");
             let status = c.wait()?;
             if !status.success() {
@@ -260,8 +277,45 @@ pub(crate) fn serve_with_plan(plan: ServePlan) -> Result<()> {
             }
             Ok(())
         }
-        // Ollama daemon keeps running; our job is done.
+        // Detached child: register WITHOUT the drop-guard so it outlives us.
+        Some(c) => {
+            let log_path = log_dir.join(format!("{}.log", c.id()));
+            register_detached(&plan, c.id(), Some(log_path));
+            eprintln!(
+                "serving in background · pid {} · paddock logs {}",
+                c.id(),
+                plan.model_ref
+            );
+            Ok(())
+        }
+        // Ollama daemon path: nothing to detach or track — the daemon owns the
+        // model and `ollama ps` lists it. Matches today's behavior. paddock's
+        // ps/stop/logs cover the spawned (llama.cpp/mlx) servers only.
         None => Ok(()),
+    }
+}
+
+/// Register a detached child server. Unlike `RegistryGuard`, this does NOT
+/// unregister on drop — the server must survive this process exiting.
+fn register_detached(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>) {
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let record = ServingRecord {
+        pid,
+        runtime: plan.runtime,
+        endpoint: plan.endpoint.clone(),
+        openai_url: plan.openai_url.clone(),
+        model_ref: plan.model_ref.clone(),
+        ready_path: plan.ready_path.clone(),
+        started_at,
+        ctx: plan.ctx,
+        log_path,
+        port: plan.port,
+    };
+    if let Err(e) = Registry::open_default().register(&record) {
+        eprintln!("warning: could not record serving state: {e}");
     }
 }
 
@@ -273,7 +327,12 @@ struct RegistryGuard {
 }
 
 impl RegistryGuard {
-    fn register(plan: &ServePlan, pid: u32) -> Self {
+    fn register(
+        plan: &ServePlan,
+        pid: u32,
+        ctx: u32,
+        log_path: Option<std::path::PathBuf>,
+    ) -> Self {
         let registry = Registry::open_default();
         let started_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -287,9 +346,9 @@ impl RegistryGuard {
             model_ref: plan.model_ref.clone(),
             ready_path: plan.ready_path.clone(),
             started_at,
-            ctx: 0,
-            log_path: None,
-            port: None,
+            ctx,
+            log_path,
+            port: plan.port,
         };
         if let Err(e) = registry.register(&record) {
             eprintln!("warning: could not record serving state: {e}");
@@ -367,6 +426,41 @@ fn spawn_checked(argv: &[String]) -> Result<std::process::Child> {
     std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to start {}: {e}. Is it in PATH?", argv[0]))
+}
+
+// libc-free, matching serving.rs style: detach into a new session.
+unsafe extern "C" {
+    #[link_name = "setsid"]
+    fn libc_setsid() -> i32;
+}
+
+/// Spawn a server child detached from the controlling terminal, with stdout +
+/// stderr captured to `log_path`. Returns the child handle (its PID is the
+/// session leader). Dropping the handle does NOT kill the process.
+fn spawn_detached(argv: &[String], log_path: &std::path::Path) -> Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("cannot create log dir {parent:?}: {e}"))?;
+    }
+    let log = std::fs::File::create(log_path)
+        .map_err(|e| anyhow::anyhow!("cannot create log file {log_path:?}: {e}"))?;
+    let log_err = log.try_clone().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(log)
+        .stderr(log_err);
+    // SAFETY: setsid only creates a new session; async-signal-safe, no allocation.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc_setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn()
         .map_err(|e| anyhow::anyhow!("failed to start {}: {e}. Is it in PATH?", argv[0]))
 }
 

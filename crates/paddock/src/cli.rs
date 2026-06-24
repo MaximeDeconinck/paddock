@@ -51,9 +51,12 @@ pub enum Command {
         /// Port for llama.cpp / mlx servers (Ollama always uses 11434)
         #[arg(long)]
         port: Option<u16>,
-        /// Context window in tokens (llama.cpp only; Ollama/MLX manage their own)
+        /// Context window in tokens (llama.cpp only; default auto-sizes to memory)
         #[arg(long)]
         ctx: Option<u32>,
+        /// Stay attached and stream logs (Ctrl-C stops); default runs detached
+        #[arg(long, short = 'f')]
+        foreground: bool,
     },
     /// Refresh the model catalog
     Sync {
