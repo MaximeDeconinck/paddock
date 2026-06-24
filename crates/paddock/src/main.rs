@@ -215,6 +215,7 @@ pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
 
     let log_dir = paddock_core::serving::default_serving_dir().join("logs");
 
+    let mut detached_log: Option<std::path::PathBuf> = None;
     let mut child = match &plan.server_argv {
         Some(argv) => {
             eprintln!("$ {}", argv.join(" "));
@@ -227,7 +228,11 @@ pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
                 let tmp_log = log_dir.join(format!("pending-{}.log", std::process::id()));
                 let c = spawn_detached(argv, &tmp_log)?;
                 let final_log = log_dir.join(format!("{}.log", c.id()));
-                let _ = std::fs::rename(&tmp_log, &final_log);
+                let actual = match std::fs::rename(&tmp_log, &final_log) {
+                    Ok(()) => final_log,
+                    Err(_) => tmp_log, // rename failed → the data is still at the pending path
+                };
+                detached_log = Some(actual);
                 Some(c)
             }
         }
@@ -269,7 +274,7 @@ pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
             // on every exit path including `?`. SIGINT kills paddock and the
             // child together (default tty behavior) without running Drop —
             // the stale file is reaped by the next `list_live`.
-            let _guard = RegistryGuard::register(&plan, c.id(), plan.ctx, None);
+            let _guard = RegistryGuard::register(&plan, c.id(), None);
             eprintln!("serving — press Ctrl-C to stop");
             let status = c.wait()?;
             if !status.success() {
@@ -279,8 +284,7 @@ pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
         }
         // Detached child: register WITHOUT the drop-guard so it outlives us.
         Some(c) => {
-            let log_path = log_dir.join(format!("{}.log", c.id()));
-            register_detached(&plan, c.id(), Some(log_path));
+            register_detached(&plan, c.id(), detached_log.take());
             eprintln!(
                 "serving in background · pid {} · paddock logs {}",
                 c.id(),
@@ -295,14 +299,13 @@ pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
     }
 }
 
-/// Register a detached child server. Unlike `RegistryGuard`, this does NOT
-/// unregister on drop — the server must survive this process exiting.
-fn register_detached(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>) {
+/// Build a serving registry record for a running server.
+fn build_record(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>) -> ServingRecord {
     let started_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let record = ServingRecord {
+    ServingRecord {
         pid,
         runtime: plan.runtime,
         endpoint: plan.endpoint.clone(),
@@ -313,7 +316,13 @@ fn register_detached(plan: &ServePlan, pid: u32, log_path: Option<std::path::Pat
         ctx: plan.ctx,
         log_path,
         port: plan.port,
-    };
+    }
+}
+
+/// Register a detached child server. Unlike `RegistryGuard`, this does NOT
+/// unregister on drop — the server must survive this process exiting.
+fn register_detached(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>) {
+    let record = build_record(plan, pid, log_path);
     if let Err(e) = Registry::open_default().register(&record) {
         eprintln!("warning: could not record serving state: {e}");
     }
@@ -327,29 +336,9 @@ struct RegistryGuard {
 }
 
 impl RegistryGuard {
-    fn register(
-        plan: &ServePlan,
-        pid: u32,
-        ctx: u32,
-        log_path: Option<std::path::PathBuf>,
-    ) -> Self {
+    fn register(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>) -> Self {
         let registry = Registry::open_default();
-        let started_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let record = ServingRecord {
-            pid,
-            runtime: plan.runtime,
-            endpoint: plan.endpoint.clone(),
-            openai_url: plan.openai_url.clone(),
-            model_ref: plan.model_ref.clone(),
-            ready_path: plan.ready_path.clone(),
-            started_at,
-            ctx,
-            log_path,
-            port: plan.port,
-        };
+        let record = build_record(plan, pid, log_path);
         if let Err(e) = registry.register(&record) {
             eprintln!("warning: could not record serving state: {e}");
         }
