@@ -33,6 +33,8 @@ A Homebrew formula is coming. Requires macOS on Apple Silicon (M1 or later).
 
 Running `paddock` with no arguments opens the interactive TUI. It opens instantly against the last catalog snapshot and refreshes in the background when that snapshot is more than 24h old (or empty): a spinner shows in the footer while the refresh runs, the list stays fully usable, and it swaps in the new catalog atomically when done (keeping your selection and search). Press `R` to force a refresh on demand. The blocking `paddock sync` command below is still there for scripts and cron.
 
+Press `Tab` to switch to the servers view: the models you have served show there with their endpoint, context, uptime and pid; `x` stops the selected server, `c` copies its OpenAI endpoint to the clipboard. Serving a model from the TUI (`s`) now runs it detached and lands you on the servers tab, so the TUI stays open.
+
 Nine subcommands cover everything scriptable:
 
 ### `paddock scan`: what is this machine?
