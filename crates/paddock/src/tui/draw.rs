@@ -15,7 +15,7 @@ use ratatui::widgets::{Paragraph, Row, Table, TableState};
 
 use crate::app::ScoredModel;
 use crate::output::{age_label, gib, verdict_label};
-use crate::tui::state::{Mode, SyncStatus, TuiState, use_case_label};
+use crate::tui::state::{Mode, SyncStatus, Tab, TuiState, use_case_label};
 
 /// Accent palette sampled from the paddock wordmark (deep indigo banner).
 /// ACCENT for accented text on dark terminals (readable royal blue),
@@ -34,7 +34,10 @@ pub fn draw(frame: &mut Frame, state: &TuiState, profile: &HardwareProfile) {
     .vertical_margin(1)
     .areas(frame.area());
     draw_header(frame, header, profile);
-    draw_table(frame, table, state);
+    match state.tab {
+        Tab::Models => draw_table(frame, table, state),
+        Tab::Servers => draw_servers(frame, table, state),
+    }
     draw_footer(frame, footer, state);
     if state.mode == Mode::Detail {
         draw_detail(frame, state, profile);
@@ -186,7 +189,77 @@ fn draw_table(frame: &mut Frame, area: Rect, state: &TuiState) {
     frame.render_stateful_widget(table, area, &mut ts);
 }
 
+fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
+    if state.servers.is_empty() {
+        let msg = Paragraph::new("no servers running — press s on a model to serve one")
+            .style(Style::new().fg(Color::DarkGray));
+        frame.render_widget(msg, area);
+        return;
+    }
+    let header = Row::new(["MODEL", "RUNTIME", "ENDPOINT", "CTX", "UPTIME", "PID"])
+        .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    let rows = state.servers.iter().map(|r| {
+        Row::new(vec![
+            Cell::from(truncate_cell(&r.model_ref, 30)),
+            Cell::from(runtime_label(r.runtime)),
+            Cell::from(truncate_cell(&r.endpoint, 26)),
+            Cell::from(r.ctx.to_string()),
+            Cell::from(crate::output::humanize_since(uptime_secs(r.started_at))),
+            Cell::from(r.pid.to_string()),
+        ])
+        .style(Style::new().fg(Color::Gray))
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(20),
+            Constraint::Length(10),
+            Constraint::Length(24),
+            Constraint::Length(7),
+            Constraint::Length(8),
+            Constraint::Length(8),
+        ],
+    )
+    .header(header)
+    .row_highlight_style(Style::new().fg(Color::White).bg(ACCENT_DEEP));
+    let mut ts = TableState::default().with_selected(Some(state.server_selected));
+    frame.render_stateful_widget(table, area, &mut ts);
+}
+
+fn runtime_label(rt: RuntimeKind) -> &'static str {
+    match rt {
+        RuntimeKind::Ollama => "ollama",
+        RuntimeKind::LlamaCpp => "llama.cpp",
+        RuntimeKind::MlxLm => "mlx-lm",
+    }
+}
+
+fn truncate_cell(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(n - 1).collect();
+        format!("{head}…")
+    }
+}
+
+fn uptime_secs(started_at: i64) -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    (now - started_at).max(0)
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
+    if state.tab == Tab::Servers {
+        let line = "j/k move · x stop · c copy endpoint · tab models · q quit";
+        frame.render_widget(
+            Paragraph::new(Span::styled(line, Style::new().fg(Color::DarkGray))),
+            area,
+        );
+        return;
+    }
     const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let sync_seg = match &state.sync_status {
         SyncStatus::Running => {
@@ -215,7 +288,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
             Style::new().fg(ACCENT),
         )),
         (None, _) => Line::from(Span::styled(
-            "↑↓ move · enter detail · x run · s serve · / search · g/c/r/h use-case · R sync · q quit",
+            "↑↓ move · enter detail · x run · s serve · / search · g/c/r/h use-case · R sync · tab servers · q quit",
             Style::new().fg(Color::DarkGray),
         )),
     };
