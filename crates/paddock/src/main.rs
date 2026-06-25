@@ -284,7 +284,8 @@ pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
             // on every exit path including `?`. SIGINT kills paddock and the
             // child together (default tty behavior) without running Drop —
             // the stale file is reaped by the next `list_live`.
-            let _guard = RegistryGuard::register(&plan, c.id(), None);
+            let _guard = (plan.runtime != paddock_core::catalog::RuntimeKind::Ollama)
+                .then(|| RegistryGuard::register(&plan, c.id(), None));
             eprintln!("serving — press Ctrl-C to stop");
             let status = c.wait()?;
             if !status.success() {
@@ -294,17 +295,24 @@ pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
         }
         // Detached child: register WITHOUT the drop-guard so it outlives us.
         Some(c) => {
-            register_detached(&plan, c.id(), detached_log.take());
-            eprintln!(
-                "serving in background · pid {} · paddock logs {}",
-                c.id(),
-                plan.model_ref
-            );
+            if plan.runtime == paddock_core::catalog::RuntimeKind::Ollama {
+                // Cold-started the Ollama daemon; it serves in the background on
+                // its fixed port. ollama ps / ollama stop manage it, not paddock.
+                eprintln!("ollama daemon started in the background");
+            } else {
+                let log_path = detached_log.take();
+                register_detached(&plan, c.id(), log_path);
+                eprintln!(
+                    "serving in background · pid {} · paddock logs {}",
+                    c.id(),
+                    plan.model_ref
+                );
+            }
             Ok(())
         }
-        // Ollama daemon path: nothing to detach or track — the daemon owns the
-        // model and `ollama ps` lists it. Matches today's behavior. paddock's
-        // ps/stop/logs cover the spawned (llama.cpp/mlx) servers only.
+        // Already-running Ollama daemon: nothing was spawned, so nothing to
+        // detach or track — the daemon owns the model and `ollama ps` lists it.
+        // paddock's ps/stop/logs cover the spawned (llama.cpp/mlx) servers only.
         None => Ok(()),
     }
 }

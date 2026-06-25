@@ -228,7 +228,9 @@ pub fn plan_serve(
                 }),
                 port_ignored: false,
                 runtime: RuntimeKind::MlxLm,
-                ctx,
+                // mlx_lm.server is launched without a context flag, so the
+                // resolved ctx is not applicable here (ServePlan.ctx doc: 0).
+                ctx: 0,
                 port: Some(port),
             })
         }
