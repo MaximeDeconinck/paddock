@@ -259,7 +259,7 @@ fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
 
 fn draw_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
     if state.tab == Tab::Servers {
-        let line = "j/k move · x stop · c copy endpoint · tab models · q quit";
+        let line = "↑↓ move · x stop · c copy endpoint · tab models · q quit";
         frame.render_widget(
             Paragraph::new(Span::styled(line, Style::new().fg(Color::DarkGray))),
             area,

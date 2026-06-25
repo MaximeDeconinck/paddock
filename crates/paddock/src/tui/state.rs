@@ -256,8 +256,8 @@ impl TuiState {
                 match self.tab {
                     Tab::Models => match key.code {
                         K::Char('q') => return Action::Quit,
-                        K::Up | K::Char('k') => self.selected = self.selected.saturating_sub(1),
-                        K::Down | K::Char('j') => {
+                        K::Up => self.selected = self.selected.saturating_sub(1),
+                        K::Down => {
                             self.selected =
                                 (self.selected + 1).min(self.rows.len().saturating_sub(1));
                         }
@@ -284,10 +284,10 @@ impl TuiState {
                     },
                     Tab::Servers => match key.code {
                         K::Char('q') => return Action::Quit,
-                        K::Up | K::Char('k') => {
+                        K::Up => {
                             self.server_selected = self.server_selected.saturating_sub(1)
                         }
-                        K::Down | K::Char('j') => {
+                        K::Down => {
                             self.server_selected = (self.server_selected + 1)
                                 .min(self.servers.len().saturating_sub(1));
                         }
@@ -489,16 +489,16 @@ mod tests {
     }
 
     #[test]
-    fn j_k_move_selection_within_bounds() {
+    fn arrows_move_selection_within_bounds() {
         let mut s = state();
         assert_eq!(s.selected, 0);
-        s.handle_key(key(KeyCode::Char('k'))); // clamped at top
+        s.handle_key(key(KeyCode::Up)); // clamped at top
         assert_eq!(s.selected, 0);
-        s.handle_key(key(KeyCode::Char('j')));
+        s.handle_key(key(KeyCode::Down));
         assert_eq!(s.selected, 1);
         s.handle_key(key(KeyCode::Down));
-        s.handle_key(key(KeyCode::Char('j'))); // clamped at bottom
-        s.handle_key(key(KeyCode::Char('j')));
+        s.handle_key(key(KeyCode::Down)); // clamped at bottom
+        s.handle_key(key(KeyCode::Down));
         assert_eq!(s.selected, 2);
         s.handle_key(key(KeyCode::Up));
         assert_eq!(s.selected, 1);
@@ -617,8 +617,8 @@ mod tests {
     #[test]
     fn rescore_preserves_cursor_clamped() {
         let mut s = state();
-        s.handle_key(key(KeyCode::Char('j')));
-        s.handle_key(key(KeyCode::Char('j')));
+        s.handle_key(key(KeyCode::Down));
+        s.handle_key(key(KeyCode::Down));
         assert_eq!(s.selected, 2);
         // Same query, new rows: cursor kept.
         s.set_rows(
@@ -721,11 +721,11 @@ mod tests {
         s.set_servers(vec![srv(1, "a", 8080), srv(2, "b", 8081)]);
         s.handle_key(key(KeyCode::Tab)); // -> Servers
         assert_eq!(s.server_selected, 0);
-        s.handle_key(key(KeyCode::Char('k'))); // clamped at top
+        s.handle_key(key(KeyCode::Up)); // clamped at top
         assert_eq!(s.server_selected, 0);
-        s.handle_key(key(KeyCode::Char('j')));
+        s.handle_key(key(KeyCode::Down));
         assert_eq!(s.server_selected, 1);
-        s.handle_key(key(KeyCode::Char('j'))); // clamped at bottom
+        s.handle_key(key(KeyCode::Down)); // clamped at bottom
         assert_eq!(s.server_selected, 1);
     }
 
