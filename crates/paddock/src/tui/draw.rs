@@ -1,7 +1,6 @@
 //! Pure rendering — reads state, never mutates it, no IO.
 //! Palette: DarkGray/Gray/White + a single deep-blue accent.
 
-use paddock_core::catalog::RuntimeKind;
 use paddock_core::estimate::{FitVerdict, estimate_speed, kv_cache_bytes};
 use paddock_core::hardware::{HardwareProfile, RuntimeStatus};
 use paddock_core::runtime::{RunPlan, ServePlan};
@@ -224,7 +223,7 @@ fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
         .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
     let rows = state.servers.iter().map(|r| {
         Row::new(vec![
-            Cell::from(crate::output::truncate(&r.model_ref, 30)),
+            Cell::from(crate::output::truncate(&r.model_ref, 28)),
             Cell::from(crate::output::runtime_label(r.runtime)),
             Cell::from(crate::output::truncate(&r.endpoint, 26)),
             Cell::from(r.ctx.to_string()),
@@ -492,11 +491,7 @@ fn detail_lines<'a>(
     // endpoint shown is exactly the one `s` would serve on.
     match serve_plan {
         Some(Ok(sp)) => {
-            let runtime = match sp.runtime {
-                RuntimeKind::Ollama => "ollama",
-                RuntimeKind::LlamaCpp => "llama.cpp",
-                RuntimeKind::MlxLm => "mlx-lm",
-            };
+            let runtime = crate::output::runtime_label(sp.runtime);
             lines.push(Line::from(vec![
                 Span::styled("  s to serve on ", Style::new().fg(Color::DarkGray)),
                 Span::styled(sp.endpoint.clone(), Style::new().fg(ACCENT)),
