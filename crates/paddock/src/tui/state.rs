@@ -703,4 +703,35 @@ mod tests {
             Action::Quit
         ));
     }
+
+    #[test]
+    fn x_on_servers_tab_returns_stop_action() {
+        let mut s = state();
+        s.set_servers(vec![srv(42, "qwen", 8080)]);
+        s.tab = Tab::Servers;
+        match s.handle_key(key(KeyCode::Char('x'))) {
+            Action::StopServer(pid) => assert_eq!(pid, 42),
+            other => panic!("expected StopServer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn c_on_servers_tab_returns_copy_action() {
+        let mut s = state();
+        s.set_servers(vec![srv(42, "qwen", 8080)]);
+        s.tab = Tab::Servers;
+        match s.handle_key(key(KeyCode::Char('c'))) {
+            Action::CopyEndpoint(url) => {
+                assert_eq!(url, "http://127.0.0.1:8080/v1/chat/completions")
+            }
+            other => panic!("expected CopyEndpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x_on_empty_servers_tab_is_noop() {
+        let mut s = state();
+        s.tab = Tab::Servers;
+        assert!(matches!(s.handle_key(key(KeyCode::Char('x'))), Action::None));
+    }
 }
