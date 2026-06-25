@@ -130,6 +130,8 @@ fn event_loop(
                     ));
                 }
             }
+            // Inert until the Servers-tab actions are wired in a later task.
+            Action::StopServer(_) | Action::CopyEndpoint(_) => {}
         }
     }
 }

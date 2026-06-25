@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use paddock_core::hardware::RuntimesStatus;
 use paddock_core::runtime::{RunPlan, ServePlan, plan_run, plan_serve};
 use paddock_core::score::UseCase;
+use paddock_core::serving::ServingRecord;
 
 use crate::app::ScoredModel;
 
@@ -12,6 +13,12 @@ pub enum Mode {
     List,
     Detail,
     Search { query: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Models,
+    Servers,
 }
 
 /// Background-sync lifecycle as seen by the UI. Pure data; the event loop owns
@@ -58,6 +65,10 @@ pub enum Action {
     Rescore(UseCase),
     /// Kick off a background catalog sync (the event loop owns the thread).
     StartSync,
+    /// Stop the server with this pid (SIGTERM + unregister), then refresh.
+    StopServer(u32),
+    /// Copy this endpoint URL to the system clipboard.
+    CopyEndpoint(String),
 }
 
 pub struct TuiState {
@@ -88,6 +99,12 @@ pub struct TuiState {
     /// Catalog `last_sync` epoch (seconds), read from the DB at launch and
     /// after each background sync; the footer shows it as "synced Xm ago".
     pub last_sync: Option<i64>,
+    /// Active top-level tab. Search/Detail overlays only apply on `Models`.
+    pub tab: Tab,
+    /// Live servers shown on the Servers tab; refreshed by the background task.
+    pub servers: Vec<ServingRecord>,
+    /// Cursor within `servers`.
+    pub server_selected: usize,
 }
 
 impl TuiState {
@@ -106,6 +123,9 @@ impl TuiState {
             sync_status: SyncStatus::Idle,
             tick: 0,
             last_sync: None,
+            tab: Tab::Models,
+            servers: Vec::new(),
+            server_selected: 0,
         }
     }
 
@@ -133,6 +153,21 @@ impl TuiState {
             .and_then(|name| self.rows.iter().position(|r| r.model.name == name))
             .unwrap_or(0)
             .min(self.rows.len().saturating_sub(1));
+    }
+
+    /// Replace the servers snapshot, keeping the cursor on the same pid when it
+    /// survives the refresh, otherwise clamping to the new length.
+    pub fn set_servers(&mut self, servers: Vec<ServingRecord>) {
+        let selected_pid = self.servers.get(self.server_selected).map(|r| r.pid);
+        self.servers = servers;
+        self.server_selected = selected_pid
+            .and_then(|pid| self.servers.iter().position(|r| r.pid == pid))
+            .unwrap_or(0)
+            .min(self.servers.len().saturating_sub(1));
+    }
+
+    pub fn selected_server(&self) -> Option<&ServingRecord> {
+        self.servers.get(self.server_selected)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
@@ -180,33 +215,67 @@ impl TuiState {
                 K::Char('s') => return self.serve_selected(),
                 _ => {}
             },
-            Mode::List => match key.code {
-                K::Char('q') => return Action::Quit,
-                K::Up | K::Char('k') => self.selected = self.selected.saturating_sub(1),
-                K::Down | K::Char('j') => {
-                    self.selected = (self.selected + 1).min(self.rows.len().saturating_sub(1));
+            Mode::List => {
+                // Tab toggles the top-level view from either tab.
+                if key.code == K::Tab {
+                    self.tab = match self.tab {
+                        Tab::Models => Tab::Servers,
+                        Tab::Servers => Tab::Models,
+                    };
+                    return Action::None;
                 }
-                K::Enter => {
-                    if !self.rows.is_empty() {
-                        self.detail_plan = self.plan_for_selected();
-                        self.detail_serve_plan = self.serve_plan_for_selected();
-                        self.mode = Mode::Detail;
-                    }
+                match self.tab {
+                    Tab::Models => match key.code {
+                        K::Char('q') => return Action::Quit,
+                        K::Up | K::Char('k') => self.selected = self.selected.saturating_sub(1),
+                        K::Down | K::Char('j') => {
+                            self.selected =
+                                (self.selected + 1).min(self.rows.len().saturating_sub(1));
+                        }
+                        K::Enter => {
+                            if !self.rows.is_empty() {
+                                self.detail_plan = self.plan_for_selected();
+                                self.detail_serve_plan = self.serve_plan_for_selected();
+                                self.mode = Mode::Detail;
+                            }
+                        }
+                        K::Char('x') => return self.run_selected(),
+                        K::Char('s') => return self.serve_selected(),
+                        K::Char('/') => {
+                            self.mode = Mode::Search {
+                                query: String::new(),
+                            }
+                        }
+                        K::Char('g') => return self.set_use_case(UseCase::General),
+                        K::Char('c') => return self.set_use_case(UseCase::Coding),
+                        K::Char('r') => return self.set_use_case(UseCase::Reasoning),
+                        K::Char('h') => return self.set_use_case(UseCase::Chat),
+                        K::Char('R') => return Action::StartSync,
+                        _ => {}
+                    },
+                    Tab::Servers => match key.code {
+                        K::Char('q') => return Action::Quit,
+                        K::Up | K::Char('k') => {
+                            self.server_selected = self.server_selected.saturating_sub(1)
+                        }
+                        K::Down | K::Char('j') => {
+                            self.server_selected = (self.server_selected + 1)
+                                .min(self.servers.len().saturating_sub(1));
+                        }
+                        K::Char('x') => {
+                            if let Some(r) = self.selected_server() {
+                                return Action::StopServer(r.pid);
+                            }
+                        }
+                        K::Char('c') => {
+                            if let Some(r) = self.selected_server() {
+                                return Action::CopyEndpoint(r.openai_url.clone());
+                            }
+                        }
+                        _ => {}
+                    },
                 }
-                K::Char('x') => return self.run_selected(),
-                K::Char('s') => return self.serve_selected(),
-                K::Char('/') => {
-                    self.mode = Mode::Search {
-                        query: String::new(),
-                    }
-                }
-                K::Char('g') => return self.set_use_case(UseCase::General),
-                K::Char('c') => return self.set_use_case(UseCase::Coding),
-                K::Char('r') => return self.set_use_case(UseCase::Reasoning),
-                K::Char('h') => return self.set_use_case(UseCase::Chat),
-                K::Char('R') => return Action::StartSync,
-                _ => {}
-            },
+            }
         }
         Action::None
     }
@@ -333,6 +402,23 @@ mod tests {
             memory,
             speed,
             score,
+        }
+    }
+
+    use paddock_core::serving::ServingRecord;
+
+    fn srv(pid: u32, model: &str, port: u16) -> ServingRecord {
+        ServingRecord {
+            pid,
+            runtime: RuntimeKind::LlamaCpp,
+            endpoint: format!("http://127.0.0.1:{port}"),
+            openai_url: format!("http://127.0.0.1:{port}/v1/chat/completions"),
+            model_ref: model.into(),
+            ready_path: "/health".into(),
+            started_at: 0,
+            ctx: 8192,
+            log_path: None,
+            port: Some(port),
         }
     }
 
@@ -567,6 +653,41 @@ mod tests {
         assert!(matches!(done, SyncStatus::Done { .. }));
         let failed = SyncStatus::Running.on_failed("boom".into());
         assert!(matches!(failed, SyncStatus::Failed(m) if m == "boom"));
+    }
+
+    #[test]
+    fn tab_toggles_between_models_and_servers() {
+        let mut s = state();
+        assert_eq!(s.tab, Tab::Models);
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(s.tab, Tab::Servers);
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(s.tab, Tab::Models);
+    }
+
+    #[test]
+    fn servers_tab_navigation_is_clamped() {
+        let mut s = state();
+        s.set_servers(vec![srv(1, "a", 8080), srv(2, "b", 8081)]);
+        s.handle_key(key(KeyCode::Tab)); // -> Servers
+        assert_eq!(s.server_selected, 0);
+        s.handle_key(key(KeyCode::Char('k'))); // clamped at top
+        assert_eq!(s.server_selected, 0);
+        s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(s.server_selected, 1);
+        s.handle_key(key(KeyCode::Char('j'))); // clamped at bottom
+        assert_eq!(s.server_selected, 1);
+    }
+
+    #[test]
+    fn set_servers_preserves_selection_by_pid() {
+        let mut s = state();
+        s.set_servers(vec![srv(10, "a", 8080), srv(20, "b", 8081)]);
+        s.tab = Tab::Servers;
+        s.server_selected = 1; // pid 20
+        s.set_servers(vec![srv(20, "b", 8081)]); // pid 10 dropped
+        assert_eq!(s.server_selected, 0);
+        assert_eq!(s.selected_server().unwrap().pid, 20);
     }
 
     #[test]
