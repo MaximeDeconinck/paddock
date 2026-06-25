@@ -258,7 +258,9 @@ pub fn list_all_servers(registry: &Registry, probe: &dyn SystemProbe) -> Vec<Ser
             runtime: r.runtime,
             endpoint: r.endpoint,
             openai_url: r.openai_url,
-            ctx: Some(r.ctx),
+            // 0 is the "not applicable" sentinel (mlx-lm runs without a paddock
+            // ctx flag) - surface it as None so the UI shows "-", not "0".
+            ctx: (r.ctx != 0).then_some(r.ctx),
             started_at: Some(r.started_at),
             stop: StopHandle::Pid(r.pid),
         })
