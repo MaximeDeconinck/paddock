@@ -224,9 +224,9 @@ fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
         .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
     let rows = state.servers.iter().map(|r| {
         Row::new(vec![
-            Cell::from(truncate_cell(&r.model_ref, 30)),
-            Cell::from(runtime_label(r.runtime)),
-            Cell::from(truncate_cell(&r.endpoint, 26)),
+            Cell::from(crate::output::truncate(&r.model_ref, 30)),
+            Cell::from(crate::output::runtime_label(r.runtime)),
+            Cell::from(crate::output::truncate(&r.endpoint, 26)),
             Cell::from(r.ctx.to_string()),
             Cell::from(crate::output::uptime_label(r.started_at)),
             Cell::from(r.pid.to_string()),
@@ -238,7 +238,7 @@ fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
         [
             Constraint::Min(20),
             Constraint::Length(10),
-            Constraint::Length(24),
+            Constraint::Length(26),
             Constraint::Length(7),
             Constraint::Length(8),
             Constraint::Length(8),
@@ -249,24 +249,6 @@ fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
     let mut ts = TableState::default().with_selected(Some(state.server_selected));
     frame.render_stateful_widget(table, area, &mut ts);
 }
-
-fn runtime_label(rt: RuntimeKind) -> &'static str {
-    match rt {
-        RuntimeKind::Ollama => "ollama",
-        RuntimeKind::LlamaCpp => "llama.cpp",
-        RuntimeKind::MlxLm => "mlx-lm",
-    }
-}
-
-fn truncate_cell(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(n - 1).collect();
-        format!("{head}…")
-    }
-}
-
 
 fn draw_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
     if state.tab == Tab::Servers {

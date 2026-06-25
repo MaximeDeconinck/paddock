@@ -223,7 +223,7 @@ pub fn print_recommendations_json(rows: &[ScoredModel]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn truncate(s: &str, n: usize) -> String {
+pub fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
     } else {
@@ -255,7 +255,7 @@ pub fn print_ps_table(records: &[ServingRecord]) {
     }
 }
 
-fn runtime_label(rt: paddock_core::catalog::RuntimeKind) -> &'static str {
+pub fn runtime_label(rt: paddock_core::catalog::RuntimeKind) -> &'static str {
     use paddock_core::catalog::RuntimeKind::*;
     match rt {
         Ollama => "ollama",
