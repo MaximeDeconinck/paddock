@@ -26,7 +26,12 @@ enum Exit {
 pub fn run(app: App) -> Result<()> {
     let db = app.open_db()?;
     let rows = app.scored_models(&db, UseCase::default(), false)?;
-    let mut state = TuiState::new(rows, UseCase::default(), app.profile.runtimes.clone());
+    let mut state = TuiState::new(
+        rows,
+        UseCase::default(),
+        app.profile.runtimes.clone(),
+        app.budget.clone(),
+    );
 
     // Stale (>24h) or empty catalog -> kick off a background refresh. The TUI
     // opens immediately against whatever snapshot exists (possibly empty).

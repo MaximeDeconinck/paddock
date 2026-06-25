@@ -1,6 +1,7 @@
 //! Pure TUI state machine — no terminal IO, fully unit-testable.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use paddock_core::estimate::{MemoryBudget, resolve_ctx};
 use paddock_core::hardware::RuntimesStatus;
 use paddock_core::runtime::{RunPlan, ServePlan, plan_run, plan_serve};
 use paddock_core::score::UseCase;
@@ -83,6 +84,8 @@ pub struct TuiState {
     pub query: String,
     /// Runtime availability snapshot used to build run plans.
     pub runtimes: RuntimesStatus,
+    /// Memory budget for this machine; used to auto-size run/serve context.
+    pub budget: MemoryBudget,
     /// Last plan_run failure, surfaced in the footer instead of crashing.
     pub last_error: Option<String>,
     /// Run plan for the selected row, computed once on Detail entry so the
@@ -108,7 +111,12 @@ pub struct TuiState {
 }
 
 impl TuiState {
-    pub fn new(rows: Vec<ScoredModel>, use_case: UseCase, runtimes: RuntimesStatus) -> Self {
+    pub fn new(
+        rows: Vec<ScoredModel>,
+        use_case: UseCase,
+        runtimes: RuntimesStatus,
+        budget: MemoryBudget,
+    ) -> Self {
         Self {
             all_rows: rows.clone(),
             rows,
@@ -117,6 +125,7 @@ impl TuiState {
             mode: Mode::List,
             query: String::new(),
             runtimes,
+            budget,
             last_error: None,
             detail_plan: None,
             detail_serve_plan: None,
@@ -316,8 +325,10 @@ impl TuiState {
     fn plan_for_selected(&self) -> Option<Result<RunPlan, String>> {
         let row = self.rows.get(self.selected)?;
         let variant = &row.model.variants[row.variant_idx];
-        // TUI has no flag surface, so ctx is always the default.
-        Some(plan_run(&row.model, variant, &self.runtimes, None).map_err(|e| e.to_string()))
+        // TUI has no flag surface, so ctx is auto-sized against the memory budget.
+        let mv = row.model.to_model_variant(variant);
+        let ctx = resolve_ctx(None, &mv, &self.budget, row.model.context_max);
+        Some(plan_run(&row.model, variant, &self.runtimes, Some(ctx)).map_err(|e| e.to_string()))
     }
 
     /// Single source for serve-plan computation (Detail entry and `s` both
@@ -326,7 +337,12 @@ impl TuiState {
     fn serve_plan_for_selected(&self) -> Option<Result<ServePlan, String>> {
         let row = self.rows.get(self.selected)?;
         let variant = &row.model.variants[row.variant_idx];
-        Some(plan_serve(&row.model, variant, &self.runtimes, None, None).map_err(|e| e.to_string()))
+        let mv = row.model.to_model_variant(variant);
+        let ctx = resolve_ctx(None, &mv, &self.budget, row.model.context_max);
+        Some(
+            plan_serve(&row.model, variant, &self.runtimes, None, Some(ctx))
+                .map_err(|e| e.to_string()),
+        )
     }
 
     /// Build the run plan for the selected row. A plan_run failure must not
@@ -415,6 +431,14 @@ mod tests {
         }
     }
 
+    /// Same as `fake_row` but with a parameterized `context_max`, so tests can
+    /// build a model whose auto-sized context exceeds the 8192 default.
+    fn fake_row_ctx(name: &str, context_max: u32) -> ScoredModel {
+        let mut row = fake_row(name);
+        row.model.context_max = context_max;
+        row
+    }
+
     use paddock_core::serving::ServingRecord;
 
     fn srv(pid: u32, model: &str, port: u16) -> ServingRecord {
@@ -441,6 +465,10 @@ mod tests {
             ],
             UseCase::General,
             RuntimesStatus::default(),
+            MemoryBudget {
+                gpu_effective_bytes: 24 * (1u64 << 30),
+                ram_total_bytes: 32 * (1u64 << 30),
+            },
         )
     }
 
@@ -755,6 +783,17 @@ mod tests {
         s.set_servers(vec![srv(1, "a", 8080)]);
         s.remove_server(999);
         assert_eq!(s.servers.len(), 1);
+    }
+
+    #[test]
+    fn tui_serve_plan_auto_sizes_context() {
+        // A roomy budget + large context_max should auto-size well above the 8192 default.
+        let mut s = state();
+        s.rows = vec![fake_row_ctx("Big", 32_768)];
+        s.all_rows = s.rows.clone();
+        s.selected = 0;
+        let plan = s.serve_plan_for_selected().unwrap().unwrap();
+        assert!(plan.ctx > 8192, "expected auto-sized ctx, got {}", plan.ctx);
     }
 
     #[test]
