@@ -33,7 +33,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, profile: &HardwareProfile) {
     .horizontal_margin(2)
     .vertical_margin(1)
     .areas(frame.area());
-    draw_header(frame, header, profile);
+    draw_header(frame, header, profile, state.tab);
     match state.tab {
         Tab::Models => draw_table(frame, table, state),
         Tab::Servers => draw_servers(frame, table, state),
@@ -55,7 +55,31 @@ const WORDMARK: [&str; 5] = [
 /// Display width of the widest wordmark row + a 2-col right margin.
 const WORDMARK_WIDTH: u16 = 57;
 
-fn draw_header(frame: &mut Frame, area: Rect, p: &HardwareProfile) {
+fn draw_header(frame: &mut Frame, area: Rect, p: &HardwareProfile, tab: Tab) {
+    // Active-tab indicator, top-right corner above the machine box.
+    let (models_style, servers_style) = match tab {
+        Tab::Models => (
+            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::new().fg(Color::DarkGray),
+        ),
+        Tab::Servers => (
+            Style::new().fg(Color::DarkGray),
+            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+    };
+    let tabs = Line::from(vec![
+        Span::styled("models", models_style),
+        Span::styled("  ", Style::new()),
+        Span::styled("servers", servers_style),
+    ]);
+    let tab_row = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(tabs).alignment(Alignment::Right), tab_row);
+
     // Wide terminals: wordmark on the left, machine box to its right.
     // Narrow ones: machine box only (it carries the " paddock " title then).
     let min_box_width = 46;
@@ -204,7 +228,7 @@ fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
             Cell::from(runtime_label(r.runtime)),
             Cell::from(truncate_cell(&r.endpoint, 26)),
             Cell::from(r.ctx.to_string()),
-            Cell::from(crate::output::humanize_since(uptime_secs(r.started_at))),
+            Cell::from(crate::output::uptime_label(r.started_at)),
             Cell::from(r.pid.to_string()),
         ])
         .style(Style::new().fg(Color::Gray))
@@ -243,13 +267,6 @@ fn truncate_cell(s: &str, n: usize) -> String {
     }
 }
 
-fn uptime_secs(started_at: i64) -> i64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    (now - started_at).max(0)
-}
 
 fn draw_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
     if state.tab == Tab::Servers {

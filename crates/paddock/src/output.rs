@@ -265,7 +265,7 @@ fn runtime_label(rt: paddock_core::catalog::RuntimeKind) -> &'static str {
 }
 
 /// Humanized uptime (`30s`, `12m`, `3h`, `2d`) from a unix `started_at`.
-fn uptime_label(started_at: i64) -> String {
+pub fn uptime_label(started_at: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
