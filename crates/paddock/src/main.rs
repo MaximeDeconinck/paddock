@@ -64,6 +64,7 @@ fn main() -> Result<()> {
             }
         }
         Some(Command::Stop { target, yes }) => stop_servers(&target, yes)?,
+        Some(Command::Logs { target, follow }) => show_logs(&target, follow)?,
         Some(Command::Sync {
             hf_limit,
             mlx_limit,
@@ -518,6 +519,47 @@ fn stop_servers(target: &str, yes: bool) -> Result<()> {
         println!("stopped {} (pid {})", r.model_ref, r.pid);
     }
     Ok(())
+}
+
+fn show_logs(target: &str, follow: bool) -> Result<()> {
+    use paddock_core::serving::{RecordMatch, match_records};
+
+    let records = Registry::open_default().list_live(&RealSystemProbe);
+    let chosen = match match_records(&records, target) {
+        RecordMatch::Matched(v) if v.len() == 1 => v[0].clone(),
+        RecordMatch::Matched(_) | RecordMatch::Ambiguous(_) => {
+            eprintln!("`{target}` matches several servers — use a pid");
+            std::process::exit(1);
+        }
+        RecordMatch::NotFound => {
+            eprintln!("no running server matches `{target}`");
+            std::process::exit(1);
+        }
+    };
+
+    let Some(path) = chosen.log_path.clone() else {
+        eprintln!(
+            "{} runs under {:?} which keeps its own logs (no paddock log file)",
+            chosen.model_ref, chosen.runtime
+        );
+        return Ok(());
+    };
+
+    if follow {
+        // Delegate to `tail -f` for follow semantics. Unlike `run_checked`, a
+        // non-zero exit is NOT an error here: the user ends `tail -f` with
+        // Ctrl-C (exit 130), which is the normal way to stop following.
+        std::process::Command::new("tail")
+            .args(["-f".as_ref(), path.as_os_str()])
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to run tail: {e}. Is it in PATH?"))?;
+        Ok(())
+    } else {
+        let body = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("cannot read log {path:?}: {e}"))?;
+        print!("{body}");
+        Ok(())
+    }
 }
 
 /// Run a pre-step to completion (stdout/stderr inherited — progress streams

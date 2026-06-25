@@ -68,6 +68,14 @@ pub enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Show a detached server's log (by model name or pid)
+    Logs {
+        /// Target: model name substring or a pid
+        target: String,
+        /// Follow the log (like `tail -f`)
+        #[arg(long, short = 'f')]
+        follow: bool,
+    },
     /// Refresh the model catalog
     Sync {
         /// Max Hugging Face GGUF repos to index

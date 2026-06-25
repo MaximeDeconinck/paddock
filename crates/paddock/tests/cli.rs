@@ -172,3 +172,14 @@ fn stop_unknown_target_errors() {
     let (mut cmd, _dir) = paddock();
     cmd.args(["stop", "nope"]).assert().failure();
 }
+
+#[test]
+fn logs_unknown_target_errors() {
+    let (mut cmd, _dir) = paddock();
+    // code(1) (not clap's 2) + the message proves the subcommand is wired up
+    // and reached the no-match path, not just that some failure occurred.
+    cmd.args(["logs", "nope"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("no running server matches"));
+}
