@@ -115,6 +115,9 @@ mod tests {
             model_ref: model_ref.to_string(),
             ready_path: "/health".into(),
             started_at: 1_770_000_000,
+            ctx: 8192,
+            log_path: None,
+            port: Some(port),
         }
     }
 

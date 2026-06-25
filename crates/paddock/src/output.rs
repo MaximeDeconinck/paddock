@@ -2,6 +2,7 @@
 
 use paddock_core::estimate::FitVerdict;
 use paddock_core::hardware::HardwareProfile;
+use paddock_core::serving::ServingRecord;
 
 use crate::app::ScoredModel;
 
@@ -229,6 +230,47 @@ fn truncate(s: &str, n: usize) -> String {
         let cut: String = s.chars().take(n.saturating_sub(1)).collect();
         format!("{cut}…")
     }
+}
+
+/// Render `ps` as a table; empty → a short notice.
+pub fn print_ps_table(records: &[ServingRecord]) {
+    if records.is_empty() {
+        println!("no servers running");
+        return;
+    }
+    println!(
+        "{:<28} {:<9} {:<26} {:>7} {:>8} {:>7}",
+        "MODEL", "RUNTIME", "ENDPOINT", "CTX", "UPTIME", "PID"
+    );
+    for r in records {
+        println!(
+            "{:<28} {:<9} {:<26} {:>7} {:>8} {:>7}",
+            truncate(&r.model_ref, 28),
+            runtime_label(r.runtime),
+            truncate(&r.endpoint, 26),
+            r.ctx,
+            uptime_label(r.started_at),
+            r.pid,
+        );
+    }
+}
+
+fn runtime_label(rt: paddock_core::catalog::RuntimeKind) -> &'static str {
+    use paddock_core::catalog::RuntimeKind::*;
+    match rt {
+        Ollama => "ollama",
+        LlamaCpp => "llama.cpp",
+        MlxLm => "mlx-lm",
+    }
+}
+
+/// Humanized uptime (`30s`, `12m`, `3h`, `2d`) from a unix `started_at`.
+fn uptime_label(started_at: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    humanize_since(now - started_at)
 }
 
 #[cfg(test)]

@@ -169,6 +169,10 @@ pub struct ServePlan {
     pub port_ignored: bool,
     /// Runtime this plan serves with (registry label, readiness policy).
     pub runtime: RuntimeKind,
+    /// Resolved context window (llama.cpp); 0 when not applicable.
+    pub ctx: u32,
+    /// Bound port for spawned servers; None for the Ollama daemon.
+    pub port: Option<u16>,
 }
 
 /// Serve strategy mirrors `plan_run`, plus a llama.cpp fallback for HF GGUF
@@ -224,6 +228,10 @@ pub fn plan_serve(
                 }),
                 port_ignored: false,
                 runtime: RuntimeKind::MlxLm,
+                // mlx_lm.server is launched without a context flag, so the
+                // resolved ctx is not applicable here (ServePlan.ctx doc: 0).
+                ctx: 0,
+                port: Some(port),
             })
         }
         Source::Ollama | Source::HuggingFace => {
@@ -272,6 +280,8 @@ pub fn plan_serve(
                 install: (!rt.ollama.installed).then(ollama_install),
                 port_ignored: port_requested,
                 runtime: RuntimeKind::Ollama,
+                ctx,
+                port: None,
             })
         }
     }
@@ -324,6 +334,8 @@ fn llama_server_plan(
         install,
         port_ignored: false,
         runtime: RuntimeKind::LlamaCpp,
+        ctx,
+        port: Some(port),
     }
 }
 

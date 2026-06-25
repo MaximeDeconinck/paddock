@@ -18,6 +18,15 @@ pub struct ServingRecord {
     pub model_ref: String,
     pub ready_path: String,
     pub started_at: i64,
+    /// Resolved context window the server was launched with (0 for legacy records).
+    #[serde(default)]
+    pub ctx: u32,
+    /// Log file for detached spawned children; None for foreground / Ollama.
+    #[serde(default)]
+    pub log_path: Option<PathBuf>,
+    /// Port for spawned servers (None for the Ollama daemon).
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 pub struct Registry {
@@ -131,6 +140,61 @@ unsafe extern "C" {
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
+/// Result of resolving a `stop`/`logs` target against live records.
+pub enum RecordMatch<'a> {
+    /// One or more records to act on (also the `all` case).
+    Matched(Vec<&'a ServingRecord>),
+    /// A name substring hit several models — caller lists and aborts.
+    Ambiguous(Vec<&'a ServingRecord>),
+    NotFound,
+}
+
+impl<'a> RecordMatch<'a> {
+    pub fn matched(&self) -> &[&'a ServingRecord] {
+        match self {
+            RecordMatch::Matched(v) => v,
+            _ => &[],
+        }
+    }
+}
+
+/// Resolve a target: `all` → every record; all-digits → exact PID; otherwise a
+/// case-insensitive substring of `model_ref` (Ambiguous if >1 distinct model).
+pub fn match_records<'a>(records: &'a [ServingRecord], target: &str) -> RecordMatch<'a> {
+    if target == "all" {
+        return if records.is_empty() {
+            RecordMatch::NotFound
+        } else {
+            RecordMatch::Matched(records.iter().collect())
+        };
+    }
+    if let Ok(pid) = target.parse::<u32>() {
+        return match records.iter().find(|r| r.pid == pid) {
+            Some(r) => RecordMatch::Matched(vec![r]),
+            None => RecordMatch::NotFound,
+        };
+    }
+    let needle = target.to_lowercase();
+    let hits: Vec<&ServingRecord> = records
+        .iter()
+        .filter(|r| r.model_ref.to_lowercase().contains(&needle))
+        .collect();
+    match hits.len() {
+        0 => RecordMatch::NotFound,
+        1 => RecordMatch::Matched(hits),
+        _ => RecordMatch::Ambiguous(hits),
+    }
+}
+
+/// Send SIGTERM to a pid. Best-effort; a dead pid is a no-op.
+pub fn terminate(pid: u32) {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return;
+    }
+    // SAFETY: kill with SIGTERM (15) signals an existing process.
+    unsafe { libc_kill(pid as i32, 15) };
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadedModel {
     pub name: String,
@@ -177,6 +241,47 @@ pub fn warm_up_ollama(probe: &dyn SystemProbe, model_ref: &str) -> bool {
 }
 
 #[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    #[test]
+    fn record_roundtrips_new_fields() {
+        let r = ServingRecord {
+            pid: 42,
+            runtime: RuntimeKind::LlamaCpp,
+            endpoint: "http://127.0.0.1:8080".into(),
+            openai_url: "http://127.0.0.1:8080/v1/chat/completions".into(),
+            model_ref: "repo:Q4_K_M".into(),
+            ready_path: "/health".into(),
+            started_at: 1000,
+            ctx: 32768,
+            log_path: Some(std::path::PathBuf::from("/tmp/42.log")),
+            port: Some(8080),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: ServingRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ctx, 32768);
+        assert_eq!(back.log_path, Some(std::path::PathBuf::from("/tmp/42.log")));
+        assert_eq!(back.port, Some(8080));
+    }
+
+    #[test]
+    fn old_record_without_new_fields_still_deserializes() {
+        let old = r#"{
+            "pid": 7, "runtime": "ollama",
+            "endpoint": "http://127.0.0.1:11434",
+            "openai_url": "http://127.0.0.1:11434/v1/chat/completions",
+            "model_ref": "llama3.2:1b", "ready_path": "/api/version",
+            "started_at": 5
+        }"#;
+        let r: ServingRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(r.ctx, 0);
+        assert_eq!(r.log_path, None);
+        assert_eq!(r.port, None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::hardware::MockProbe;
@@ -215,6 +320,9 @@ mod tests {
             model_ref: "repo:Q4_K_M".into(),
             ready_path: "/health".into(),
             started_at: 1_770_000_000,
+            ctx: 0,
+            log_path: None,
+            port: None,
         }
     }
 
@@ -297,5 +405,62 @@ mod tests {
     #[test]
     fn ollama_ps_unreachable_is_none() {
         assert!(ollama_loaded_models(&MockProbe::default()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod match_tests {
+    use super::*;
+
+    fn rec(pid: u32, model: &str) -> ServingRecord {
+        ServingRecord {
+            pid,
+            runtime: RuntimeKind::LlamaCpp,
+            endpoint: "e".into(),
+            openai_url: "o".into(),
+            model_ref: model.into(),
+            ready_path: "/health".into(),
+            started_at: 0,
+            ctx: 8192,
+            log_path: None,
+            port: Some(8080),
+        }
+    }
+
+    #[test]
+    fn match_all_returns_everything() {
+        let rs = vec![rec(1, "a"), rec(2, "b")];
+        assert_eq!(match_records(&rs, "all").matched().len(), 2);
+    }
+
+    #[test]
+    fn match_by_pid() {
+        let rs = vec![rec(10, "a"), rec(20, "b")];
+        let m = match_records(&rs, "20");
+        assert_eq!(m.matched().len(), 1);
+        assert_eq!(m.matched()[0].pid, 20);
+    }
+
+    #[test]
+    fn match_by_model_substring() {
+        let rs = vec![rec(1, "qwen3-35b"), rec(2, "llama3-8b")];
+        let m = match_records(&rs, "qwen");
+        assert_eq!(m.matched().len(), 1);
+        assert_eq!(m.matched()[0].pid, 1);
+    }
+
+    #[test]
+    fn ambiguous_substring_lists_candidates() {
+        let rs = vec![rec(1, "qwen3-35b"), rec(2, "qwen3-8b")];
+        assert!(matches!(
+            match_records(&rs, "qwen"),
+            RecordMatch::Ambiguous(_)
+        ));
+    }
+
+    #[test]
+    fn no_match_is_not_found() {
+        let rs = vec![rec(1, "a")];
+        assert!(matches!(match_records(&rs, "zzz"), RecordMatch::NotFound));
     }
 }

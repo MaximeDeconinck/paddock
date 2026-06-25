@@ -140,6 +140,23 @@ fn sync_help_lists_catalog_flags() {
 }
 
 #[test]
+fn ps_empty_registry_reports_no_servers() {
+    let (mut cmd, _dir) = paddock();
+    let out = cmd.arg("ps").assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
+    assert!(stdout.contains("no servers running"), "got: {stdout}");
+}
+
+#[test]
+fn ps_json_empty_is_empty_array() {
+    let (mut cmd, _dir) = paddock();
+    let out = cmd.args(["ps", "--json"]).assert().success();
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.get_output().stdout).expect("valid json");
+    assert_eq!(v, serde_json::json!([]));
+}
+
+#[test]
 fn recommend_json_is_array_max_5() {
     let (mut cmd, _dir) = paddock();
     let out = cmd
@@ -148,4 +165,21 @@ fn recommend_json_is_array_max_5() {
         .success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert!(v.as_array().unwrap().len() <= 5);
+}
+
+#[test]
+fn stop_unknown_target_errors() {
+    let (mut cmd, _dir) = paddock();
+    cmd.args(["stop", "nope"]).assert().failure();
+}
+
+#[test]
+fn logs_unknown_target_errors() {
+    let (mut cmd, _dir) = paddock();
+    // code(1) (not clap's 2) + the message proves the subcommand is wired up
+    // and reached the no-match path, not just that some failure occurred.
+    cmd.args(["logs", "nope"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("no running server matches"));
 }

@@ -62,7 +62,7 @@ pub fn run(app: App) -> Result<()> {
             println!("$ {}", plan.display());
             crate::launch(plan)
         }
-        Some(Exit::Serve(plan)) => crate::serve_with_plan(plan),
+        Some(Exit::Serve(plan)) => crate::serve_with_plan(plan, true),
         None => Ok(()),
     }
 }

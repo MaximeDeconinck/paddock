@@ -49,9 +49,22 @@ fn main() -> Result<()> {
             }
         }
         Some(Command::Run { model, ctx }) => run_model(&app, &model, ctx, cli.json)?,
-        Some(Command::Serve { model, port, ctx }) => {
-            serve_model(&app, &model, port, ctx, cli.json)?
+        Some(Command::Serve {
+            model,
+            port,
+            ctx,
+            foreground,
+        }) => serve_model(&app, &model, port, ctx, foreground, cli.json)?,
+        Some(Command::Ps) => {
+            let records = Registry::open_default().list_live(&RealSystemProbe);
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&records)?);
+            } else {
+                output::print_ps_table(&records);
+            }
         }
+        Some(Command::Stop { target, yes }) => stop_servers(&target, yes)?,
+        Some(Command::Logs { target, follow }) => show_logs(&target, follow)?,
         Some(Command::Sync {
             hf_limit,
             mlx_limit,
@@ -153,11 +166,19 @@ fn resolve_model(app: &App, query: &str) -> Result<(CatalogModel, usize)> {
     Ok((model, best_idx))
 }
 
+/// Resolve the launch context for a chosen model variant: explicit `--ctx`
+/// wins, otherwise auto-size against this machine's memory budget.
+fn resolved_ctx(app: &App, model: &CatalogModel, idx: usize, ctx: Option<u32>) -> u32 {
+    let mv = model.to_model_variant(&model.variants[idx]);
+    paddock_core::estimate::resolve_ctx(ctx, &mv, &app.budget, model.context_max)
+}
+
 fn run_model(app: &App, query: &str, ctx: Option<u32>, json: bool) -> Result<()> {
     let (model, idx) = resolve_model(app, query)?;
 
     // API delta vs the original plan: plan_run is fallible (repo-less HF/MLX
     // models, non-GGUF quants). Surface the actionable error and exit non-zero.
+    let ctx = Some(resolved_ctx(app, &model, idx, ctx));
     let plan: RunPlan = plan_run(&model, &model.variants[idx], &app.profile.runtimes, ctx)?;
 
     if json {
@@ -175,9 +196,11 @@ fn serve_model(
     query: &str,
     port: Option<u16>,
     ctx: Option<u32>,
+    foreground: bool,
     json: bool,
 ) -> Result<()> {
     let (model, idx) = resolve_model(app, query)?;
+    let ctx = Some(resolved_ctx(app, &model, idx, ctx));
     let plan = plan_serve(&model, &model.variants[idx], &app.profile.runtimes, port, ctx)?;
 
     if json {
@@ -186,13 +209,13 @@ fn serve_model(
         return Ok(());
     }
 
-    serve_with_plan(plan)
+    serve_with_plan(plan, foreground)
 }
 
 /// Full serve lifecycle: confirm install, spawn the server child when needed,
 /// wait for readiness, run pre-steps (e.g. `ollama pull`), print the endpoint
 /// block, then wait on the child. Shared with the TUI (Task 3).
-pub(crate) fn serve_with_plan(plan: ServePlan) -> Result<()> {
+pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
     if plan.port_ignored {
         eprintln!("warning: --port is ignored for the Ollama daemon (fixed 11434)");
     }
@@ -200,10 +223,28 @@ pub(crate) fn serve_with_plan(plan: ServePlan) -> Result<()> {
         confirm_and_install(install)?;
     }
 
+    let log_dir = paddock_core::serving::default_serving_dir().join("logs");
+
+    let mut detached_log: Option<std::path::PathBuf> = None;
     let mut child = match &plan.server_argv {
         Some(argv) => {
             eprintln!("$ {}", argv.join(" "));
-            Some(spawn_checked(argv)?)
+            if foreground {
+                Some(spawn_checked(argv)?)
+            } else {
+                // Detached: spawn to a per-invocation placeholder (our own pid
+                // makes it unique across concurrent `serve`s), then rename to
+                // <child-pid>.log once the child pid is known.
+                let tmp_log = log_dir.join(format!("pending-{}.log", std::process::id()));
+                let c = spawn_detached(argv, &tmp_log)?;
+                let final_log = log_dir.join(format!("{}.log", c.id()));
+                let actual = match std::fs::rename(&tmp_log, &final_log) {
+                    Ok(()) => final_log,
+                    Err(_) => tmp_log, // rename failed → the data is still at the pending path
+                };
+                detached_log = Some(actual);
+                Some(c)
+            }
         }
         None => None,
     };
@@ -238,12 +279,13 @@ pub(crate) fn serve_with_plan(plan: ServePlan) -> Result<()> {
     output::print_endpoint(&plan);
 
     match child {
-        Some(mut c) => {
+        Some(mut c) if foreground => {
             // Best-effort registry entry for tray/UIs; the guard unregisters
             // on every exit path including `?`. SIGINT kills paddock and the
             // child together (default tty behavior) without running Drop —
             // the stale file is reaped by the next `list_live`.
-            let _guard = RegistryGuard::register(&plan, c.id());
+            let _guard = (plan.runtime != paddock_core::catalog::RuntimeKind::Ollama)
+                .then(|| RegistryGuard::register(&plan, c.id(), None));
             eprintln!("serving — press Ctrl-C to stop");
             let status = c.wait()?;
             if !status.success() {
@@ -251,8 +293,56 @@ pub(crate) fn serve_with_plan(plan: ServePlan) -> Result<()> {
             }
             Ok(())
         }
-        // Ollama daemon keeps running; our job is done.
+        // Detached child: register WITHOUT the drop-guard so it outlives us.
+        Some(c) => {
+            if plan.runtime == paddock_core::catalog::RuntimeKind::Ollama {
+                // Cold-started the Ollama daemon; it serves in the background on
+                // its fixed port. ollama ps / ollama stop manage it, not paddock.
+                eprintln!("ollama daemon started in the background");
+            } else {
+                let log_path = detached_log.take();
+                register_detached(&plan, c.id(), log_path);
+                eprintln!(
+                    "serving in background · pid {} · paddock logs {}",
+                    c.id(),
+                    plan.model_ref
+                );
+            }
+            Ok(())
+        }
+        // Already-running Ollama daemon: nothing was spawned, so nothing to
+        // detach or track — the daemon owns the model and `ollama ps` lists it.
+        // paddock's ps/stop/logs cover the spawned (llama.cpp/mlx) servers only.
         None => Ok(()),
+    }
+}
+
+/// Build a serving registry record for a running server.
+fn build_record(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>) -> ServingRecord {
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    ServingRecord {
+        pid,
+        runtime: plan.runtime,
+        endpoint: plan.endpoint.clone(),
+        openai_url: plan.openai_url.clone(),
+        model_ref: plan.model_ref.clone(),
+        ready_path: plan.ready_path.clone(),
+        started_at,
+        ctx: plan.ctx,
+        log_path,
+        port: plan.port,
+    }
+}
+
+/// Register a detached child server. Unlike `RegistryGuard`, this does NOT
+/// unregister on drop — the server must survive this process exiting.
+fn register_detached(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>) {
+    let record = build_record(plan, pid, log_path);
+    if let Err(e) = Registry::open_default().register(&record) {
+        eprintln!("warning: could not record serving state: {e}");
     }
 }
 
@@ -264,21 +354,9 @@ struct RegistryGuard {
 }
 
 impl RegistryGuard {
-    fn register(plan: &ServePlan, pid: u32) -> Self {
+    fn register(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>) -> Self {
         let registry = Registry::open_default();
-        let started_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let record = ServingRecord {
-            pid,
-            runtime: plan.runtime,
-            endpoint: plan.endpoint.clone(),
-            openai_url: plan.openai_url.clone(),
-            model_ref: plan.model_ref.clone(),
-            ready_path: plan.ready_path.clone(),
-            started_at,
-        };
+        let record = build_record(plan, pid, log_path);
         if let Err(e) = registry.register(&record) {
             eprintln!("warning: could not record serving state: {e}");
         }
@@ -356,6 +434,140 @@ fn spawn_checked(argv: &[String]) -> Result<std::process::Child> {
         .args(&argv[1..])
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to start {}: {e}. Is it in PATH?", argv[0]))
+}
+
+// libc-free, matching serving.rs style: detach into a new session.
+unsafe extern "C" {
+    #[link_name = "setsid"]
+    fn libc_setsid() -> i32;
+}
+
+/// Spawn a server child detached from the controlling terminal, with stdout +
+/// stderr captured to `log_path`. Returns the child handle (its PID is the
+/// session leader). Dropping the handle does NOT kill the process.
+fn spawn_detached(argv: &[String], log_path: &std::path::Path) -> Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("cannot create log dir {parent:?}: {e}"))?;
+    }
+    let log = std::fs::File::create(log_path)
+        .map_err(|e| anyhow::anyhow!("cannot create log file {log_path:?}: {e}"))?;
+    let log_err = log.try_clone().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(log)
+        .stderr(log_err);
+    // SAFETY: setsid only creates a new session; async-signal-safe, no allocation.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc_setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn()
+        .map_err(|e| anyhow::anyhow!("failed to start {}: {e}. Is it in PATH?", argv[0]))
+}
+
+fn stop_servers(target: &str, yes: bool) -> Result<()> {
+    use paddock_core::catalog::RuntimeKind;
+    use paddock_core::serving::{RecordMatch, match_records, terminate};
+
+    let registry = Registry::open_default();
+    let records = registry.list_live(&RealSystemProbe);
+    let chosen = match match_records(&records, target) {
+        RecordMatch::Matched(v) => v,
+        RecordMatch::Ambiguous(cands) => {
+            eprintln!("`{target}` matches several servers — be specific:");
+            for r in cands {
+                eprintln!("  {} (pid {})", r.model_ref, r.pid);
+            }
+            std::process::exit(1);
+        }
+        RecordMatch::NotFound => {
+            eprintln!("no running server matches `{target}`");
+            if !records.is_empty() {
+                eprintln!(
+                    "running: {}",
+                    records
+                        .iter()
+                        .map(|r| r.model_ref.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            std::process::exit(1);
+        }
+    };
+
+    if target == "all" && !yes {
+        eprintln!("about to stop {} server(s):", chosen.len());
+        for r in &chosen {
+            eprintln!("  {} (pid {})", r.model_ref, r.pid);
+        }
+        eprint!("proceed? [y/N] ");
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        if !matches!(line.trim(), "y" | "Y") {
+            eprintln!("aborted");
+            return Ok(());
+        }
+    }
+
+    for r in chosen {
+        if r.runtime == RuntimeKind::Ollama {
+            let _ = run_checked(&["ollama".into(), "stop".into(), r.model_ref.clone()]);
+        } else {
+            terminate(r.pid);
+        }
+        let _ = registry.unregister(r.pid);
+        println!("stopped {} (pid {})", r.model_ref, r.pid);
+    }
+    Ok(())
+}
+
+fn show_logs(target: &str, follow: bool) -> Result<()> {
+    use paddock_core::serving::{RecordMatch, match_records};
+
+    let records = Registry::open_default().list_live(&RealSystemProbe);
+    let chosen = match match_records(&records, target) {
+        RecordMatch::Matched(v) if v.len() == 1 => v[0].clone(),
+        RecordMatch::Matched(_) | RecordMatch::Ambiguous(_) => {
+            eprintln!("`{target}` matches several servers — use a pid");
+            std::process::exit(1);
+        }
+        RecordMatch::NotFound => {
+            eprintln!("no running server matches `{target}`");
+            std::process::exit(1);
+        }
+    };
+
+    let Some(path) = chosen.log_path.clone() else {
+        eprintln!(
+            "{} runs under {:?} which keeps its own logs (no paddock log file)",
+            chosen.model_ref, chosen.runtime
+        );
+        return Ok(());
+    };
+
+    if follow {
+        // Delegate to `tail -f` for follow semantics. Unlike `run_checked`, a
+        // non-zero exit is NOT an error here: the user ends `tail -f` with
+        // Ctrl-C (exit 130), which is the normal way to stop following.
+        std::process::Command::new("tail")
+            .args(["-f".as_ref(), path.as_os_str()])
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to run tail: {e}. Is it in PATH?"))?;
+        Ok(())
+    } else {
+        let body = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("cannot read log {path:?}: {e}"))?;
+        print!("{body}");
+        Ok(())
+    }
 }
 
 /// Run a pre-step to completion (stdout/stderr inherited — progress streams

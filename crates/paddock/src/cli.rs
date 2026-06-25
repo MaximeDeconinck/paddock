@@ -51,9 +51,30 @@ pub enum Command {
         /// Port for llama.cpp / mlx servers (Ollama always uses 11434)
         #[arg(long)]
         port: Option<u16>,
-        /// Context window in tokens (llama.cpp only; Ollama/MLX manage their own)
+        /// Context window in tokens (llama.cpp only; default auto-sizes to memory)
         #[arg(long)]
         ctx: Option<u32>,
+        /// Stay attached and stream logs (Ctrl-C stops); default runs detached
+        #[arg(long, short = 'f')]
+        foreground: bool,
+    },
+    /// List running paddock servers
+    Ps,
+    /// Stop a running server (by model name, pid, or `all`)
+    Stop {
+        /// Target: model name substring, a pid, or `all`
+        target: String,
+        /// Skip the confirmation prompt for `all`
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Show a detached server's log (by model name or pid)
+    Logs {
+        /// Target: model name substring or a pid
+        target: String,
+        /// Follow the log (like `tail -f`)
+        #[arg(long, short = 'f')]
+        follow: bool,
     },
     /// Refresh the model catalog
     Sync {
