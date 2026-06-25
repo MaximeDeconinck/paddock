@@ -124,7 +124,7 @@ impl Registry {
 }
 
 /// `kill(pid, 0)` liveness probe (signal 0 = existence check, no signal sent).
-/// kill→-1/EPERM (alive process owned by another user) reads as dead here —
+/// kill→-1/EPERM (alive process owned by another user) reads as dead here -
 /// acceptable, we only track our own children.
 fn pid_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
@@ -144,7 +144,7 @@ unsafe extern "C" {
 pub enum RecordMatch<'a> {
     /// One or more records to act on (also the `all` case).
     Matched(Vec<&'a ServingRecord>),
-    /// A name substring hit several models — caller lists and aborts.
+    /// A name substring hit several models - caller lists and aborts.
     Ambiguous(Vec<&'a ServingRecord>),
     NotFound,
 }
@@ -286,7 +286,7 @@ const WARM_UP_KEEP_ALIVE: &str = "30m";
 
 /// Load `model_ref` into the local Ollama daemon's memory so the first real
 /// request doesn't pay the cold start (and so the model shows up in
-/// `/api/ps` — and the tray — right away). A prompt-less `/api/generate`
+/// `/api/ps` - and the tray - right away). A prompt-less `/api/generate`
 /// is Ollama's documented "just load it" call. Returns false when the
 /// daemon is unreachable or refuses; callers treat this as best-effort.
 pub fn warm_up_ollama(probe: &dyn SystemProbe, model_ref: &str) -> bool {

@@ -1,4 +1,4 @@
-//! Builds the exact command to run a model — pure data, no exec, no prompt.
+//! Builds the exact command to run a model - pure data, no exec, no prompt.
 //! The binary owns display, confirmation and process replacement.
 
 use serde::Serialize;
@@ -71,7 +71,7 @@ pub fn plan_run(
     ctx: Option<u32>,
 ) -> Result<RunPlan, PaddockError> {
     // `-c` size for llama.cpp paths; None falls back to the fit-verdict default.
-    // Ollama/MLX are unaffected — they manage their own context window.
+    // Ollama/MLX are unaffected - they manage their own context window.
     let ctx = ctx.unwrap_or(DEFAULT_CONTEXT);
     match model.source {
         Source::Mlx => {
@@ -98,7 +98,7 @@ pub fn plan_run(
                 // `-c` aligns runtime memory with the fit verdict's context
                 // assumption: llama-cli defaults --ctx-size to 0 = the model's
                 // full context, which can be 262k → tens of GB of KV cache.
-                // `--no-mmproj` skips the vision tower — text-only in v0.1,
+                // `--no-mmproj` skips the vision tower - text-only in v0.1,
                 // and the estimator doesn't count vision weights (flag
                 // verified present in llama.cpp b9580 for both binaries).
                 return Ok(RunPlan {
@@ -313,7 +313,7 @@ fn llama_server_plan(
         // `-c` aligns runtime memory with the fit verdict's context
         // assumption: llama-server defaults --ctx-size to 0 = the model's
         // full context, which can be 262k → tens of GB of KV cache.
-        // `--no-mmproj` skips the vision tower — text-only in v0.1, and the
+        // `--no-mmproj` skips the vision tower - text-only in v0.1, and the
         // estimator doesn't count vision weights (flag verified present in
         // llama.cpp b9580 for both binaries).
         server_argv: Some(s(&[

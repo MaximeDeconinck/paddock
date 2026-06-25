@@ -21,7 +21,7 @@ pub fn spawn_servers_refresh() -> Receiver<Vec<ServerRow>> {
             let snapshot =
                 paddock_core::serving::list_all_servers(&Registry::open_default(), &RealSystemProbe);
             if tx.send(snapshot).is_err() {
-                break; // receiver dropped — TUI exited
+                break; // receiver dropped - TUI exited
             }
             std::thread::sleep(REFRESH_EVERY);
         }

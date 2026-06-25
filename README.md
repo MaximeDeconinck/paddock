@@ -92,11 +92,11 @@ Ranking is age-aware: the quality sub-score takes a progressive malus once a mod
 
 ```text
 $ paddock recommend --use-case coding
-Qwen3.6-35B-A3B-MTP-GGUF Q4_K_M — 78/100: fits GPU with 2.6 GiB to spare, ~64 tok/s (instant), 256k context
-Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive Q4_K_M — 78/100: fits GPU with 3.1 GiB to spare, ~64 tok/s (instant), 256k context
-Qwen3.6-35B-A3B-GGUF Q4_K_M — 78/100: fits GPU with 3.1 GiB to spare, ~64 tok/s (instant), 256k context
-gpt-oss-20b-MXFP4-Q8 MLX_4BIT — 77/100: fits GPU with 13.2 GiB to spare, ~57 tok/s (instant), 128k context
-Qwen3-30B-A3B-Instruct-2507-GGUF Q5_K_M — 75/100: fits GPU with 2.9 GiB to spare, ~49 tok/s (instant), 256k context
+Qwen3.6-35B-A3B-MTP-GGUF Q4_K_M - 78/100: fits GPU with 2.6 GiB to spare, ~64 tok/s (instant), 256k context
+Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive Q4_K_M - 78/100: fits GPU with 3.1 GiB to spare, ~64 tok/s (instant), 256k context
+Qwen3.6-35B-A3B-GGUF Q4_K_M - 78/100: fits GPU with 3.1 GiB to spare, ~64 tok/s (instant), 256k context
+gpt-oss-20b-MXFP4-Q8 MLX_4BIT - 77/100: fits GPU with 13.2 GiB to spare, ~57 tok/s (instant), 128k context
+Qwen3-30B-A3B-Instruct-2507-GGUF Q5_K_M - 75/100: fits GPU with 2.9 GiB to spare, ~49 tok/s (instant), 256k context
 ```
 
 ### `paddock run <model>`: launch it

@@ -1,4 +1,4 @@
-//! Pure rendering — reads state, never mutates it, no IO.
+//! Pure rendering - reads state, never mutates it, no IO.
 //! Palette: DarkGray/Gray/White + a single deep-blue accent.
 
 use paddock_core::estimate::{FitVerdict, estimate_speed, kv_cache_bytes};
@@ -140,14 +140,14 @@ fn draw_machine_box(frame: &mut Frame, area: Rect, p: &HardwareProfile, titled: 
     ]);
     let mut block = Block::bordered()
         .border_style(Style::new().fg(Color::DarkGray))
-        .title(tabs_title);
+        .title(tabs_title.right_aligned());
     if titled {
         block = block.title(
             Line::from(Span::styled(
                 " paddock ",
                 Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
             ))
-            .right_aligned(),
+            .left_aligned(),
         );
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -211,7 +211,7 @@ fn draw_table(frame: &mut Frame, area: Rect, state: &TuiState) {
 
 fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
     if state.servers.is_empty() {
-        let msg = Paragraph::new("no servers running — press s on a model to serve one")
+        let msg = Paragraph::new("no servers running · press s on a model to serve one")
             .style(Style::new().fg(Color::DarkGray));
         frame.render_widget(msg, area);
         return;
@@ -221,7 +221,7 @@ fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
     let rows = state.servers.iter().map(|r| {
         let pid = match &r.stop {
             paddock_core::serving::StopHandle::Pid(p) => p.to_string(),
-            _ => "—".into(),
+            _ => "-".into(),
         };
         Row::new(vec![
             // MODEL is the flexible `Min` column: don't pre-truncate, let the
@@ -230,11 +230,11 @@ fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
             Cell::from(r.model.clone()),
             Cell::from(crate::output::runtime_label(r.runtime)),
             Cell::from(crate::output::truncate(&r.endpoint, 26)),
-            Cell::from(r.ctx.map(|c| c.to_string()).unwrap_or_else(|| "—".into())),
+            Cell::from(r.ctx.map(|c| c.to_string()).unwrap_or_else(|| "-".into())),
             Cell::from(
                 r.started_at
                     .map(crate::output::uptime_label)
-                    .unwrap_or_else(|| "—".into()),
+                    .unwrap_or_else(|| "-".into()),
             ),
             Cell::from(pid),
         ])
@@ -345,7 +345,7 @@ fn draw_detail(frame: &mut Frame, state: &TuiState, profile: &HardwareProfile) {
     draw_speed_chart(frame, chart_area, r, profile.bandwidth_gbps);
 }
 
-/// Generation speed as a function of context depth — the KV cache is
+/// Generation speed as a function of context depth - the KV cache is
 /// re-streamed every token, so tok/s decays as the conversation grows.
 /// Sampled from the same estimator the table uses (anchored at 8k there).
 fn draw_speed_chart(frame: &mut Frame, area: Rect, r: &ScoredModel, bandwidth_gbps: f64) {

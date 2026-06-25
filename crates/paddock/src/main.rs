@@ -40,7 +40,7 @@ fn main() -> Result<()> {
             let db = app.open_db()?;
             let mut rows = app.scored_models(&db, use_case.into(), false)?;
             if rows.is_empty() {
-                eprintln!("catalog is empty — run `paddock sync` first");
+                eprintln!("catalog is empty - run `paddock sync` first");
             }
             rows.truncate(5);
             if cli.json {
@@ -116,7 +116,7 @@ fn fit(app: &App, all: bool, use_case: UseCase, limit: usize, json: bool) -> Res
     let db = app.open_db()?;
     let mut rows = app.scored_models(&db, use_case, all)?;
     if rows.is_empty() {
-        eprintln!("catalog is empty — run `paddock sync` first");
+        eprintln!("catalog is empty - run `paddock sync` first");
     }
     rows.truncate(limit);
     if json {
@@ -136,7 +136,7 @@ fn resolve_model(app: &App, query: &str) -> Result<(CatalogModel, usize)> {
     let model = match find_model(&models, query) {
         Lookup::Found(m) => m.clone(),
         Lookup::Ambiguous(names) => {
-            eprintln!("model name `{query}` is ambiguous — candidates:");
+            eprintln!("model name `{query}` is ambiguous - candidates:");
             for n in names {
                 eprintln!("  {n}");
             }
@@ -267,13 +267,13 @@ pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
     }
 
     // Ollama loads a model only on its first request and the daemon outlives
-    // us — warm it up now so "ready" means ready (and the model shows in
+    // us - warm it up now so "ready" means ready (and the model shows in
     // /api/ps + the tray). Best-effort: a failure leaves a working endpoint
     // that simply cold-starts on first use.
     if plan.runtime == paddock_core::catalog::RuntimeKind::Ollama {
         eprintln!("loading {} into memory…", plan.model_ref);
         if !paddock_core::serving::warm_up_ollama(&RealSystemProbe, &plan.model_ref) {
-            eprintln!("warning: warm-up failed — the model will load on the first request");
+            eprintln!("warning: warm-up failed - the model will load on the first request");
         }
     }
 
@@ -283,11 +283,11 @@ pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
         Some(mut c) if foreground => {
             // Best-effort registry entry for tray/UIs; the guard unregisters
             // on every exit path including `?`. SIGINT kills paddock and the
-            // child together (default tty behavior) without running Drop —
+            // child together (default tty behavior) without running Drop -
             // the stale file is reaped by the next `list_live`.
             let _guard = (plan.runtime != paddock_core::catalog::RuntimeKind::Ollama)
                 .then(|| RegistryGuard::register(&plan, c.id(), None));
-            eprintln!("serving — press Ctrl-C to stop");
+            eprintln!("serving - press Ctrl-C to stop");
             let status = c.wait()?;
             if !status.success() {
                 bail!("server exited with {status}");
@@ -312,7 +312,7 @@ pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
             Ok(())
         }
         // Already-running Ollama daemon: nothing was spawned, so nothing to
-        // detach or track — the daemon owns the model and `ollama ps` lists it.
+        // detach or track - the daemon owns the model and `ollama ps` lists it.
         // paddock's ps/stop/logs cover the spawned (llama.cpp/mlx) servers only.
         None => Ok(()),
     }
@@ -339,7 +339,7 @@ fn build_record(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>
 }
 
 /// Register a detached child server. Unlike `RegistryGuard`, this does NOT
-/// unregister on drop — the server must survive this process exiting.
+/// unregister on drop - the server must survive this process exiting.
 fn register_detached(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>) {
     let record = build_record(plan, pid, log_path);
     if let Err(e) = Registry::open_default().register(&record) {
@@ -386,11 +386,11 @@ fn readiness_deadline(child_spawned: bool) -> Option<std::time::Duration> {
 }
 
 /// Poll `{endpoint}{ready_path}` until it answers 2xx. With a spawned child
-/// this loops indefinitely — the child exiting is the only failure mode; a
+/// this loops indefinitely - the child exiting is the only failure mode; a
 /// notice after 5 s and a heartbeat every 60 s keep the user informed. Each
 /// iteration blocks at most ~800 ms (300 ms connect + 500 ms read in
-/// `http_get_local`, plus a 250 ms sleep), so Ctrl-C — which kills paddock and
-/// the child together via default tty behavior — feels instant.
+/// `http_get_local`, plus a 250 ms sleep), so Ctrl-C - which kills paddock and
+/// the child together via default tty behavior - feels instant.
 fn wait_ready(plan: &ServePlan, mut child: Option<&mut std::process::Child>) -> Result<()> {
     use std::time::{Duration, Instant};
 
@@ -408,21 +408,21 @@ fn wait_ready(plan: &ServePlan, mut child: Option<&mut std::process::Child>) -> 
         {
             let argv = plan.server_argv.as_deref().unwrap_or_default().join(" ");
             bail!(
-                "server exited with {status} before becoming ready — \
+                "server exited with {status} before becoming ready - \
                      run `{argv}` manually to see the error"
             );
         }
         if let Some(deadline) = deadline
             && start.elapsed() >= deadline
         {
-            bail!("ollama daemon not reachable on 11434 — is it running?");
+            bail!("ollama daemon not reachable on 11434 - is it running?");
         }
         if !notified && start.elapsed() >= Duration::from_secs(5) {
-            eprintln!("downloading/loading model — this can take a while");
+            eprintln!("downloading/loading model - this can take a while");
             notified = true;
         }
         if start.elapsed() >= next_heartbeat {
-            eprintln!("still waiting for {} — Ctrl-C to stop", plan.endpoint);
+            eprintln!("still waiting for {} - Ctrl-C to stop", plan.endpoint);
             next_heartbeat += Duration::from_secs(60);
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -481,7 +481,7 @@ fn stop_servers(target: &str, yes: bool) -> Result<()> {
     let chosen = match match_records(&records, target) {
         RecordMatch::Matched(v) => v,
         RecordMatch::Ambiguous(cands) => {
-            eprintln!("`{target}` matches several servers — be specific:");
+            eprintln!("`{target}` matches several servers - be specific:");
             for r in cands {
                 eprintln!("  {} (pid {})", r.model_ref, r.pid);
             }
@@ -537,7 +537,7 @@ fn show_logs(target: &str, follow: bool) -> Result<()> {
     let chosen = match match_records(&records, target) {
         RecordMatch::Matched(v) if v.len() == 1 => v[0].clone(),
         RecordMatch::Matched(_) | RecordMatch::Ambiguous(_) => {
-            eprintln!("`{target}` matches several servers — use a pid");
+            eprintln!("`{target}` matches several servers - use a pid");
             std::process::exit(1);
         }
         RecordMatch::NotFound => {
@@ -571,7 +571,7 @@ fn show_logs(target: &str, follow: bool) -> Result<()> {
     }
 }
 
-/// Run a pre-step to completion (stdout/stderr inherited — progress streams
+/// Run a pre-step to completion (stdout/stderr inherited - progress streams
 /// to the tty) and fail on non-zero exit.
 fn run_checked(argv: &[String]) -> Result<()> {
     let cmd = argv.join(" ");
@@ -606,7 +606,7 @@ fn confirm_and_install(install: &InstallPlan) -> Result<()> {
         .join(" ");
     if !std::io::stdin().is_terminal() {
         eprintln!(
-            "required runtime is not installed and stdin is not a terminal — \
+            "required runtime is not installed and stdin is not a terminal - \
              re-run interactively to confirm install (`{cmd}`)."
         );
         std::process::exit(1);
@@ -617,7 +617,7 @@ fn confirm_and_install(install: &InstallPlan) -> Result<()> {
     std::io::stdin().read_line(&mut answer)?;
     let answer = answer.trim().to_ascii_lowercase();
     if answer != "y" && answer != "yes" {
-        eprintln!("install declined — nothing launched. Run `{cmd}` yourself, then retry.");
+        eprintln!("install declined - nothing launched. Run `{cmd}` yourself, then retry.");
         std::process::exit(1);
     }
     // Check the installer binary exists before running it (avoid exec-ENOENT).
@@ -638,9 +638,9 @@ fn confirm_and_install(install: &InstallPlan) -> Result<()> {
 
 fn installer_missing_hint(bin: &str) -> String {
     match bin {
-        "brew" => "brew not found — install Homebrew from https://brew.sh first".to_string(),
-        "uv" => "uv not found — install uv from https://docs.astral.sh/uv first".to_string(),
-        other => format!("{other} not found — install it and make sure it is in PATH first"),
+        "brew" => "brew not found - install Homebrew from https://brew.sh first".to_string(),
+        "uv" => "uv not found - install uv from https://docs.astral.sh/uv first".to_string(),
+        other => format!("{other} not found - install it and make sure it is in PATH first"),
     }
 }
 

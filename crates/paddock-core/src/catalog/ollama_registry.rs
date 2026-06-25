@@ -5,7 +5,7 @@
 //! exposed (`GET https://registry.ollama.ai/v2/library/llama3.1/tags/list`
 //! → 404). Tag enumeration therefore uses the public library page
 //! `GET https://ollama.com/library/{base}/tags` (HTML, 200), extracting tag
-//! names from the URL scheme `href="/library/{base}:{tag}"` — URL patterns
+//! names from the URL scheme `href="/library/{base}:{tag}"` - URL patterns
 //! are far more stable than DOM structure. Treat as semi-stable best-effort:
 //! errors are reported, never fatal.
 //!
@@ -77,7 +77,7 @@ fn extract_tag_names(html: &str, base: &str) -> Vec<String> {
 /// (= popularity order), deduplicated.
 ///
 /// PRE-VERIFIED (live curl, 2026-06-10): `https://ollama.com/library` exposes
-/// 234 model names via the URL pattern `href="/library/{name}"` — same
+/// 234 model names via the URL pattern `href="/library/{name}"` - same
 /// semi-stable URL-scheme extraction as `fetch_model_tags`.
 pub async fn fetch_library_index(http: &dyn HttpClient) -> Result<Vec<String>, PaddockError> {
     let html = http.get_text("https://ollama.com/library").await?;
@@ -85,7 +85,7 @@ pub async fn fetch_library_index(http: &dyn HttpClient) -> Result<Vec<String>, P
     let mut names: Vec<String> = Vec::new();
     for (idx, _) in html.match_indices(needle) {
         let tail = &html[idx + needle.len()..];
-        // A name stops at any char outside the Ollama name alphabet — note
+        // A name stops at any char outside the Ollama name alphabet - note
         // ':' is excluded, so tag links (`/library/{name}:{tag}`) still yield
         // the bare name and deduplicate away.
         let name: String = tail
@@ -143,7 +143,7 @@ fn params_from_size_token(size: &str) -> Option<u64> {
 /// `Err` = network failure worth reporting.
 ///
 /// v1 probes ONLY the first-seen (most popular) size and creates that one
-/// model; other sizes are skipped — arch params can differ per size, so each
+/// model; other sizes are skipped - arch params can differ per size, so each
 /// size would need its own header probe. Per-size probes are a
 /// request-budget tradeoff; revisit.
 ///
@@ -220,7 +220,7 @@ pub async fn discover_model(
     };
     let params_active = match (meta.expert_count, meta.expert_used_count) {
         // Rough MoE approximation: active ≈ total × used/total experts
-        // (ignores the dense shared layers — good enough for fit estimates).
+        // (ignores the dense shared layers - good enough for fit estimates).
         (Some(experts), Some(used)) if used > 0 && used < experts => {
             (params_total as f64 * used as f64 / experts as f64) as u64
         }
@@ -277,7 +277,7 @@ fn normalize_quant(suffix: &str) -> Option<String> {
 
 /// Pure tag selection for one curated size (e.g. "8b"):
 /// - the plain `{size_prefix}` tag maps to `default_quant` (the curated
-///   entry's quant — that's what the default tag aliases on the library);
+///   entry's quant - that's what the default tag aliases on the library);
 /// - `{size_prefix}-…-{quant}` tags are kept when the last `-` segment is a
 ///   known quant (per `quant_bpw` after normalization);
 /// - `-text`/`-base` (non-chat) tags and unknown quants (q4_1, q5_0, …) are
@@ -408,7 +408,7 @@ mod tests {
     #[async_trait]
     impl HttpClient for MockHttp {
         // `get_json_with_accept` keeps the trait's default impl, which must
-        // delegate here — manifest fixtures are registered as plain json.
+        // delegate here - manifest fixtures are registered as plain json.
         async fn get_json(&self, url: &str) -> Result<Value, PaddockError> {
             self.json
                 .get(url)
@@ -436,7 +436,7 @@ mod tests {
         }
     }
 
-    /// Realistic excerpt of https://ollama.com/library/llama3.1/tags —
+    /// Realistic excerpt of https://ollama.com/library/llama3.1/tags -
     /// hrefs are the load-bearing pattern, surrounding DOM is noise.
     const LLAMA31_TAGS_HTML: &str = r#"<!DOCTYPE html>
 <html><body>
@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     fn select_variant_tags_prefers_it_and_plain_size_quant_forms() {
-        // `{size}-it-{q}` beats non-canonical forms — even at equal length
+        // `{size}-it-{q}` beats non-canonical forms - even at equal length
         // and listed second (page order / shortest must not decide).
         let tags: Vec<String> = ["9b-v1-q4_K_M", "9b-it-q4_K_M"]
             .iter()
@@ -702,7 +702,7 @@ mod tests {
         assert_eq!(m.variants[0].file_size_bytes, Some(4_920_000_000));
     }
 
-    /// Realistic excerpt of https://ollama.com/library — names appear once
+    /// Realistic excerpt of https://ollama.com/library - names appear once
     /// per card, sometimes again as tag links; non-library links are noise.
     const LIBRARY_INDEX_HTML: &str = r#"<!DOCTYPE html>
 <html><body>
@@ -865,7 +865,7 @@ mod tests {
         assert_eq!(m.context_max, 32768);
 
         // Oldest relative date on the page ("8 months ago") is the release
-        // proxy — always approximate.
+        // proxy - always approximate.
         assert_eq!(m.released_at, Some(NOW - 8 * 30 * 86_400));
         assert!(m.released_approx);
 

@@ -1,5 +1,5 @@
 //! Terminal lifecycle + event loop. All state transitions live in `state`,
-//! all rendering in `draw` — this module only wires them to the terminal.
+//! all rendering in `draw` - this module only wires them to the terminal.
 
 mod draw;
 mod servers_task;
@@ -63,7 +63,7 @@ pub fn run(app: App) -> Result<()> {
 
     // Launch AFTER restore so the child owns a clean tty. `launch` and
     // `serve_with_plan` are the same confirm-install paths as `paddock run` /
-    // `paddock serve` — the never-auto-install guarantee lives in one place.
+    // `paddock serve` - the never-auto-install guarantee lives in one place.
     match result? {
         Some(Exit::Run(plan)) => {
             println!("$ {}", plan.display());
@@ -125,7 +125,7 @@ fn event_loop(
         let Event::Key(key) = event::read()? else {
             continue;
         };
-        // macOS terminals also deliver Release/Repeat events — act on Press only.
+        // macOS terminals also deliver Release/Repeat events - act on Press only.
         if key.kind != KeyEventKind::Press {
             continue;
         }

@@ -81,7 +81,7 @@ const AGE_MALUS_PER_YEAR: f64 = 10.0;
 const AGE_MALUS_CAP: f64 = 20.0;
 
 /// Quality penalty for model age (days since release). None (unknown
-/// release date) = no malus — absence of data must not punish a model.
+/// release date) = no malus - absence of data must not punish a model.
 fn age_malus(age_days: Option<f64>) -> f64 {
     let Some(days) = age_days else { return 0.0 };
     let years = (days / 365.25).max(0.0);

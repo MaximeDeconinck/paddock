@@ -1,4 +1,4 @@
-//! Pure TUI state machine — no terminal IO, fully unit-testable.
+//! Pure TUI state machine - no terminal IO, fully unit-testable.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use paddock_core::estimate::{MemoryBudget, resolve_ctx};
@@ -197,7 +197,7 @@ impl TuiState {
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         use KeyCode as K;
         self.last_error = None;
-        // Ctrl-C quits from any mode — never swallowed by search input.
+        // Ctrl-C quits from any mode - never swallowed by search input.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == K::Char('c') {
             return Action::Quit;
         }
@@ -572,7 +572,7 @@ mod tests {
         s.handle_key(key(KeyCode::Enter));
         assert_eq!(s.mode, Mode::Detail);
         assert!(matches!(s.handle_key(ctrl_c), Action::Quit));
-        // Search — and the 'c' must not land in the query
+        // Search - and the 'c' must not land in the query
         let mut s = state();
         s.handle_key(key(KeyCode::Char('/')));
         assert!(matches!(s.handle_key(ctrl_c), Action::Quit));

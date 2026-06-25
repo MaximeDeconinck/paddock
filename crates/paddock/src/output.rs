@@ -192,7 +192,7 @@ pub fn print_recommendations(rows: &[ScoredModel]) {
     for r in rows {
         let v = &r.model.variants[r.variant_idx];
         println!(
-            "{} {} — {:.0}/100: {}",
+            "{} {} - {:.0}/100: {}",
             r.model.name,
             v.quant,
             r.score.total,

@@ -16,11 +16,11 @@ pub struct GgufMeta {
     pub head_count_kv: Option<u64>,
     pub embedding_length: Option<u64>,
     pub context_length: Option<u64>,
-    /// `general.parameter_count` — total weight count, when published.
+    /// `general.parameter_count` - total weight count, when published.
     pub parameter_count: Option<u64>,
-    /// `{arch}.expert_count` — total experts of a MoE model.
+    /// `{arch}.expert_count` - total experts of a MoE model.
     pub expert_count: Option<u64>,
-    /// `{arch}.expert_used_count` — experts active per token.
+    /// `{arch}.expert_used_count` - experts active per token.
     pub expert_used_count: Option<u64>,
 }
 
@@ -116,7 +116,7 @@ fn all_tracked_filled(m: &GgufMeta) -> bool {
     // Includes the optional-in-practice fields (parameter_count, expert_*):
     // early exit must never skip a tracked key still ahead in the buffer.
     // When a file lacks them the full (in-memory, <= a few MiB) buffer is
-    // scanned instead — skipping bytes is cheap, and probe truncation is
+    // scanned instead - skipping bytes is cheap, and probe truncation is
     // handled separately in `parse_gguf_header`.
     m.architecture.is_some()
         && m.name.is_some()
