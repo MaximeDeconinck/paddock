@@ -201,6 +201,8 @@ pub struct LoadedModel {
     pub size_bytes: u64,
 }
 
+const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
+const OLLAMA_OPENAI_URL: &str = "http://127.0.0.1:11434/v1/chat/completions";
 const OLLAMA_PS_URL: &str = "http://127.0.0.1:11434/api/ps";
 
 /// Models currently loaded in the local Ollama daemon, None when unreachable.
@@ -242,7 +244,6 @@ pub struct ServerRow {
     pub openai_url: String,
     pub ctx: Option<u32>,
     pub started_at: Option<i64>,
-    pub size_bytes: Option<u64>,
     pub stop: StopHandle,
 }
 
@@ -259,7 +260,6 @@ pub fn list_all_servers(registry: &Registry, probe: &dyn SystemProbe) -> Vec<Ser
             openai_url: r.openai_url,
             ctx: Some(r.ctx),
             started_at: Some(r.started_at),
-            size_bytes: None,
             stop: StopHandle::Pid(r.pid),
         })
         .collect();
@@ -268,11 +268,10 @@ pub fn list_all_servers(registry: &Registry, probe: &dyn SystemProbe) -> Vec<Ser
             rows.push(ServerRow {
                 model: m.name.clone(),
                 runtime: RuntimeKind::Ollama,
-                endpoint: "http://127.0.0.1:11434".to_string(),
-                openai_url: "http://127.0.0.1:11434/v1/chat/completions".to_string(),
+                endpoint: OLLAMA_BASE.to_string(),
+                openai_url: OLLAMA_OPENAI_URL.to_string(),
                 ctx: None,
                 started_at: None,
-                size_bytes: Some(m.size_bytes),
                 stop: StopHandle::OllamaModel(m.name),
             });
         }

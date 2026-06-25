@@ -144,9 +144,8 @@ fn event_loop(
                     state.last_error = Some(e.to_string());
                 }
                 state.tab = state::Tab::Servers;
-                // Immediate refresh so a newly spawned llama.cpp/mlx server shows
-                // without waiting for the next background tick. (Ollama models are
-                // not tracked here; they appear via `ollama ps`.)
+                // Immediate refresh (paddock-spawned + Ollama-loaded) so a newly
+                // served model shows without waiting for the next background tick.
                 let snapshot = paddock_core::serving::list_all_servers(
                     &paddock_core::serving::Registry::open_default(),
                     &paddock_core::hardware::RealSystemProbe,

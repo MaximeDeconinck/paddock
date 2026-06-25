@@ -165,14 +165,16 @@ impl TuiState {
             .min(self.rows.len().saturating_sub(1));
     }
 
-    /// Replace the servers snapshot, keeping the cursor on the same model when
-    /// it survives the refresh, otherwise clamping to the new length. (Ollama
-    /// rows have no pid, so identity is the model name.)
+    /// Replace the servers snapshot, keeping the cursor on the same row when it
+    /// survives the refresh, otherwise clamping to the new length. Identity is
+    /// the unique `stop` handle (pid / Ollama model), not the model name, so
+    /// two rows sharing a model name (same model served on two ports) don't
+    /// collapse onto each other.
     pub fn set_servers(&mut self, servers: Vec<ServerRow>) {
-        let selected_model = self.servers.get(self.server_selected).map(|r| r.model.clone());
+        let selected = self.servers.get(self.server_selected).map(|r| r.stop.clone());
         self.servers = servers;
-        self.server_selected = selected_model
-            .and_then(|m| self.servers.iter().position(|r| r.model == m))
+        self.server_selected = selected
+            .and_then(|h| self.servers.iter().position(|r| r.stop == h))
             .unwrap_or(0)
             .min(self.servers.len().saturating_sub(1));
     }
@@ -452,7 +454,6 @@ mod tests {
             openai_url: format!("http://127.0.0.1:{port}/v1/chat/completions"),
             ctx: Some(8192),
             started_at: Some(0),
-            size_bytes: None,
             stop: StopHandle::Pid(pid),
         }
     }
@@ -719,14 +720,15 @@ mod tests {
     }
 
     #[test]
-    fn set_servers_preserves_selection_by_model() {
+    fn set_servers_preserves_selection_by_handle() {
         let mut s = state();
         s.set_servers(vec![srv(10, "a", 8080), srv(20, "b", 8081)]);
         s.tab = Tab::Servers;
-        s.server_selected = 1; // model "b"
-        s.set_servers(vec![srv(20, "b", 8081)]); // model "a" dropped
+        s.server_selected = 1; // pid 20
+        s.set_servers(vec![srv(20, "b", 8081)]); // pid 10 dropped
+        // The cursor follows pid 20 to its new index, keyed on the stop handle.
         assert_eq!(s.server_selected, 0);
-        assert_eq!(s.selected_server().unwrap().model, "b");
+        assert_eq!(s.selected_server().unwrap().stop, StopHandle::Pid(20));
     }
 
     #[test]
