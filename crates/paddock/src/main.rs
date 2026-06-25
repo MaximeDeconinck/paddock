@@ -55,6 +55,14 @@ fn main() -> Result<()> {
             ctx,
             foreground,
         }) => serve_model(&app, &model, port, ctx, foreground, cli.json)?,
+        Some(Command::Ps) => {
+            let records = Registry::open_default().list_live(&RealSystemProbe);
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&records)?);
+            } else {
+                output::print_ps_table(&records);
+            }
+        }
         Some(Command::Sync {
             hf_limit,
             mlx_limit,

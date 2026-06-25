@@ -58,6 +58,8 @@ pub enum Command {
         #[arg(long, short = 'f')]
         foreground: bool,
     },
+    /// List running paddock servers
+    Ps,
     /// Refresh the model catalog
     Sync {
         /// Max Hugging Face GGUF repos to index
