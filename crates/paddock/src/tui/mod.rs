@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind};
 use paddock_core::catalog::db::Db;
-use paddock_core::runtime::{RunPlan, ServePlan};
+use paddock_core::runtime::RunPlan;
 use paddock_core::score::UseCase;
 use ratatui::DefaultTerminal;
 
@@ -21,7 +21,6 @@ use state::{Action, SyncStatus, TuiState};
 /// What to do after the terminal is restored.
 enum Exit {
     Run(RunPlan),
-    Serve(ServePlan),
 }
 
 pub fn run(app: App) -> Result<()> {
@@ -50,9 +49,11 @@ pub fn run(app: App) -> Result<()> {
         None
     };
 
+    let servers_rx = servers_task::spawn_servers_refresh();
+
     // ratatui 0.29 helpers: raw mode + alternate screen + panic hook.
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut state, &app, &db, &mut sync_rx);
+    let result = event_loop(&mut terminal, &mut state, &app, &db, &mut sync_rx, &servers_rx);
     ratatui::restore();
 
     // Launch AFTER restore so the child owns a clean tty. `launch` and
@@ -63,7 +64,6 @@ pub fn run(app: App) -> Result<()> {
             println!("$ {}", plan.display());
             crate::launch(plan)
         }
-        Some(Exit::Serve(plan)) => crate::serve_with_plan(plan, true),
         None => Ok(()),
     }
 }
@@ -74,6 +74,7 @@ fn event_loop(
     app: &App,
     db: &Db,
     sync_rx: &mut Option<std::sync::mpsc::Receiver<sync_task::SyncMsg>>,
+    servers_rx: &std::sync::mpsc::Receiver<Vec<paddock_core::serving::ServingRecord>>,
 ) -> Result<Option<Exit>> {
     use std::sync::mpsc::TryRecvError;
     use sync_task::SyncMsg;
@@ -104,6 +105,15 @@ fn event_loop(
             }
         }
 
+        // Drain servers snapshots (keep the most recent).
+        let mut latest = None;
+        while let Ok(snapshot) = servers_rx.try_recv() {
+            latest = Some(snapshot);
+        }
+        if let Some(snapshot) = latest {
+            state.set_servers(snapshot);
+        }
+
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
@@ -118,7 +128,23 @@ fn event_loop(
             Action::None => {}
             Action::Quit => return Ok(None),
             Action::Run(plan) => return Ok(Some(Exit::Run(plan))),
-            Action::Serve(plan) => return Ok(Some(Exit::Serve(plan))),
+            Action::Serve(plan) => {
+                // Suspend the TUI so serve_with_plan can print load/install
+                // progress (and prompt for install) on a clean terminal, then
+                // resume. Detached: the server keeps running in the background.
+                ratatui::restore();
+                let res = crate::serve_with_plan(plan, false);
+                *terminal = ratatui::init();
+                if let Err(e) = res {
+                    state.last_error = Some(e.to_string());
+                }
+                state.tab = state::Tab::Servers;
+                // Immediate refresh so the new server shows without waiting for
+                // the next background tick (it already passed readiness).
+                let snapshot = paddock_core::serving::Registry::open_default()
+                    .list_live(&paddock_core::hardware::RealSystemProbe);
+                state.set_servers(snapshot);
+            }
             Action::Rescore(uc) => {
                 let rows = app.scored_models(db, uc, false)?;
                 state.set_rows(rows, uc);
@@ -131,8 +157,15 @@ fn event_loop(
                     ));
                 }
             }
-            // Inert until the Servers-tab actions are wired in a later task.
-            Action::StopServer(_) | Action::CopyEndpoint(_) => {}
+            Action::StopServer(pid) => {
+                paddock_core::serving::terminate(pid);
+                let _ = paddock_core::serving::Registry::open_default().unregister(pid);
+                state.servers.retain(|r| r.pid != pid);
+                state.server_selected = state
+                    .server_selected
+                    .min(state.servers.len().saturating_sub(1));
+            }
+            Action::CopyEndpoint(url) => crate::clipboard::copy_to_clipboard(&url),
         }
     }
 }
