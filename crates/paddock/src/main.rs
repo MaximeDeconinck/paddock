@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod clipboard;
 mod output;
 mod tray;
 mod tui;

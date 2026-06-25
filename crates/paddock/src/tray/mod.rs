@@ -76,7 +76,7 @@ mod macos {
                     next_refresh = Instant::now() + REFRESH_EVERY;
                 }
                 Event::UserEvent(UserEvent::Menu(e)) => match actions.get(e.id()) {
-                    Some(Action::Copy(url)) => copy_to_clipboard(url),
+                    Some(Action::Copy(url)) => crate::clipboard::copy_to_clipboard(url),
                     Some(Action::Refresh) => {
                         refresh_into(tray.as_ref(), &mut actions, &runtimes, &mut prev_model);
                         next_refresh = Instant::now() + REFRESH_EVERY;
@@ -154,13 +154,6 @@ mod macos {
         actions.insert(quit.id().clone(), Action::Quit);
         append(&quit);
         (menu, actions)
-    }
-
-    fn copy_to_clipboard(text: &str) {
-        let res = arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string()));
-        if let Err(e) = res {
-            eprintln!("could not copy to clipboard: {e}");
-        }
     }
 
     /// 22×22 monochrome "P" glyph, black + alpha. Rendered as a template
