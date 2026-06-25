@@ -166,6 +166,16 @@ impl TuiState {
             .min(self.servers.len().saturating_sub(1));
     }
 
+    /// Drop the server with `pid` from the snapshot and clamp the cursor.
+    /// Used for the optimistic update after a stop, before the next background
+    /// refresh reconciles.
+    pub fn remove_server(&mut self, pid: u32) {
+        self.servers.retain(|r| r.pid != pid);
+        self.server_selected = self
+            .server_selected
+            .min(self.servers.len().saturating_sub(1));
+    }
+
     pub fn selected_server(&self) -> Option<&ServingRecord> {
         self.servers.get(self.server_selected)
     }
@@ -726,6 +736,25 @@ mod tests {
             }
             other => panic!("expected CopyEndpoint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn remove_server_drops_and_clamps() {
+        let mut s = state();
+        s.set_servers(vec![srv(1, "a", 8080), srv(2, "b", 8081), srv(3, "c", 8082)]);
+        s.tab = Tab::Servers;
+        s.server_selected = 2; // pid 3 (last)
+        s.remove_server(3);
+        assert_eq!(s.servers.len(), 2);
+        assert_eq!(s.server_selected, 1); // clamped from 2 to last valid index
+    }
+
+    #[test]
+    fn remove_server_of_unknown_pid_is_noop() {
+        let mut s = state();
+        s.set_servers(vec![srv(1, "a", 8080)]);
+        s.remove_server(999);
+        assert_eq!(s.servers.len(), 1);
     }
 
     #[test]

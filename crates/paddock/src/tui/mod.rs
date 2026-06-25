@@ -139,8 +139,9 @@ fn event_loop(
                     state.last_error = Some(e.to_string());
                 }
                 state.tab = state::Tab::Servers;
-                // Immediate refresh so the new server shows without waiting for
-                // the next background tick (it already passed readiness).
+                // Immediate refresh so a newly spawned llama.cpp/mlx server shows
+                // without waiting for the next background tick. (Ollama models are
+                // not tracked here; they appear via `ollama ps`.)
                 let snapshot = paddock_core::serving::Registry::open_default()
                     .list_live(&paddock_core::hardware::RealSystemProbe);
                 state.set_servers(snapshot);
@@ -160,10 +161,7 @@ fn event_loop(
             Action::StopServer(pid) => {
                 paddock_core::serving::terminate(pid);
                 let _ = paddock_core::serving::Registry::open_default().unregister(pid);
-                state.servers.retain(|r| r.pid != pid);
-                state.server_selected = state
-                    .server_selected
-                    .min(state.servers.len().saturating_sub(1));
+                state.remove_server(pid);
             }
             Action::CopyEndpoint(url) => crate::clipboard::copy_to_clipboard(&url),
         }
