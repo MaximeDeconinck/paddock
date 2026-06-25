@@ -8,17 +8,18 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
 use paddock_core::hardware::RealSystemProbe;
-use paddock_core::serving::{Registry, ServingRecord};
+use paddock_core::serving::{Registry, ServerRow};
 
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 
 /// Spawn the periodic refresh. The receiver yields a fresh snapshot roughly
 /// every 2s until the TUI drops it.
-pub fn spawn_servers_refresh() -> Receiver<Vec<ServingRecord>> {
+pub fn spawn_servers_refresh() -> Receiver<Vec<ServerRow>> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         loop {
-            let snapshot = Registry::open_default().list_live(&RealSystemProbe);
+            let snapshot =
+                paddock_core::serving::list_all_servers(&Registry::open_default(), &RealSystemProbe);
             if tx.send(snapshot).is_err() {
                 break; // receiver dropped — TUI exited
             }

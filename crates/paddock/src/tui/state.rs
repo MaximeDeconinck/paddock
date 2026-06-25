@@ -5,7 +5,7 @@ use paddock_core::estimate::{MemoryBudget, resolve_ctx};
 use paddock_core::hardware::RuntimesStatus;
 use paddock_core::runtime::{RunPlan, ServePlan, plan_run, plan_serve};
 use paddock_core::score::UseCase;
-use paddock_core::serving::ServingRecord;
+use paddock_core::serving::{ServerRow, StopHandle};
 
 use crate::app::ScoredModel;
 
@@ -66,8 +66,9 @@ pub enum Action {
     Rescore(UseCase),
     /// Kick off a background catalog sync (the event loop owns the thread).
     StartSync,
-    /// Stop the server with this pid (SIGTERM + unregister), then refresh.
-    StopServer(u32),
+    /// Stop the selected server (SIGTERM + unregister, or `ollama stop`),
+    /// then refresh.
+    StopServer(StopHandle),
     /// Copy this endpoint URL to the system clipboard.
     CopyEndpoint(String),
 }
@@ -105,7 +106,7 @@ pub struct TuiState {
     /// Active top-level tab. Search/Detail overlays only apply on `Models`.
     pub tab: Tab,
     /// Live servers shown on the Servers tab; refreshed by the background task.
-    pub servers: Vec<ServingRecord>,
+    pub servers: Vec<ServerRow>,
     /// Cursor within `servers`.
     pub server_selected: usize,
 }
@@ -164,28 +165,30 @@ impl TuiState {
             .min(self.rows.len().saturating_sub(1));
     }
 
-    /// Replace the servers snapshot, keeping the cursor on the same pid when it
-    /// survives the refresh, otherwise clamping to the new length.
-    pub fn set_servers(&mut self, servers: Vec<ServingRecord>) {
-        let selected_pid = self.servers.get(self.server_selected).map(|r| r.pid);
+    /// Replace the servers snapshot, keeping the cursor on the same model when
+    /// it survives the refresh, otherwise clamping to the new length. (Ollama
+    /// rows have no pid, so identity is the model name.)
+    pub fn set_servers(&mut self, servers: Vec<ServerRow>) {
+        let selected_model = self.servers.get(self.server_selected).map(|r| r.model.clone());
         self.servers = servers;
-        self.server_selected = selected_pid
-            .and_then(|pid| self.servers.iter().position(|r| r.pid == pid))
+        self.server_selected = selected_model
+            .and_then(|m| self.servers.iter().position(|r| r.model == m))
             .unwrap_or(0)
             .min(self.servers.len().saturating_sub(1));
     }
 
-    /// Drop the server with `pid` from the snapshot and clamp the cursor.
-    /// Used for the optimistic update after a stop, before the next background
-    /// refresh reconciles.
-    pub fn remove_server(&mut self, pid: u32) {
-        self.servers.retain(|r| r.pid != pid);
+    /// Drop the currently-selected server row (optimistic update after a stop;
+    /// the next background refresh reconciles) and clamp the cursor.
+    pub fn remove_selected(&mut self) {
+        if self.server_selected < self.servers.len() {
+            self.servers.remove(self.server_selected);
+        }
         self.server_selected = self
             .server_selected
             .min(self.servers.len().saturating_sub(1));
     }
 
-    pub fn selected_server(&self) -> Option<&ServingRecord> {
+    pub fn selected_server(&self) -> Option<&ServerRow> {
         self.servers.get(self.server_selected)
     }
 
@@ -283,7 +286,7 @@ impl TuiState {
                         }
                         K::Char('x') => {
                             if let Some(r) = self.selected_server() {
-                                return Action::StopServer(r.pid);
+                                return Action::StopServer(r.stop.clone());
                             }
                         }
                         K::Char('c') => {
@@ -439,20 +442,18 @@ mod tests {
         row
     }
 
-    use paddock_core::serving::ServingRecord;
+    use paddock_core::serving::{ServerRow, StopHandle};
 
-    fn srv(pid: u32, model: &str, port: u16) -> ServingRecord {
-        ServingRecord {
-            pid,
+    fn srv(pid: u32, model: &str, port: u16) -> ServerRow {
+        ServerRow {
+            model: model.into(),
             runtime: RuntimeKind::LlamaCpp,
             endpoint: format!("http://127.0.0.1:{port}"),
             openai_url: format!("http://127.0.0.1:{port}/v1/chat/completions"),
-            model_ref: model.into(),
-            ready_path: "/health".into(),
-            started_at: 0,
-            ctx: 8192,
-            log_path: None,
-            port: Some(port),
+            ctx: Some(8192),
+            started_at: Some(0),
+            size_bytes: None,
+            stop: StopHandle::Pid(pid),
         }
     }
 
@@ -718,14 +719,14 @@ mod tests {
     }
 
     #[test]
-    fn set_servers_preserves_selection_by_pid() {
+    fn set_servers_preserves_selection_by_model() {
         let mut s = state();
         s.set_servers(vec![srv(10, "a", 8080), srv(20, "b", 8081)]);
         s.tab = Tab::Servers;
-        s.server_selected = 1; // pid 20
-        s.set_servers(vec![srv(20, "b", 8081)]); // pid 10 dropped
+        s.server_selected = 1; // model "b"
+        s.set_servers(vec![srv(20, "b", 8081)]); // model "a" dropped
         assert_eq!(s.server_selected, 0);
-        assert_eq!(s.selected_server().unwrap().pid, 20);
+        assert_eq!(s.selected_server().unwrap().model, "b");
     }
 
     #[test]
@@ -748,7 +749,7 @@ mod tests {
         s.set_servers(vec![srv(42, "qwen", 8080)]);
         s.tab = Tab::Servers;
         match s.handle_key(key(KeyCode::Char('x'))) {
-            Action::StopServer(pid) => assert_eq!(pid, 42),
+            Action::StopServer(h) => assert_eq!(h, StopHandle::Pid(42)),
             other => panic!("expected StopServer, got {other:?}"),
         }
     }
@@ -767,22 +768,24 @@ mod tests {
     }
 
     #[test]
-    fn remove_server_drops_and_clamps() {
+    fn remove_selected_drops_and_clamps() {
         let mut s = state();
         s.set_servers(vec![srv(1, "a", 8080), srv(2, "b", 8081), srv(3, "c", 8082)]);
         s.tab = Tab::Servers;
-        s.server_selected = 2; // pid 3 (last)
-        s.remove_server(3);
+        s.server_selected = 2; // last (model "c")
+        s.remove_selected();
         assert_eq!(s.servers.len(), 2);
         assert_eq!(s.server_selected, 1); // clamped from 2 to last valid index
+        // The dropped row is gone.
+        assert!(s.servers.iter().all(|r| r.model != "c"));
     }
 
     #[test]
-    fn remove_server_of_unknown_pid_is_noop() {
+    fn remove_selected_on_empty_is_noop() {
         let mut s = state();
-        s.set_servers(vec![srv(1, "a", 8080)]);
-        s.remove_server(999);
-        assert_eq!(s.servers.len(), 1);
+        s.remove_selected();
+        assert_eq!(s.servers.len(), 0);
+        assert_eq!(s.server_selected, 0);
     }
 
     #[test]

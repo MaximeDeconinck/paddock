@@ -221,6 +221,65 @@ pub fn ollama_loaded_models(probe: &dyn SystemProbe) -> Option<Vec<LoadedModel>>
     )
 }
 
+/// How to stop a running server shown in a UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopHandle {
+    /// A paddock-spawned child: SIGTERM the pid then unregister.
+    Pid(u32),
+    /// An Ollama-loaded model: `ollama stop <model>` (the daemon keeps running).
+    OllamaModel(String),
+}
+
+/// A unified "running server" row for UIs: paddock-spawned servers from the
+/// registry plus Ollama-loaded models from `/api/ps`. Fields that don't apply
+/// to a source are `None` (Ollama has no ctx/start-time/pid; paddock-spawned
+/// has no size).
+#[derive(Debug, Clone)]
+pub struct ServerRow {
+    pub model: String,
+    pub runtime: RuntimeKind,
+    pub endpoint: String,
+    pub openai_url: String,
+    pub ctx: Option<u32>,
+    pub started_at: Option<i64>,
+    pub size_bytes: Option<u64>,
+    pub stop: StopHandle,
+}
+
+/// All running servers a UI should show: paddock-spawned (llama.cpp/mlx) from
+/// `registry.list_live`, followed by Ollama-loaded models from `/api/ps`.
+pub fn list_all_servers(registry: &Registry, probe: &dyn SystemProbe) -> Vec<ServerRow> {
+    let mut rows: Vec<ServerRow> = registry
+        .list_live(probe)
+        .into_iter()
+        .map(|r| ServerRow {
+            model: r.model_ref,
+            runtime: r.runtime,
+            endpoint: r.endpoint,
+            openai_url: r.openai_url,
+            ctx: Some(r.ctx),
+            started_at: Some(r.started_at),
+            size_bytes: None,
+            stop: StopHandle::Pid(r.pid),
+        })
+        .collect();
+    if let Some(models) = ollama_loaded_models(probe) {
+        for m in models {
+            rows.push(ServerRow {
+                model: m.name.clone(),
+                runtime: RuntimeKind::Ollama,
+                endpoint: "http://127.0.0.1:11434".to_string(),
+                openai_url: "http://127.0.0.1:11434/v1/chat/completions".to_string(),
+                ctx: None,
+                started_at: None,
+                size_bytes: Some(m.size_bytes),
+                stop: StopHandle::OllamaModel(m.name),
+            });
+        }
+    }
+    rows
+}
+
 const OLLAMA_GENERATE_URL: &str = "http://127.0.0.1:11434/api/generate";
 /// How long a freshly served model stays loaded without traffic. Long enough
 /// to bridge the gap between `paddock serve` and the user's first request.
@@ -405,6 +464,38 @@ mod tests {
     #[test]
     fn ollama_ps_unreachable_is_none() {
         assert!(ollama_loaded_models(&MockProbe::default()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod list_all_tests {
+    use super::*;
+    use crate::hardware::MockProbe;
+
+    #[test]
+    fn merges_ollama_loaded_models() {
+        let dir = std::env::temp_dir().join(format!("paddock-test-{}", std::process::id()));
+        let registry = Registry::at(&dir); // empty registry (no files)
+        let mut probe = MockProbe::default();
+        probe.http.insert(
+            "http://127.0.0.1:11434/api/ps".to_string(),
+            r#"{"models":[{"name":"gemma:12b","size":18000000000}]}"#.to_string(),
+        );
+        let rows = list_all_servers(&registry, &probe);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "gemma:12b");
+        assert_eq!(rows[0].runtime, RuntimeKind::Ollama);
+        assert_eq!(rows[0].ctx, None);
+        assert_eq!(rows[0].stop, StopHandle::OllamaModel("gemma:12b".to_string()));
+        assert_eq!(rows[0].endpoint, "http://127.0.0.1:11434");
+    }
+
+    #[test]
+    fn empty_when_nothing_running() {
+        let dir = std::env::temp_dir().join(format!("paddock-test-empty-{}", std::process::id()));
+        let registry = Registry::at(&dir);
+        let probe = MockProbe::default(); // no /api/ps fixture -> ollama_loaded_models None
+        assert!(list_all_servers(&registry, &probe).is_empty());
     }
 }
 

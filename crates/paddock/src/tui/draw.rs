@@ -219,13 +219,21 @@ fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
     let header = Row::new(["MODEL", "RUNTIME", "ENDPOINT", "CTX", "UPTIME", "PID"])
         .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
     let rows = state.servers.iter().map(|r| {
+        let pid = match &r.stop {
+            paddock_core::serving::StopHandle::Pid(p) => p.to_string(),
+            _ => "—".into(),
+        };
         Row::new(vec![
-            Cell::from(crate::output::truncate(&r.model_ref, 28)),
+            Cell::from(crate::output::truncate(&r.model, 28)),
             Cell::from(crate::output::runtime_label(r.runtime)),
             Cell::from(crate::output::truncate(&r.endpoint, 26)),
-            Cell::from(r.ctx.to_string()),
-            Cell::from(crate::output::uptime_label(r.started_at)),
-            Cell::from(r.pid.to_string()),
+            Cell::from(r.ctx.map(|c| c.to_string()).unwrap_or_else(|| "—".into())),
+            Cell::from(
+                r.started_at
+                    .map(crate::output::uptime_label)
+                    .unwrap_or_else(|| "—".into()),
+            ),
+            Cell::from(pid),
         ])
         .style(Style::new().fg(Color::Gray))
     });

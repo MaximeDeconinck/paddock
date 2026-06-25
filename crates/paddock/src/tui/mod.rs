@@ -79,7 +79,7 @@ fn event_loop(
     app: &App,
     db: &Db,
     sync_rx: &mut Option<std::sync::mpsc::Receiver<sync_task::SyncMsg>>,
-    servers_rx: &std::sync::mpsc::Receiver<Vec<paddock_core::serving::ServingRecord>>,
+    servers_rx: &std::sync::mpsc::Receiver<Vec<paddock_core::serving::ServerRow>>,
 ) -> Result<Option<Exit>> {
     use std::sync::mpsc::TryRecvError;
     use sync_task::SyncMsg;
@@ -147,8 +147,10 @@ fn event_loop(
                 // Immediate refresh so a newly spawned llama.cpp/mlx server shows
                 // without waiting for the next background tick. (Ollama models are
                 // not tracked here; they appear via `ollama ps`.)
-                let snapshot = paddock_core::serving::Registry::open_default()
-                    .list_live(&paddock_core::hardware::RealSystemProbe);
+                let snapshot = paddock_core::serving::list_all_servers(
+                    &paddock_core::serving::Registry::open_default(),
+                    &paddock_core::hardware::RealSystemProbe,
+                );
                 state.set_servers(snapshot);
             }
             Action::Rescore(uc) => {
@@ -163,10 +165,22 @@ fn event_loop(
                     ));
                 }
             }
-            Action::StopServer(pid) => {
-                paddock_core::serving::terminate(pid);
-                let _ = paddock_core::serving::Registry::open_default().unregister(pid);
-                state.remove_server(pid);
+            Action::StopServer(handle) => {
+                use paddock_core::serving::{Registry, StopHandle, terminate};
+                match handle {
+                    StopHandle::Pid(pid) => {
+                        terminate(pid);
+                        let _ = Registry::open_default().unregister(pid);
+                    }
+                    StopHandle::OllamaModel(model) => {
+                        // Unload the model from the daemon; capture output so it
+                        // doesn't corrupt the TUI screen (we're in raw mode).
+                        let _ = std::process::Command::new("ollama")
+                            .args(["stop", &model])
+                            .output();
+                    }
+                }
+                state.remove_selected();
             }
             Action::CopyEndpoint(url) => crate::clipboard::copy_to_clipboard(&url),
         }
