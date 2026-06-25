@@ -194,6 +194,15 @@ impl TuiState {
         self.servers.get(self.server_selected)
     }
 
+    /// Close the Detail overlay back to the List view, clearing its cached
+    /// plans. Used both by the Detail dismiss keys and when serving from Detail
+    /// (the serve switches to the Servers tab, so the popup must not linger).
+    pub fn close_detail(&mut self) {
+        self.mode = Mode::List;
+        self.detail_plan = None;
+        self.detail_serve_plan = None;
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         use KeyCode as K;
         self.last_error = None;
@@ -230,11 +239,7 @@ impl TuiState {
                 _ => {}
             },
             Mode::Detail => match key.code {
-                K::Esc | K::Char('q') | K::Enter => {
-                    self.mode = Mode::List;
-                    self.detail_plan = None;
-                    self.detail_serve_plan = None;
-                }
+                K::Esc | K::Char('q') | K::Enter => self.close_detail(),
                 K::Char('x') => return self.run_selected(),
                 K::Char('s') => return self.serve_selected(),
                 _ => {}
@@ -367,7 +372,12 @@ impl TuiState {
     /// footer, never crash the TUI.
     fn serve_selected(&mut self) -> Action {
         match self.serve_plan_for_selected() {
-            Some(Ok(plan)) => Action::Serve(plan),
+            Some(Ok(plan)) => {
+                // Serving switches to the Servers tab, so a Detail popup opened
+                // on this row must not linger over it.
+                self.close_detail();
+                Action::Serve(plan)
+            }
             Some(Err(e)) => {
                 self.last_error = Some(e);
                 Action::None
@@ -806,5 +816,17 @@ mod tests {
         let mut s = state();
         s.tab = Tab::Servers;
         assert!(matches!(s.handle_key(key(KeyCode::Char('x'))), Action::None));
+    }
+
+    #[test]
+    fn serving_from_detail_closes_the_popup() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Enter)); // open Detail on the selected model
+        assert_eq!(s.mode, Mode::Detail);
+        let action = s.handle_key(key(KeyCode::Char('s'))); // serve from Detail
+        assert!(matches!(action, Action::Serve(_)));
+        assert_eq!(s.mode, Mode::List, "Detail popup must close when serving");
+        assert!(s.detail_plan.is_none());
+        assert!(s.detail_serve_plan.is_none());
     }
 }
