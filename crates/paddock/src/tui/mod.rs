@@ -2,6 +2,7 @@
 //! all rendering in `draw` — this module only wires them to the terminal.
 
 mod draw;
+mod servers_task;
 mod state;
 mod sync_task;
 
