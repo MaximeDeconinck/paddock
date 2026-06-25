@@ -224,7 +224,10 @@ fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
             _ => "—".into(),
         };
         Row::new(vec![
-            Cell::from(crate::output::truncate(&r.model, 28)),
+            // MODEL is the flexible `Min` column: don't pre-truncate, let the
+            // table widget clip to whatever width is left (full names show on a
+            // wide terminal).
+            Cell::from(r.model.clone()),
             Cell::from(crate::output::runtime_label(r.runtime)),
             Cell::from(crate::output::truncate(&r.endpoint, 26)),
             Cell::from(r.ctx.map(|c| c.to_string()).unwrap_or_else(|| "—".into())),
