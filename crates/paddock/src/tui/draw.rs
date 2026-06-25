@@ -55,30 +55,6 @@ const WORDMARK: [&str; 5] = [
 const WORDMARK_WIDTH: u16 = 57;
 
 fn draw_header(frame: &mut Frame, area: Rect, p: &HardwareProfile, tab: Tab) {
-    // Active-tab indicator, top-right corner above the machine box.
-    let (models_style, servers_style) = match tab {
-        Tab::Models => (
-            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-            Style::new().fg(Color::DarkGray),
-        ),
-        Tab::Servers => (
-            Style::new().fg(Color::DarkGray),
-            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-        ),
-    };
-    let tabs = Line::from(vec![
-        Span::styled("models", models_style),
-        Span::styled("  ", Style::new()),
-        Span::styled("servers", servers_style),
-    ]);
-    let tab_row = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: 1,
-    };
-    frame.render_widget(Paragraph::new(tabs).alignment(Alignment::Right), tab_row);
-
     // Wide terminals: wordmark on the left, machine box to its right.
     // Narrow ones: machine box only (it carries the " paddock " title then).
     let min_box_width = 46;
@@ -100,10 +76,10 @@ fn draw_header(frame: &mut Frame, area: Rect, p: &HardwareProfile, tab: Tab) {
         );
         frame.render_widget(Paragraph::new(mark), m);
     }
-    draw_machine_box(frame, box_area, p, mark_area.is_none());
+    draw_machine_box(frame, box_area, p, mark_area.is_none(), tab);
 }
 
-fn draw_machine_box(frame: &mut Frame, area: Rect, p: &HardwareProfile, titled: bool) {
+fn draw_machine_box(frame: &mut Frame, area: Rect, p: &HardwareProfile, titled: bool, tab: Tab) {
     let label = |s: &str| Span::styled(format!("{s:<11}"), Style::new().fg(Color::DarkGray));
     let value = |s: String| Span::styled(s, Style::new().fg(Color::Gray));
     let gpu_line = match p.gpu.metal_limit_bytes {
@@ -146,12 +122,33 @@ fn draw_machine_box(frame: &mut Frame, area: Rect, p: &HardwareProfile, titled: 
         Line::from(vec![label("bandwidth"), value(bandwidth)]),
         Line::from(vec![label("runtimes"), value(runtimes)]),
     ];
-    let mut block = Block::bordered().border_style(Style::new().fg(Color::DarkGray));
+    let tab_span = |name: &str, active: bool| {
+        if active {
+            Span::styled(
+                format!("[{name}]"),
+                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!(" {name} "), Style::new().fg(Color::DarkGray))
+        }
+    };
+    let tabs_title = Line::from(vec![
+        Span::raw(" "),
+        tab_span("models", tab == Tab::Models),
+        tab_span("servers", tab == Tab::Servers),
+        Span::raw(" "),
+    ]);
+    let mut block = Block::bordered()
+        .border_style(Style::new().fg(Color::DarkGray))
+        .title(tabs_title);
     if titled {
-        block = block.title(Span::styled(
-            " paddock ",
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ));
+        block = block.title(
+            Line::from(Span::styled(
+                " paddock ",
+                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ))
+            .right_aligned(),
+        );
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
