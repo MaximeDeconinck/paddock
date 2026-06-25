@@ -33,7 +33,7 @@ A Homebrew formula is coming. Requires macOS on Apple Silicon (M1 or later).
 
 Running `paddock` with no arguments opens the interactive TUI. It opens instantly against the last catalog snapshot and refreshes in the background when that snapshot is more than 24h old (or empty): a spinner shows in the footer while the refresh runs, the list stays fully usable, and it swaps in the new catalog atomically when done (keeping your selection and search). Press `R` to force a refresh on demand. The blocking `paddock sync` command below is still there for scripts and cron.
 
-Six subcommands cover everything scriptable:
+Nine subcommands cover everything scriptable:
 
 ### `paddock scan`: what is this machine?
 
@@ -127,12 +127,50 @@ try it      curl -s http://127.0.0.1:11434/v1/chat/completions \
               -d '{"model":"llama3.2:1b","messages":[{"role":"user","content":"hello"}]}'
 ```
 
+By default `serve` runs detached: paddock spawns the server in the background, waits until it answers its readiness check, prints the endpoint, and returns to your shell. No dedicated terminal stays open. The server keeps running, and paddock records it in a registry so `paddock ps`, `paddock stop`, and `paddock logs` (below) can find it later:
+
+```text
+$ paddock serve qwen3-8b
+…
+endpoint    http://127.0.0.1:8080
+serving in background · pid 51234 · paddock logs qwen3-8b
+```
+
+Pass `--foreground` (`-f`) to keep the old attached behavior instead: paddock stays in the foreground, streams the server's logs to your terminal, and **Ctrl-C stops the server**.
+
 The lifecycle depends on the runtime:
 
-- **Ollama models** reuse the daemon: if it's already running, paddock pulls the model, prints the endpoint and exits; the daemon keeps serving in the background on its fixed port 11434. If paddock had to start it (`ollama serve` cold start), paddock stays attached and **Ctrl-C stops it**.
-- **llama.cpp / mlx-lm models** spawn a foreground server (`llama-server -hf …` / `mlx_lm.server --model …`), wait until it answers its readiness check, print the endpoint, and stay attached; **Ctrl-C stops the server**. llama-server may download the model first; paddock waits through that. llama.cpp commands pin `--ctx-size` to the same 8k context used by the fit verdict (the model-default context can be far larger (262k on some models) and OOM), overridable with `--ctx <tokens>`, and skip vision projectors with `--no-mmproj` (text-only v0.1).
+- **Ollama models** reuse the daemon: paddock pulls the model, prints the endpoint, and the daemon keeps serving in the background on its fixed port 11434. Ollama-loaded models are managed by `ollama ps` / `ollama stop`, not paddock's lifecycle commands. (In `--foreground`, if paddock had to cold-start `ollama serve`, Ctrl-C stops that daemon.)
+- **llama.cpp / mlx-lm models** spawn a server (`llama-server -hf …` / `mlx_lm.server --model …`) that paddock owns. By default it runs detached (logs go to a file you can read with `paddock logs`); with `--foreground` it stays attached and Ctrl-C stops it. llama-server may download the model first; paddock waits through that. llama.cpp commands skip vision projectors with `--no-mmproj` (text-only v0.1).
 
-`--port <N>` picks the port for foreground servers (default 8080). The Ollama daemon's port is fixed, so `--port` is ignored there with a warning. `--ctx <tokens>` raises the context window for llama.cpp servers (default 8k); bump it when requests exceed the window (`request (N tokens) exceeds the available context size`). Ollama and MLX manage their own context, so `--ctx` does not apply to them. `--json` prints the full serve plan (argv, endpoint, pre-steps) without spawning or pulling anything.
+Context auto-sizes by default. For llama.cpp, paddock picks the largest context window that fits this machine's memory budget rather than the model default (which can be far larger, 262k on some models, and OOM), which is what prevents `request (N tokens) exceeds the available context size` errors. Override it with `--ctx <tokens>`. Ollama and MLX manage their own context, so `--ctx` is llama.cpp-only.
+
+`--port <N>` picks the port for llama.cpp / mlx servers (default 8080). The Ollama daemon's port is fixed, so `--port` is ignored there with a warning. `--json` prints the full serve plan (argv, endpoint, pre-steps) without spawning or pulling anything.
+
+### `paddock ps`, `paddock stop`, `paddock logs`: manage running servers
+
+These cover the llama.cpp / mlx servers paddock spawned (Ollama-loaded models are managed by `ollama ps` / `ollama stop`).
+
+`paddock ps` lists what's running, one row per server:
+
+```text
+$ paddock ps
+MODEL          RUNTIME    ENDPOINT                CTX   UPTIME   PID
+qwen3-8b       llama.cpp  http://127.0.0.1:8080  32768     2m    51234
+```
+
+`--json` emits the same data machine-readable for scripts.
+
+`paddock stop <target>` stops a server by model name, pid, or `all`:
+
+```text
+$ paddock stop qwen3-8b
+stopped qwen3-8b (pid 51234)
+```
+
+`stop all` asks for confirmation before stopping everything; `-y` (`--yes`) skips the prompt.
+
+`paddock logs <target>` prints a detached server's log (by model name or pid). Pass `-f` (`--follow`) to follow it live, like `tail -f`.
 
 Some Hugging Face repos ship their vision projector as a separate `mmproj-*.gguf` file (Unsloth's Qwen3.6 uploads, for example). Ollama cannot import those repos via `hf.co/…` ([ollama/ollama#15447](https://github.com/ollama/ollama/issues/15447)); it would download the full weights and then fail. paddock detects the `mmproj` file at sync time, marks every variant of the repo llama.cpp-only, and serves it with `llama-server` (or proposes `brew install llama.cpp`) even when Ollama is installed and running. Run `paddock sync` to refresh these compatibility flags.
 
