@@ -63,6 +63,7 @@ fn main() -> Result<()> {
                 output::print_ps_table(&records);
             }
         }
+        Some(Command::Stop { target, yes }) => stop_servers(&target, yes)?,
         Some(Command::Sync {
             hf_limit,
             mlx_limit,
@@ -459,6 +460,64 @@ fn spawn_detached(argv: &[String], log_path: &std::path::Path) -> Result<std::pr
     }
     cmd.spawn()
         .map_err(|e| anyhow::anyhow!("failed to start {}: {e}. Is it in PATH?", argv[0]))
+}
+
+fn stop_servers(target: &str, yes: bool) -> Result<()> {
+    use paddock_core::catalog::RuntimeKind;
+    use paddock_core::serving::{RecordMatch, match_records, terminate};
+
+    let registry = Registry::open_default();
+    let records = registry.list_live(&RealSystemProbe);
+    let chosen = match match_records(&records, target) {
+        RecordMatch::Matched(v) => v,
+        RecordMatch::Ambiguous(cands) => {
+            eprintln!("`{target}` matches several servers — be specific:");
+            for r in cands {
+                eprintln!("  {} (pid {})", r.model_ref, r.pid);
+            }
+            std::process::exit(1);
+        }
+        RecordMatch::NotFound => {
+            eprintln!("no running server matches `{target}`");
+            if !records.is_empty() {
+                eprintln!(
+                    "running: {}",
+                    records
+                        .iter()
+                        .map(|r| r.model_ref.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            std::process::exit(1);
+        }
+    };
+
+    if target == "all" && !yes {
+        eprintln!("about to stop {} server(s):", chosen.len());
+        for r in &chosen {
+            eprintln!("  {} (pid {})", r.model_ref, r.pid);
+        }
+        eprint!("proceed? [y/N] ");
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        if !matches!(line.trim(), "y" | "Y") {
+            eprintln!("aborted");
+            return Ok(());
+        }
+    }
+
+    for r in chosen {
+        if r.runtime == RuntimeKind::Ollama {
+            let _ = run_checked(&["ollama".into(), "stop".into(), r.model_ref.clone()]);
+        } else {
+            terminate(r.pid);
+        }
+        let _ = registry.unregister(r.pid);
+        println!("stopped {} (pid {})", r.model_ref, r.pid);
+    }
+    Ok(())
 }
 
 /// Run a pre-step to completion (stdout/stderr inherited — progress streams

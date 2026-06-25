@@ -60,6 +60,14 @@ pub enum Command {
     },
     /// List running paddock servers
     Ps,
+    /// Stop a running server (by model name, pid, or `all`)
+    Stop {
+        /// Target: model name substring, a pid, or `all`
+        target: String,
+        /// Skip the confirmation prompt for `all`
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Refresh the model catalog
     Sync {
         /// Max Hugging Face GGUF repos to index

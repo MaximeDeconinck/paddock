@@ -166,3 +166,9 @@ fn recommend_json_is_array_max_5() {
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert!(v.as_array().unwrap().len() <= 5);
 }
+
+#[test]
+fn stop_unknown_target_errors() {
+    let (mut cmd, _dir) = paddock();
+    cmd.args(["stop", "nope"]).assert().failure();
+}
