@@ -140,9 +140,23 @@ async fn fetch_hf_repo(
         .get_json(&format!("{HF_API}/models/{repo}?blobs=true"))
         .await?;
     let gguf = &detail["gguf"];
-    let mut architecture = gguf["architecture"].as_str().map(String::from);
+    // HF's `gguf` summary sometimes describes an auxiliary file (e.g. the CLIP
+    // mmproj vision projector) rather than the main model, reporting a bogus
+    // architecture ("clip") and a tiny `total`. Don't trust a projector arch.
+    let mut architecture = gguf["architecture"]
+        .as_str()
+        .filter(|a| *a != "clip")
+        .map(String::from);
     let mut context_max = gguf["context_length"].as_u64().unwrap_or(0) as u32;
-    let params_total = gguf["total"].as_u64().unwrap_or(0);
+    // Same projector pollution can make `total` far too small (an mmproj is
+    // ~0.5B for a 27B model). Trust the name-derived count when it dwarfs HF's.
+    let gguf_total = gguf["total"].as_u64().unwrap_or(0);
+    let name_params = params_from_name(repo).unwrap_or(0);
+    let params_total = if name_params > gguf_total.saturating_mul(2) {
+        name_params
+    } else {
+        gguf_total
+    };
 
     // Collect GGUF files with a recognizable quant.
     let mut files: Vec<(String, String, u64)> = Vec::new(); // (filename, quant, size)
@@ -553,6 +567,43 @@ mod tests {
         // Detail JSON without createdAt → no release date.
         assert_eq!(m.released_at, None);
         assert!(!m.released_approx);
+    }
+
+    #[tokio::test]
+    async fn mmproj_projector_does_not_shrink_params() {
+        // HF's `gguf` summary for this repo describes the mmproj projector:
+        // architecture "clip", total ~0.46B. The 27B name must win so weights
+        // aren't computed as 0.5 GiB. (Jackrong/Qwopus3.6-27B-v2-MTP-GGUF)
+        let repo = "Jackrong/Qwopus3.6-27B-v2-MTP-GGUF";
+        let detail_url = format!("{HF_API}/models/{repo}?blobs=true");
+        let list_url = format!("{HF_API}/models?filter=gguf&sort=downloads&limit=1");
+        let range_url =
+            format!("https://huggingface.co/{repo}/resolve/main/Qwopus3.6-27B-v2-MTP-Q8_0.gguf");
+
+        let http = MockHttp::new()
+            .add_json(&list_url, json!([{"id": repo}]))
+            .add_json(
+                &detail_url,
+                json!({
+                    "id": repo,
+                    "gguf": {"architecture": "clip", "total": 460730096u64},
+                    "siblings": [
+                        {"rfilename": "Qwopus3.6-27B-v2-MTP-Q8_0.gguf", "size": 29047082176u64},
+                        {"rfilename": "mmproj-F32.gguf", "size": 931145760u64}
+                    ]
+                }),
+            )
+            .add_range(&range_url, llama_header());
+
+        let models = fetch_hf_gguf(&http, 1).await.unwrap();
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        assert_eq!(m.params_total, 27_000_000_000);
+        // "clip" projector arch must not stick; header arch wins.
+        assert_ne!(m.architecture.as_deref(), Some("clip"));
+        // mmproj is a projector, not a variant → LlamaCpp-only.
+        assert_eq!(m.variants.len(), 1);
+        assert_eq!(m.variants[0].runtime_compat, vec![RuntimeKind::LlamaCpp]);
     }
 
     #[test]
