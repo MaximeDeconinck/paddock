@@ -33,7 +33,7 @@ A Homebrew formula is coming. Requires macOS on Apple Silicon (M1 or later).
 
 Running `paddock` with no arguments opens the interactive TUI. It opens instantly against the last catalog snapshot and refreshes in the background when that snapshot is more than 24h old (or empty): a spinner shows in the footer while the refresh runs, the list stays fully usable, and it swaps in the new catalog atomically when done (keeping your selection and search). Press `R` to force a refresh on demand. The blocking `paddock sync` command below is still there for scripts and cron.
 
-Press `Tab` to switch to the servers view: the models you have served show there with their endpoint, context, uptime and pid; `x` stops the selected server, `c` copies its OpenAI endpoint to the clipboard. Serving a model from the TUI (`s`) now runs it detached and lands you on the servers tab, so the TUI stays open.
+Press `Tab` to switch to the servers view: everything currently running shows there, both the llama.cpp/mlx servers paddock spawned and the models loaded in the Ollama daemon, with their endpoint, context, uptime and pid. Navigate with the arrow keys; `x` stops the selected server, `c` copies its OpenAI endpoint to the clipboard. Serving a model from the TUI (`s`) now runs it detached and lands you on the servers tab, so the TUI stays open.
 
 Nine subcommands cover everything scriptable:
 
@@ -147,7 +147,7 @@ The lifecycle depends on the runtime:
 
 Context auto-sizes by default. For llama.cpp, paddock picks the largest context window that fits this machine's memory budget rather than the model default (which can be far larger, 262k on some models, and OOM), which is what prevents `request (N tokens) exceeds the available context size` errors. Override it with `--ctx <tokens>`. Ollama and MLX manage their own context, so `--ctx` is llama.cpp-only.
 
-`--port <N>` picks the port for llama.cpp / mlx servers (default 8080). The Ollama daemon's port is fixed, so `--port` is ignored there with a warning. `--json` prints the full serve plan (argv, endpoint, pre-steps) without spawning or pulling anything.
+`--port <N>` picks the port for llama.cpp / mlx servers (default 8080). When the chosen port is already taken, paddock serves on the next free one (so serving several models never collides), printing where it landed. The Ollama daemon's port is fixed, so `--port` is ignored there with a warning. `--json` prints the full serve plan (argv, endpoint, pre-steps) without spawning or pulling anything.
 
 ### `paddock ps`, `paddock stop`, `paddock logs`: manage running servers
 
