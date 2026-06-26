@@ -1,7 +1,6 @@
-//! Pure rendering — reads state, never mutates it, no IO.
+//! Pure rendering - reads state, never mutates it, no IO.
 //! Palette: DarkGray/Gray/White + a single deep-blue accent.
 
-use paddock_core::catalog::RuntimeKind;
 use paddock_core::estimate::{FitVerdict, estimate_speed, kv_cache_bytes};
 use paddock_core::hardware::{HardwareProfile, RuntimeStatus};
 use paddock_core::runtime::{RunPlan, ServePlan};
@@ -15,7 +14,7 @@ use ratatui::widgets::{Paragraph, Row, Table, TableState};
 
 use crate::app::ScoredModel;
 use crate::output::{age_label, gib, verdict_label};
-use crate::tui::state::{Mode, SyncStatus, TuiState, use_case_label};
+use crate::tui::state::{Mode, SyncStatus, Tab, TuiState, use_case_label};
 
 /// Accent palette sampled from the paddock wordmark (deep indigo banner).
 /// ACCENT for accented text on dark terminals (readable royal blue),
@@ -33,8 +32,11 @@ pub fn draw(frame: &mut Frame, state: &TuiState, profile: &HardwareProfile) {
     .horizontal_margin(2)
     .vertical_margin(1)
     .areas(frame.area());
-    draw_header(frame, header, profile);
-    draw_table(frame, table, state);
+    draw_header(frame, header, profile, state.tab);
+    match state.tab {
+        Tab::Models => draw_table(frame, table, state),
+        Tab::Servers => draw_servers(frame, table, state),
+    }
     draw_footer(frame, footer, state);
     if state.mode == Mode::Detail {
         draw_detail(frame, state, profile);
@@ -52,7 +54,7 @@ const WORDMARK: [&str; 5] = [
 /// Display width of the widest wordmark row + a 2-col right margin.
 const WORDMARK_WIDTH: u16 = 57;
 
-fn draw_header(frame: &mut Frame, area: Rect, p: &HardwareProfile) {
+fn draw_header(frame: &mut Frame, area: Rect, p: &HardwareProfile, tab: Tab) {
     // Wide terminals: wordmark on the left, machine box to its right.
     // Narrow ones: machine box only (it carries the " paddock " title then).
     let min_box_width = 46;
@@ -74,10 +76,10 @@ fn draw_header(frame: &mut Frame, area: Rect, p: &HardwareProfile) {
         );
         frame.render_widget(Paragraph::new(mark), m);
     }
-    draw_machine_box(frame, box_area, p, mark_area.is_none());
+    draw_machine_box(frame, box_area, p, mark_area.is_none(), tab);
 }
 
-fn draw_machine_box(frame: &mut Frame, area: Rect, p: &HardwareProfile, titled: bool) {
+fn draw_machine_box(frame: &mut Frame, area: Rect, p: &HardwareProfile, titled: bool, tab: Tab) {
     let label = |s: &str| Span::styled(format!("{s:<11}"), Style::new().fg(Color::DarkGray));
     let value = |s: String| Span::styled(s, Style::new().fg(Color::Gray));
     let gpu_line = match p.gpu.metal_limit_bytes {
@@ -120,12 +122,33 @@ fn draw_machine_box(frame: &mut Frame, area: Rect, p: &HardwareProfile, titled: 
         Line::from(vec![label("bandwidth"), value(bandwidth)]),
         Line::from(vec![label("runtimes"), value(runtimes)]),
     ];
-    let mut block = Block::bordered().border_style(Style::new().fg(Color::DarkGray));
+    let tab_span = |name: &str, active: bool| {
+        if active {
+            Span::styled(
+                format!("[{name}]"),
+                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!(" {name} "), Style::new().fg(Color::DarkGray))
+        }
+    };
+    let tabs_title = Line::from(vec![
+        Span::raw(" "),
+        tab_span("models", tab == Tab::Models),
+        tab_span("servers", tab == Tab::Servers),
+        Span::raw(" "),
+    ]);
+    let mut block = Block::bordered()
+        .border_style(Style::new().fg(Color::DarkGray))
+        .title(tabs_title.right_aligned());
     if titled {
-        block = block.title(Span::styled(
-            " paddock ",
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ));
+        block = block.title(
+            Line::from(Span::styled(
+                " paddock ",
+                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ))
+            .left_aligned(),
+        );
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -186,7 +209,63 @@ fn draw_table(frame: &mut Frame, area: Rect, state: &TuiState) {
     frame.render_stateful_widget(table, area, &mut ts);
 }
 
+fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
+    if state.servers.is_empty() {
+        let msg = Paragraph::new("no servers running · press s on a model to serve one")
+            .style(Style::new().fg(Color::DarkGray));
+        frame.render_widget(msg, area);
+        return;
+    }
+    let header = Row::new(["MODEL", "RUNTIME", "ENDPOINT", "CTX", "UPTIME", "PID"])
+        .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    let rows = state.servers.iter().map(|r| {
+        let pid = match &r.stop {
+            paddock_core::serving::StopHandle::Pid(p) => p.to_string(),
+            _ => "-".into(),
+        };
+        Row::new(vec![
+            // MODEL is the flexible `Min` column: don't pre-truncate, let the
+            // table widget clip to whatever width is left (full names show on a
+            // wide terminal).
+            Cell::from(r.model.clone()),
+            Cell::from(crate::output::runtime_label(r.runtime)),
+            Cell::from(crate::output::truncate(&r.endpoint, 26)),
+            Cell::from(r.ctx.map(|c| c.to_string()).unwrap_or_else(|| "-".into())),
+            Cell::from(
+                r.started_at
+                    .map(crate::output::uptime_label)
+                    .unwrap_or_else(|| "-".into()),
+            ),
+            Cell::from(pid),
+        ])
+        .style(Style::new().fg(Color::Gray))
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(20),
+            Constraint::Length(10),
+            Constraint::Length(26),
+            Constraint::Length(7),
+            Constraint::Length(8),
+            Constraint::Length(8),
+        ],
+    )
+    .header(header)
+    .row_highlight_style(Style::new().fg(Color::White).bg(ACCENT_DEEP));
+    let mut ts = TableState::default().with_selected(Some(state.server_selected));
+    frame.render_stateful_widget(table, area, &mut ts);
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
+    if state.tab == Tab::Servers {
+        let line = "↑↓ move · x stop · c copy endpoint · tab models · q quit";
+        frame.render_widget(
+            Paragraph::new(Span::styled(line, Style::new().fg(Color::DarkGray))),
+            area,
+        );
+        return;
+    }
     const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let sync_seg = match &state.sync_status {
         SyncStatus::Running => {
@@ -215,7 +294,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
             Style::new().fg(ACCENT),
         )),
         (None, _) => Line::from(Span::styled(
-            "↑↓ move · enter detail · x run · s serve · / search · g/c/r/h use-case · R sync · q quit",
+            "↑↓ move · enter detail · x run · s serve · / search · g/c/r/h use-case · R sync · tab servers · q quit",
             Style::new().fg(Color::DarkGray),
         )),
     };
@@ -266,7 +345,7 @@ fn draw_detail(frame: &mut Frame, state: &TuiState, profile: &HardwareProfile) {
     draw_speed_chart(frame, chart_area, r, profile.bandwidth_gbps);
 }
 
-/// Generation speed as a function of context depth — the KV cache is
+/// Generation speed as a function of context depth - the KV cache is
 /// re-streamed every token, so tok/s decays as the conversation grows.
 /// Sampled from the same estimator the table uses (anchored at 8k there).
 fn draw_speed_chart(frame: &mut Frame, area: Rect, r: &ScoredModel, bandwidth_gbps: f64) {
@@ -420,11 +499,7 @@ fn detail_lines<'a>(
     // endpoint shown is exactly the one `s` would serve on.
     match serve_plan {
         Some(Ok(sp)) => {
-            let runtime = match sp.runtime {
-                RuntimeKind::Ollama => "ollama",
-                RuntimeKind::LlamaCpp => "llama.cpp",
-                RuntimeKind::MlxLm => "mlx-lm",
-            };
+            let runtime = crate::output::runtime_label(sp.runtime);
             lines.push(Line::from(vec![
                 Span::styled("  s to serve on ", Style::new().fg(Color::DarkGray)),
                 Span::styled(sp.endpoint.clone(), Style::new().fg(ACCENT)),

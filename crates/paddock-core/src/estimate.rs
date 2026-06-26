@@ -1,4 +1,4 @@
-//! Pure estimation formulas — the scientific core of paddock.
+//! Pure estimation formulas - the scientific core of paddock.
 //!
 //! Generation speed model: token generation on Apple Silicon is memory-bandwidth
 //! bound. Each generated token streams all active weights once:
@@ -52,7 +52,7 @@ pub enum FitVerdict {
     FitsGpu,
     /// Would fit if `iogpu.wired_limit_mb` were raised (still leaving a system reserve).
     FitsWithSysctlTuning,
-    /// Fits in total RAM only — partial CPU offload, degraded speed.
+    /// Fits in total RAM only - partial CPU offload, degraded speed.
     FitsRamOnly,
     DoesNotFit,
 }
@@ -117,7 +117,7 @@ pub struct SpeedEstimate {
 }
 
 /// KV cache size at a given context depth: K + V (×2), per layer, per KV
-/// head, head_dim wide, fp16 (×2 bytes). Linear in `context_len` — this is
+/// head, head_dim wide, fp16 (×2 bytes). Linear in `context_len` - this is
 /// also the slope of the speed decay, since every decoded token re-streams
 /// the whole cache.
 pub fn kv_cache_bytes(v: &ModelVariant, context_len: u32) -> u64 {
@@ -128,7 +128,7 @@ pub fn kv_cache_bytes(v: &ModelVariant, context_len: u32) -> u64 {
         .saturating_mul(2)
 }
 
-/// Step size for auto-sized context — round to a 4k boundary.
+/// Step size for auto-sized context - round to a 4k boundary.
 const CTX_STEP: u32 = 4096;
 /// Never auto-size below this; a variant that cannot hold 4k would not have
 /// been selected by `best_variant`.
@@ -210,7 +210,7 @@ pub fn estimate_memory(
 /// pass the DEFAULT_CONTEXT cache from `estimate_memory`, keeping the MEMORY
 /// and TOK/S columns consistent at the same 8k depth; 0 models an empty
 /// context. NOTE: SPEED_EFFICIENCY/MOE_SPEED_EFFICIENCY were calibrated on
-/// shallow-context benchmarks — recalibrate both when `paddock bench` lands,
+/// shallow-context benchmarks - recalibrate both when `paddock bench` lands,
 /// not before, to avoid double-counting the decay.
 pub fn estimate_speed(v: &ModelVariant, bandwidth_gbps: f64, kv_cache_bytes: u64) -> SpeedEstimate {
     let bpw = if v.bpw.is_finite() && v.bpw > 0.0 {

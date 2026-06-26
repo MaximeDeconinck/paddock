@@ -1,9 +1,11 @@
-//! Pure TUI state machine — no terminal IO, fully unit-testable.
+//! Pure TUI state machine - no terminal IO, fully unit-testable.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use paddock_core::estimate::{MemoryBudget, resolve_ctx};
 use paddock_core::hardware::RuntimesStatus;
 use paddock_core::runtime::{RunPlan, ServePlan, plan_run, plan_serve};
 use paddock_core::score::UseCase;
+use paddock_core::serving::{ServerRow, StopHandle};
 
 use crate::app::ScoredModel;
 
@@ -12,6 +14,12 @@ pub enum Mode {
     List,
     Detail,
     Search { query: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Models,
+    Servers,
 }
 
 /// Background-sync lifecycle as seen by the UI. Pure data; the event loop owns
@@ -58,6 +66,11 @@ pub enum Action {
     Rescore(UseCase),
     /// Kick off a background catalog sync (the event loop owns the thread).
     StartSync,
+    /// Stop the selected server (SIGTERM + unregister, or `ollama stop`),
+    /// then refresh.
+    StopServer(StopHandle),
+    /// Copy this endpoint URL to the system clipboard.
+    CopyEndpoint(String),
 }
 
 pub struct TuiState {
@@ -72,6 +85,8 @@ pub struct TuiState {
     pub query: String,
     /// Runtime availability snapshot used to build run plans.
     pub runtimes: RuntimesStatus,
+    /// Memory budget for this machine; used to auto-size run/serve context.
+    pub budget: MemoryBudget,
     /// Last plan_run failure, surfaced in the footer instead of crashing.
     pub last_error: Option<String>,
     /// Run plan for the selected row, computed once on Detail entry so the
@@ -88,10 +103,21 @@ pub struct TuiState {
     /// Catalog `last_sync` epoch (seconds), read from the DB at launch and
     /// after each background sync; the footer shows it as "synced Xm ago".
     pub last_sync: Option<i64>,
+    /// Active top-level tab. Search/Detail overlays only apply on `Models`.
+    pub tab: Tab,
+    /// Live servers shown on the Servers tab; refreshed by the background task.
+    pub servers: Vec<ServerRow>,
+    /// Cursor within `servers`.
+    pub server_selected: usize,
 }
 
 impl TuiState {
-    pub fn new(rows: Vec<ScoredModel>, use_case: UseCase, runtimes: RuntimesStatus) -> Self {
+    pub fn new(
+        rows: Vec<ScoredModel>,
+        use_case: UseCase,
+        runtimes: RuntimesStatus,
+        budget: MemoryBudget,
+    ) -> Self {
         Self {
             all_rows: rows.clone(),
             rows,
@@ -100,12 +126,16 @@ impl TuiState {
             mode: Mode::List,
             query: String::new(),
             runtimes,
+            budget,
             last_error: None,
             detail_plan: None,
             detail_serve_plan: None,
             sync_status: SyncStatus::Idle,
             tick: 0,
             last_sync: None,
+            tab: Tab::Models,
+            servers: Vec::new(),
+            server_selected: 0,
         }
     }
 
@@ -135,10 +165,48 @@ impl TuiState {
             .min(self.rows.len().saturating_sub(1));
     }
 
+    /// Replace the servers snapshot, keeping the cursor on the same row when it
+    /// survives the refresh, otherwise clamping to the new length. Identity is
+    /// the unique `stop` handle (pid / Ollama model), not the model name, so
+    /// two rows sharing a model name (same model served on two ports) don't
+    /// collapse onto each other.
+    pub fn set_servers(&mut self, servers: Vec<ServerRow>) {
+        let selected = self.servers.get(self.server_selected).map(|r| r.stop.clone());
+        self.servers = servers;
+        self.server_selected = selected
+            .and_then(|h| self.servers.iter().position(|r| r.stop == h))
+            .unwrap_or(0)
+            .min(self.servers.len().saturating_sub(1));
+    }
+
+    /// Drop the currently-selected server row (optimistic update after a stop;
+    /// the next background refresh reconciles) and clamp the cursor.
+    pub fn remove_selected(&mut self) {
+        if self.server_selected < self.servers.len() {
+            self.servers.remove(self.server_selected);
+        }
+        self.server_selected = self
+            .server_selected
+            .min(self.servers.len().saturating_sub(1));
+    }
+
+    pub fn selected_server(&self) -> Option<&ServerRow> {
+        self.servers.get(self.server_selected)
+    }
+
+    /// Close the Detail overlay back to the List view, clearing its cached
+    /// plans. Used both by the Detail dismiss keys and when serving from Detail
+    /// (the serve switches to the Servers tab, so the popup must not linger).
+    pub fn close_detail(&mut self) {
+        self.mode = Mode::List;
+        self.detail_plan = None;
+        self.detail_serve_plan = None;
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         use KeyCode as K;
         self.last_error = None;
-        // Ctrl-C quits from any mode — never swallowed by search input.
+        // Ctrl-C quits from any mode - never swallowed by search input.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == K::Char('c') {
             return Action::Quit;
         }
@@ -171,42 +239,72 @@ impl TuiState {
                 _ => {}
             },
             Mode::Detail => match key.code {
-                K::Esc | K::Char('q') | K::Enter => {
-                    self.mode = Mode::List;
-                    self.detail_plan = None;
-                    self.detail_serve_plan = None;
-                }
+                K::Esc | K::Char('q') | K::Enter => self.close_detail(),
                 K::Char('x') => return self.run_selected(),
                 K::Char('s') => return self.serve_selected(),
                 _ => {}
             },
-            Mode::List => match key.code {
-                K::Char('q') => return Action::Quit,
-                K::Up | K::Char('k') => self.selected = self.selected.saturating_sub(1),
-                K::Down | K::Char('j') => {
-                    self.selected = (self.selected + 1).min(self.rows.len().saturating_sub(1));
+            Mode::List => {
+                // Tab toggles the top-level view from either tab.
+                if key.code == K::Tab {
+                    self.tab = match self.tab {
+                        Tab::Models => Tab::Servers,
+                        Tab::Servers => Tab::Models,
+                    };
+                    return Action::None;
                 }
-                K::Enter => {
-                    if !self.rows.is_empty() {
-                        self.detail_plan = self.plan_for_selected();
-                        self.detail_serve_plan = self.serve_plan_for_selected();
-                        self.mode = Mode::Detail;
-                    }
+                match self.tab {
+                    Tab::Models => match key.code {
+                        K::Char('q') => return Action::Quit,
+                        K::Up => self.selected = self.selected.saturating_sub(1),
+                        K::Down => {
+                            self.selected =
+                                (self.selected + 1).min(self.rows.len().saturating_sub(1));
+                        }
+                        K::Enter => {
+                            if !self.rows.is_empty() {
+                                self.detail_plan = self.plan_for_selected();
+                                self.detail_serve_plan = self.serve_plan_for_selected();
+                                self.mode = Mode::Detail;
+                            }
+                        }
+                        K::Char('x') => return self.run_selected(),
+                        K::Char('s') => return self.serve_selected(),
+                        K::Char('/') => {
+                            self.mode = Mode::Search {
+                                query: String::new(),
+                            }
+                        }
+                        K::Char('g') => return self.set_use_case(UseCase::General),
+                        K::Char('c') => return self.set_use_case(UseCase::Coding),
+                        K::Char('r') => return self.set_use_case(UseCase::Reasoning),
+                        K::Char('h') => return self.set_use_case(UseCase::Chat),
+                        K::Char('R') => return Action::StartSync,
+                        _ => {}
+                    },
+                    Tab::Servers => match key.code {
+                        K::Char('q') => return Action::Quit,
+                        K::Up => {
+                            self.server_selected = self.server_selected.saturating_sub(1)
+                        }
+                        K::Down => {
+                            self.server_selected = (self.server_selected + 1)
+                                .min(self.servers.len().saturating_sub(1));
+                        }
+                        K::Char('x') => {
+                            if let Some(r) = self.selected_server() {
+                                return Action::StopServer(r.stop.clone());
+                            }
+                        }
+                        K::Char('c') => {
+                            if let Some(r) = self.selected_server() {
+                                return Action::CopyEndpoint(r.openai_url.clone());
+                            }
+                        }
+                        _ => {}
+                    },
                 }
-                K::Char('x') => return self.run_selected(),
-                K::Char('s') => return self.serve_selected(),
-                K::Char('/') => {
-                    self.mode = Mode::Search {
-                        query: String::new(),
-                    }
-                }
-                K::Char('g') => return self.set_use_case(UseCase::General),
-                K::Char('c') => return self.set_use_case(UseCase::Coding),
-                K::Char('r') => return self.set_use_case(UseCase::Reasoning),
-                K::Char('h') => return self.set_use_case(UseCase::Chat),
-                K::Char('R') => return Action::StartSync,
-                _ => {}
-            },
+            }
         }
         Action::None
     }
@@ -237,8 +335,10 @@ impl TuiState {
     fn plan_for_selected(&self) -> Option<Result<RunPlan, String>> {
         let row = self.rows.get(self.selected)?;
         let variant = &row.model.variants[row.variant_idx];
-        // TUI has no flag surface, so ctx is always the default.
-        Some(plan_run(&row.model, variant, &self.runtimes, None).map_err(|e| e.to_string()))
+        // TUI has no flag surface, so ctx is auto-sized against the memory budget.
+        let mv = row.model.to_model_variant(variant);
+        let ctx = resolve_ctx(None, &mv, &self.budget, row.model.context_max);
+        Some(plan_run(&row.model, variant, &self.runtimes, Some(ctx)).map_err(|e| e.to_string()))
     }
 
     /// Single source for serve-plan computation (Detail entry and `s` both
@@ -247,7 +347,12 @@ impl TuiState {
     fn serve_plan_for_selected(&self) -> Option<Result<ServePlan, String>> {
         let row = self.rows.get(self.selected)?;
         let variant = &row.model.variants[row.variant_idx];
-        Some(plan_serve(&row.model, variant, &self.runtimes, None, None).map_err(|e| e.to_string()))
+        let mv = row.model.to_model_variant(variant);
+        let ctx = resolve_ctx(None, &mv, &self.budget, row.model.context_max);
+        Some(
+            plan_serve(&row.model, variant, &self.runtimes, None, Some(ctx))
+                .map_err(|e| e.to_string()),
+        )
     }
 
     /// Build the run plan for the selected row. A plan_run failure must not
@@ -267,7 +372,12 @@ impl TuiState {
     /// footer, never crash the TUI.
     fn serve_selected(&mut self) -> Action {
         match self.serve_plan_for_selected() {
-            Some(Ok(plan)) => Action::Serve(plan),
+            Some(Ok(plan)) => {
+                // Serving switches to the Servers tab, so a Detail popup opened
+                // on this row must not linger over it.
+                self.close_detail();
+                Action::Serve(plan)
+            }
             Some(Err(e)) => {
                 self.last_error = Some(e);
                 Action::None
@@ -336,6 +446,28 @@ mod tests {
         }
     }
 
+    /// Same as `fake_row` but with a parameterized `context_max`, so tests can
+    /// build a model whose auto-sized context exceeds the 8192 default.
+    fn fake_row_ctx(name: &str, context_max: u32) -> ScoredModel {
+        let mut row = fake_row(name);
+        row.model.context_max = context_max;
+        row
+    }
+
+    use paddock_core::serving::{ServerRow, StopHandle};
+
+    fn srv(pid: u32, model: &str, port: u16) -> ServerRow {
+        ServerRow {
+            model: model.into(),
+            runtime: RuntimeKind::LlamaCpp,
+            endpoint: format!("http://127.0.0.1:{port}"),
+            openai_url: format!("http://127.0.0.1:{port}/v1/chat/completions"),
+            ctx: Some(8192),
+            started_at: Some(0),
+            stop: StopHandle::Pid(pid),
+        }
+    }
+
     fn state() -> TuiState {
         TuiState::new(
             vec![
@@ -345,6 +477,10 @@ mod tests {
             ],
             UseCase::General,
             RuntimesStatus::default(),
+            MemoryBudget {
+                gpu_effective_bytes: 24 * (1u64 << 30),
+                ram_total_bytes: 32 * (1u64 << 30),
+            },
         )
     }
 
@@ -353,16 +489,16 @@ mod tests {
     }
 
     #[test]
-    fn j_k_move_selection_within_bounds() {
+    fn arrows_move_selection_within_bounds() {
         let mut s = state();
         assert_eq!(s.selected, 0);
-        s.handle_key(key(KeyCode::Char('k'))); // clamped at top
+        s.handle_key(key(KeyCode::Up)); // clamped at top
         assert_eq!(s.selected, 0);
-        s.handle_key(key(KeyCode::Char('j')));
+        s.handle_key(key(KeyCode::Down));
         assert_eq!(s.selected, 1);
         s.handle_key(key(KeyCode::Down));
-        s.handle_key(key(KeyCode::Char('j'))); // clamped at bottom
-        s.handle_key(key(KeyCode::Char('j')));
+        s.handle_key(key(KeyCode::Down)); // clamped at bottom
+        s.handle_key(key(KeyCode::Down));
         assert_eq!(s.selected, 2);
         s.handle_key(key(KeyCode::Up));
         assert_eq!(s.selected, 1);
@@ -446,7 +582,7 @@ mod tests {
         s.handle_key(key(KeyCode::Enter));
         assert_eq!(s.mode, Mode::Detail);
         assert!(matches!(s.handle_key(ctrl_c), Action::Quit));
-        // Search — and the 'c' must not land in the query
+        // Search - and the 'c' must not land in the query
         let mut s = state();
         s.handle_key(key(KeyCode::Char('/')));
         assert!(matches!(s.handle_key(ctrl_c), Action::Quit));
@@ -481,8 +617,8 @@ mod tests {
     #[test]
     fn rescore_preserves_cursor_clamped() {
         let mut s = state();
-        s.handle_key(key(KeyCode::Char('j')));
-        s.handle_key(key(KeyCode::Char('j')));
+        s.handle_key(key(KeyCode::Down));
+        s.handle_key(key(KeyCode::Down));
         assert_eq!(s.selected, 2);
         // Same query, new rows: cursor kept.
         s.set_rows(
@@ -570,6 +706,42 @@ mod tests {
     }
 
     #[test]
+    fn tab_toggles_between_models_and_servers() {
+        let mut s = state();
+        assert_eq!(s.tab, Tab::Models);
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(s.tab, Tab::Servers);
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(s.tab, Tab::Models);
+    }
+
+    #[test]
+    fn servers_tab_navigation_is_clamped() {
+        let mut s = state();
+        s.set_servers(vec![srv(1, "a", 8080), srv(2, "b", 8081)]);
+        s.handle_key(key(KeyCode::Tab)); // -> Servers
+        assert_eq!(s.server_selected, 0);
+        s.handle_key(key(KeyCode::Up)); // clamped at top
+        assert_eq!(s.server_selected, 0);
+        s.handle_key(key(KeyCode::Down));
+        assert_eq!(s.server_selected, 1);
+        s.handle_key(key(KeyCode::Down)); // clamped at bottom
+        assert_eq!(s.server_selected, 1);
+    }
+
+    #[test]
+    fn set_servers_preserves_selection_by_handle() {
+        let mut s = state();
+        s.set_servers(vec![srv(10, "a", 8080), srv(20, "b", 8081)]);
+        s.tab = Tab::Servers;
+        s.server_selected = 1; // pid 20
+        s.set_servers(vec![srv(20, "b", 8081)]); // pid 10 dropped
+        // The cursor follows pid 20 to its new index, keyed on the stop handle.
+        assert_eq!(s.server_selected, 0);
+        assert_eq!(s.selected_server().unwrap().stop, StopHandle::Pid(20));
+    }
+
+    #[test]
     fn q_quits_and_c_rescores_for_coding() {
         let mut s = state();
         assert!(matches!(
@@ -581,5 +753,80 @@ mod tests {
             s.handle_key(key(KeyCode::Char('q'))),
             Action::Quit
         ));
+    }
+
+    #[test]
+    fn x_on_servers_tab_returns_stop_action() {
+        let mut s = state();
+        s.set_servers(vec![srv(42, "qwen", 8080)]);
+        s.tab = Tab::Servers;
+        match s.handle_key(key(KeyCode::Char('x'))) {
+            Action::StopServer(h) => assert_eq!(h, StopHandle::Pid(42)),
+            other => panic!("expected StopServer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn c_on_servers_tab_returns_copy_action() {
+        let mut s = state();
+        s.set_servers(vec![srv(42, "qwen", 8080)]);
+        s.tab = Tab::Servers;
+        match s.handle_key(key(KeyCode::Char('c'))) {
+            Action::CopyEndpoint(url) => {
+                assert_eq!(url, "http://127.0.0.1:8080/v1/chat/completions")
+            }
+            other => panic!("expected CopyEndpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_selected_drops_and_clamps() {
+        let mut s = state();
+        s.set_servers(vec![srv(1, "a", 8080), srv(2, "b", 8081), srv(3, "c", 8082)]);
+        s.tab = Tab::Servers;
+        s.server_selected = 2; // last (model "c")
+        s.remove_selected();
+        assert_eq!(s.servers.len(), 2);
+        assert_eq!(s.server_selected, 1); // clamped from 2 to last valid index
+        // The dropped row is gone.
+        assert!(s.servers.iter().all(|r| r.model != "c"));
+    }
+
+    #[test]
+    fn remove_selected_on_empty_is_noop() {
+        let mut s = state();
+        s.remove_selected();
+        assert_eq!(s.servers.len(), 0);
+        assert_eq!(s.server_selected, 0);
+    }
+
+    #[test]
+    fn tui_serve_plan_auto_sizes_context() {
+        // A roomy budget + large context_max should auto-size well above the 8192 default.
+        let mut s = state();
+        s.rows = vec![fake_row_ctx("Big", 32_768)];
+        s.all_rows = s.rows.clone();
+        s.selected = 0;
+        let plan = s.serve_plan_for_selected().unwrap().unwrap();
+        assert!(plan.ctx > 8192, "expected auto-sized ctx, got {}", plan.ctx);
+    }
+
+    #[test]
+    fn x_on_empty_servers_tab_is_noop() {
+        let mut s = state();
+        s.tab = Tab::Servers;
+        assert!(matches!(s.handle_key(key(KeyCode::Char('x'))), Action::None));
+    }
+
+    #[test]
+    fn serving_from_detail_closes_the_popup() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Enter)); // open Detail on the selected model
+        assert_eq!(s.mode, Mode::Detail);
+        let action = s.handle_key(key(KeyCode::Char('s'))); // serve from Detail
+        assert!(matches!(action, Action::Serve(_)));
+        assert_eq!(s.mode, Mode::List, "Detail popup must close when serving");
+        assert!(s.detail_plan.is_none());
+        assert!(s.detail_serve_plan.is_none());
     }
 }

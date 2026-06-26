@@ -1,7 +1,8 @@
 //! Terminal lifecycle + event loop. All state transitions live in `state`,
-//! all rendering in `draw` — this module only wires them to the terminal.
+//! all rendering in `draw` - this module only wires them to the terminal.
 
 mod draw;
+mod servers_task;
 mod state;
 mod sync_task;
 
@@ -10,7 +11,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind};
 use paddock_core::catalog::db::Db;
-use paddock_core::runtime::{RunPlan, ServePlan};
+use paddock_core::runtime::RunPlan;
 use paddock_core::score::UseCase;
 use ratatui::DefaultTerminal;
 
@@ -20,13 +21,17 @@ use state::{Action, SyncStatus, TuiState};
 /// What to do after the terminal is restored.
 enum Exit {
     Run(RunPlan),
-    Serve(ServePlan),
 }
 
 pub fn run(app: App) -> Result<()> {
     let db = app.open_db()?;
     let rows = app.scored_models(&db, UseCase::default(), false)?;
-    let mut state = TuiState::new(rows, UseCase::default(), app.profile.runtimes.clone());
+    let mut state = TuiState::new(
+        rows,
+        UseCase::default(),
+        app.profile.runtimes.clone(),
+        app.budget.clone(),
+    );
 
     // Stale (>24h) or empty catalog -> kick off a background refresh. The TUI
     // opens immediately against whatever snapshot exists (possibly empty).
@@ -49,20 +54,21 @@ pub fn run(app: App) -> Result<()> {
         None
     };
 
+    let servers_rx = servers_task::spawn_servers_refresh();
+
     // ratatui 0.29 helpers: raw mode + alternate screen + panic hook.
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut state, &app, &db, &mut sync_rx);
+    let result = event_loop(&mut terminal, &mut state, &app, &db, &mut sync_rx, &servers_rx);
     ratatui::restore();
 
     // Launch AFTER restore so the child owns a clean tty. `launch` and
     // `serve_with_plan` are the same confirm-install paths as `paddock run` /
-    // `paddock serve` — the never-auto-install guarantee lives in one place.
+    // `paddock serve` - the never-auto-install guarantee lives in one place.
     match result? {
         Some(Exit::Run(plan)) => {
             println!("$ {}", plan.display());
             crate::launch(plan)
         }
-        Some(Exit::Serve(plan)) => crate::serve_with_plan(plan, true),
         None => Ok(()),
     }
 }
@@ -73,6 +79,7 @@ fn event_loop(
     app: &App,
     db: &Db,
     sync_rx: &mut Option<std::sync::mpsc::Receiver<sync_task::SyncMsg>>,
+    servers_rx: &std::sync::mpsc::Receiver<Vec<paddock_core::serving::ServerRow>>,
 ) -> Result<Option<Exit>> {
     use std::sync::mpsc::TryRecvError;
     use sync_task::SyncMsg;
@@ -103,13 +110,22 @@ fn event_loop(
             }
         }
 
+        // Drain servers snapshots (keep the most recent).
+        let mut latest = None;
+        while let Ok(snapshot) = servers_rx.try_recv() {
+            latest = Some(snapshot);
+        }
+        if let Some(snapshot) = latest {
+            state.set_servers(snapshot);
+        }
+
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
         let Event::Key(key) = event::read()? else {
             continue;
         };
-        // macOS terminals also deliver Release/Repeat events — act on Press only.
+        // macOS terminals also deliver Release/Repeat events - act on Press only.
         if key.kind != KeyEventKind::Press {
             continue;
         }
@@ -117,7 +133,25 @@ fn event_loop(
             Action::None => {}
             Action::Quit => return Ok(None),
             Action::Run(plan) => return Ok(Some(Exit::Run(plan))),
-            Action::Serve(plan) => return Ok(Some(Exit::Serve(plan))),
+            Action::Serve(plan) => {
+                // Suspend the TUI so serve_with_plan can print load/install
+                // progress (and prompt for install) on a clean terminal, then
+                // resume. Detached: the server keeps running in the background.
+                ratatui::restore();
+                let res = crate::serve_with_plan(plan, false);
+                *terminal = ratatui::init();
+                if let Err(e) = res {
+                    state.last_error = Some(e.to_string());
+                }
+                state.tab = state::Tab::Servers;
+                // Immediate refresh (paddock-spawned + Ollama-loaded) so a newly
+                // served model shows without waiting for the next background tick.
+                let snapshot = paddock_core::serving::list_all_servers(
+                    &paddock_core::serving::Registry::open_default(),
+                    &paddock_core::hardware::RealSystemProbe,
+                );
+                state.set_servers(snapshot);
+            }
             Action::Rescore(uc) => {
                 let rows = app.scored_models(db, uc, false)?;
                 state.set_rows(rows, uc);
@@ -130,6 +164,24 @@ fn event_loop(
                     ));
                 }
             }
+            Action::StopServer(handle) => {
+                use paddock_core::serving::{Registry, StopHandle, terminate};
+                match handle {
+                    StopHandle::Pid(pid) => {
+                        terminate(pid);
+                        let _ = Registry::open_default().unregister(pid);
+                    }
+                    StopHandle::OllamaModel(model) => {
+                        // Unload the model from the daemon; capture output so it
+                        // doesn't corrupt the TUI screen (we're in raw mode).
+                        let _ = std::process::Command::new("ollama")
+                            .args(["stop", &model])
+                            .output();
+                    }
+                }
+                state.remove_selected();
+            }
+            Action::CopyEndpoint(url) => crate::clipboard::copy_to_clipboard(&url),
         }
     }
 }

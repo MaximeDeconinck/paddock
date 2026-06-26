@@ -192,7 +192,7 @@ pub fn print_recommendations(rows: &[ScoredModel]) {
     for r in rows {
         let v = &r.model.variants[r.variant_idx];
         println!(
-            "{} {} — {:.0}/100: {}",
+            "{} {} - {:.0}/100: {}",
             r.model.name,
             v.quant,
             r.score.total,
@@ -223,7 +223,7 @@ pub fn print_recommendations_json(rows: &[ScoredModel]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn truncate(s: &str, n: usize) -> String {
+pub fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
     } else {
@@ -255,7 +255,7 @@ pub fn print_ps_table(records: &[ServingRecord]) {
     }
 }
 
-fn runtime_label(rt: paddock_core::catalog::RuntimeKind) -> &'static str {
+pub fn runtime_label(rt: paddock_core::catalog::RuntimeKind) -> &'static str {
     use paddock_core::catalog::RuntimeKind::*;
     match rt {
         Ollama => "ollama",
@@ -265,7 +265,7 @@ fn runtime_label(rt: paddock_core::catalog::RuntimeKind) -> &'static str {
 }
 
 /// Humanized uptime (`30s`, `12m`, `3h`, `2d`) from a unix `started_at`.
-fn uptime_label(started_at: i64) -> String {
+pub fn uptime_label(started_at: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

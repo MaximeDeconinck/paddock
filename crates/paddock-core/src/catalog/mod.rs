@@ -336,7 +336,7 @@ async fn enrich_curated_with_registry(
             };
             let selected = ollama_registry::select_variant_tags(&tags, size, &default_quant);
             // Empty selection: the registry answered but lists no usable tag
-            // for this size — the curated baseline stands (and is upserted).
+            // for this size - the curated baseline stands (and is upserted).
             ollama_registry::enrich_with_tags(m, &selected);
         }
     }
@@ -839,7 +839,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = db::Db::open(dir.path().join("catalog.db")).unwrap();
 
-        // Index lists a curated base (llama3.1 — must be skipped, no fixtures
+        // Index lists a curated base (llama3.1 - must be skipped, no fixtures
         // needed) and one uncurated model with a full discovery chain.
         let mut http = DiscoveryHttp::default();
         http.text.insert(

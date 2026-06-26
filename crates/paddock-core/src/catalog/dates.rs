@@ -65,7 +65,7 @@ pub fn parse_iso_date_prefix(s: &str) -> Option<i64> {
 }
 
 /// `"N years/months/weeks/days ago"` (and `"yesterday"`, sub-day units) →
-/// epoch relative to `now`. Month = 30 d, year = 365 d — display precision.
+/// epoch relative to `now`. Month = 30 d, year = 365 d - display precision.
 pub fn parse_relative_ago(s: &str, now: i64) -> Option<i64> {
     const DAY: i64 = 86_400;
     let s = s.trim().to_lowercase();
@@ -96,7 +96,7 @@ pub fn parse_relative_ago(s: &str, now: i64) -> Option<i64> {
 /// Scan a page for every `"N unit ago"` mention and return the OLDEST as an
 /// epoch. Used on Ollama tags pages where the oldest tag date is the closest
 /// available proxy for the release date (a full re-push refreshes all of
-/// them — that failure mode is accepted; see the design spec).
+/// them - that failure mode is accepted; see the design spec).
 pub fn oldest_relative_date(html: &str, now: i64) -> Option<i64> {
     let mut oldest: Option<i64> = None;
     for (idx, _) in html.match_indices(" ago") {
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn parse_iso_date_prefix_cases() {
-        // HF createdAt: "2024-03-07T15:45:34.000Z" — day prefix is enough.
+        // HF createdAt: "2024-03-07T15:45:34.000Z" - day prefix is enough.
         assert_eq!(
             parse_iso_date_prefix("2024-03-07T15:45:34.000Z"),
             ymd_to_epoch(2024, 3, 7)

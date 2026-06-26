@@ -1,6 +1,6 @@
 //! Application data directory resolution, including the one-time migration
 //! from the legacy pre-rename directory (the project used to be called
-//! "tetro"; pre-release, so no back-compat aliases — just a silent move).
+//! "tetro"; pre-release, so no back-compat aliases - just a silent move).
 
 use std::path::{Path, PathBuf};
 
@@ -18,16 +18,16 @@ pub fn app_support_dir() -> PathBuf {
 
 /// If the paddock dir is absent and the legacy dir exists, rename the whole
 /// legacy dir (catalog.db + serving/) to paddock. Best-effort and one-shot:
-/// errors are ignored silently — worst case the user gets a fresh dir and
+/// errors are ignored silently - worst case the user gets a fresh dir and
 /// re-syncs. If both dirs ever coexist (a past failed rename, or an old
 /// binary recreating the legacy dir), the legacy dir is left orphaned and is
-/// NOT cleaned up or reported — acceptable pre-1.0; manual cleanup: delete
+/// NOT cleaned up or reported - acceptable pre-1.0; manual cleanup: delete
 /// ~/Library/Application Support/tetro.
 fn resolve(base: &Path) -> PathBuf {
     let paddock = base.join("paddock");
     let legacy = base.join(LEGACY_DIR_NAME);
     if !paddock.exists() && legacy.exists() {
-        // Benign TOCTOU: POSIX rename replaces an empty target dir, so a concurrently created empty paddock/ may be swapped for the legacy dir during startup — legacy data wins, concurrent migrations are safe (loser gets ENOENT, ignored).
+        // Benign TOCTOU: POSIX rename replaces an empty target dir, so a concurrently created empty paddock/ may be swapped for the legacy dir during startup - legacy data wins, concurrent migrations are safe (loser gets ENOENT, ignored).
         let _ = std::fs::rename(&legacy, &paddock);
     }
     paddock

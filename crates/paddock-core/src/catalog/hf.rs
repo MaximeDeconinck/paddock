@@ -192,7 +192,7 @@ async fn fetch_hf_repo(
         }
     }
     if layers == 0 || kv_heads == 0 || head_dim == 0 || params_total == 0 {
-        return Ok(None); // cannot estimate without these — skip repo
+        return Ok(None); // cannot estimate without these - skip repo
     }
 
     let runtime_compat = if has_mmproj {

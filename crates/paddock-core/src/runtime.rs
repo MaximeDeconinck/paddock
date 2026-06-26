@@ -1,4 +1,4 @@
-//! Builds the exact command to run a model — pure data, no exec, no prompt.
+//! Builds the exact command to run a model - pure data, no exec, no prompt.
 //! The binary owns display, confirmation and process replacement.
 
 use serde::Serialize;
@@ -71,7 +71,7 @@ pub fn plan_run(
     ctx: Option<u32>,
 ) -> Result<RunPlan, PaddockError> {
     // `-c` size for llama.cpp paths; None falls back to the fit-verdict default.
-    // Ollama/MLX are unaffected — they manage their own context window.
+    // Ollama/MLX are unaffected - they manage their own context window.
     let ctx = ctx.unwrap_or(DEFAULT_CONTEXT);
     match model.source {
         Source::Mlx => {
@@ -98,7 +98,7 @@ pub fn plan_run(
                 // `-c` aligns runtime memory with the fit verdict's context
                 // assumption: llama-cli defaults --ctx-size to 0 = the model's
                 // full context, which can be 262k → tens of GB of KV cache.
-                // `--no-mmproj` skips the vision tower — text-only in v0.1,
+                // `--no-mmproj` skips the vision tower - text-only in v0.1,
                 // and the estimator doesn't count vision weights (flag
                 // verified present in llama.cpp b9580 for both binaries).
                 return Ok(RunPlan {
@@ -173,6 +173,24 @@ pub struct ServePlan {
     pub ctx: u32,
     /// Bound port for spawned servers; None for the Ollama daemon.
     pub port: Option<u16>,
+}
+
+impl ServePlan {
+    /// Rebind a spawned-server plan to a different local port: rewrites the
+    /// `--port` argument, `endpoint`, `openai_url`, and `port`. Intended for
+    /// llama.cpp/mlx plans (the Ollama daemon has a fixed port and no --port).
+    pub fn with_port(mut self, port: u16) -> Self {
+        if let Some(argv) = self.server_argv.as_mut()
+            && let Some(i) = argv.iter().position(|a| a == "--port")
+            && let Some(slot) = argv.get_mut(i + 1)
+        {
+            *slot = port.to_string();
+        }
+        self.endpoint = format!("http://127.0.0.1:{port}");
+        self.openai_url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        self.port = Some(port);
+        self
+    }
 }
 
 /// Serve strategy mirrors `plan_run`, plus a llama.cpp fallback for HF GGUF
@@ -313,7 +331,7 @@ fn llama_server_plan(
         // `-c` aligns runtime memory with the fit verdict's context
         // assumption: llama-server defaults --ctx-size to 0 = the model's
         // full context, which can be 262k → tens of GB of KV cache.
-        // `--no-mmproj` skips the vision tower — text-only in v0.1, and the
+        // `--no-mmproj` skips the vision tower - text-only in v0.1, and the
         // estimator doesn't count vision weights (flag verified present in
         // llama.cpp b9580 for both binaries).
         server_argv: Some(s(&[
@@ -646,6 +664,20 @@ mod tests {
         let p2 = plan_serve(&m, &m.variants[0], &ollama_running(), Some(9999), None).unwrap();
         assert_eq!(p2.endpoint, "http://127.0.0.1:11434");
         assert!(p2.port_ignored);
+    }
+
+    #[test]
+    fn with_port_rewrites_argv_endpoint_and_url() {
+        let m = hf_model();
+        let p = plan_serve(&m, &m.variants[0], &llama_cpp_only(), None, None)
+            .unwrap()
+            .with_port(8090);
+        assert_eq!(p.port, Some(8090));
+        assert_eq!(p.endpoint, "http://127.0.0.1:8090");
+        assert_eq!(p.openai_url, "http://127.0.0.1:8090/v1/chat/completions");
+        let argv = p.server_argv.unwrap();
+        let i = argv.iter().position(|a| a == "--port").unwrap();
+        assert_eq!(argv[i + 1], "8090");
     }
 
     #[test]
