@@ -210,36 +210,56 @@ fn draw_table(frame: &mut Frame, area: Rect, state: &TuiState) {
 }
 
 fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
-    if state.servers.is_empty() {
+    if state.servers.is_empty() && state.available.is_empty() {
         let msg = Paragraph::new("no servers running · press s on a model to serve one")
             .style(Style::new().fg(Color::DarkGray));
         frame.render_widget(msg, area);
         return;
     }
-    let header = Row::new(["MODEL", "RUNTIME", "ENDPOINT", "CTX", "UPTIME", "PID"])
+    let header = Row::new(["MODEL", "RUNTIME", "ENDPOINT / DETAIL", "CTX", "UPTIME", "PID"])
         .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
-    let rows = state.servers.iter().map(|r| {
+
+    let mut rows: Vec<Row> = Vec::new();
+    for r in &state.servers {
         let pid = match &r.stop {
             paddock_core::serving::StopHandle::Pid(p) => p.to_string(),
             _ => "-".into(),
         };
-        Row::new(vec![
-            // MODEL is the flexible `Min` column: don't pre-truncate, let the
-            // table widget clip to whatever width is left (full names show on a
-            // wide terminal).
-            Cell::from(r.model.clone()),
-            Cell::from(crate::output::runtime_label(r.runtime)),
-            Cell::from(crate::output::truncate(&r.endpoint, 26)),
-            Cell::from(r.ctx.map(|c| c.to_string()).unwrap_or_else(|| "-".into())),
-            Cell::from(
-                r.started_at
-                    .map(crate::output::uptime_label)
-                    .unwrap_or_else(|| "-".into()),
-            ),
-            Cell::from(pid),
-        ])
-        .style(Style::new().fg(Color::Gray))
-    });
+        rows.push(
+            Row::new(vec![
+                Cell::from(r.model.clone()),
+                Cell::from(crate::output::runtime_label(r.runtime)),
+                Cell::from(crate::output::truncate(&r.endpoint, 26)),
+                Cell::from(r.ctx.map(|c| c.to_string()).unwrap_or_else(|| "-".into())),
+                Cell::from(
+                    r.started_at
+                        .map(crate::output::uptime_label)
+                        .unwrap_or_else(|| "-".into()),
+                ),
+                Cell::from(pid),
+            ])
+            .style(Style::new().fg(Color::Gray)),
+        );
+    }
+    for a in &state.available {
+        let detail = match (a.size_bytes, a.last_served_at) {
+            (Some(sz), _) => format!("{} (installed)", crate::output::gib(sz)),
+            (_, Some(ts)) => format!("served {} ago", crate::output::uptime_label(ts)),
+            _ => String::new(),
+        };
+        rows.push(
+            Row::new(vec![
+                Cell::from(a.model.clone()),
+                Cell::from(crate::output::runtime_label(a.runtime)),
+                Cell::from(detail),
+                Cell::from("-"),
+                Cell::from("-"),
+                Cell::from("-"),
+            ])
+            .style(Style::new().fg(Color::DarkGray)),
+        );
+    }
+
     let table = Table::new(
         rows,
         [
@@ -259,7 +279,7 @@ fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
 
 fn draw_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
     if state.tab == Tab::Servers {
-        let line = "↑↓ move · x stop · c copy endpoint · tab models · q quit";
+        let line = "↑↓ move · enter launch · x stop · c copy endpoint · tab models · q quit";
         frame.render_widget(
             Paragraph::new(Span::styled(line, Style::new().fg(Color::DarkGray))),
             area,
