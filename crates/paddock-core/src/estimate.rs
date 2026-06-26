@@ -478,7 +478,7 @@ mod tests {
         let c = auto_ctx(&v, &budget, v.context_max);
         assert!(c >= CTX_FLOOR, "never below the floor");
         assert!(c < 131_072, "must actually clamp below context_max");
-        assert!(c % CTX_STEP == 0, "rounded to a 4k step");
+        assert!(c.is_multiple_of(CTX_STEP), "rounded to a 4k step");
     }
 
     #[test]

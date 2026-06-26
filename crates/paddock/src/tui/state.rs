@@ -174,8 +174,10 @@ impl TuiState {
             .min(self.rows.len().saturating_sub(1));
     }
 
-    /// Replace both groups. Cursor preserved by identity (running by model,
-    /// available by model) then clamped to the combined length.
+    /// Replace both groups. Cursor preserved by identity (model name, prefixed
+    /// `r:`/`a:` per group) then clamped to the combined length. The model-name
+    /// key is collision-free because `list_available` excludes running models
+    /// from the available group, so no model appears in both at once.
     pub fn set_snapshot(&mut self, running: Vec<ServerRow>, available: Vec<AvailableRow>) {
         let prev = self.selected_combined_key();
         self.servers = running;
@@ -205,6 +207,8 @@ impl TuiState {
         } else if let Some(a) = self.available.get(self.server_selected - n) {
             SelectedRow::Available(a)
         } else {
+            // Unreachable in practice: every mutator clamps server_selected to
+            // the combined length. Kept as a total fallback.
             SelectedRow::None
         }
     }
