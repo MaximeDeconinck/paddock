@@ -267,10 +267,30 @@ pub struct LoadedModel {
 const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 const OLLAMA_OPENAI_URL: &str = "http://127.0.0.1:11434/v1/chat/completions";
 const OLLAMA_PS_URL: &str = "http://127.0.0.1:11434/api/ps";
+const OLLAMA_TAGS_URL: &str = "http://127.0.0.1:11434/api/tags";
 
 /// Models currently loaded in the local Ollama daemon, None when unreachable.
 pub fn ollama_loaded_models(probe: &dyn SystemProbe) -> Option<Vec<LoadedModel>> {
     let body = probe.http_get_local(OLLAMA_PS_URL)?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    Some(
+        v["models"]
+            .as_array()?
+            .iter()
+            .filter_map(|m| {
+                Some(LoadedModel {
+                    name: m["name"].as_str()?.to_string(),
+                    size_bytes: m["size"].as_u64().unwrap_or(0),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Models installed in the local Ollama daemon (`/api/tags`), None when
+/// unreachable. Reuses `LoadedModel { name, size_bytes }`.
+pub fn ollama_installed_models(probe: &dyn SystemProbe) -> Option<Vec<LoadedModel>> {
+    let body = probe.http_get_local(OLLAMA_TAGS_URL)?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
     Some(
         v["models"]
@@ -691,5 +711,29 @@ mod history_tests {
             .find(|e| e.plan.model_ref == "mlx-community/A")
             .unwrap();
         assert_eq!(a.last_served_at, 2000);
+    }
+}
+
+#[cfg(test)]
+mod installed_tests {
+    use super::*;
+    use crate::hardware::MockProbe;
+
+    #[test]
+    fn parses_ollama_tags() {
+        let mut probe = MockProbe::default();
+        probe.http.insert(
+            "http://127.0.0.1:11434/api/tags".to_string(),
+            r#"{"models":[{"name":"gemma4:26b","size":18000000000},{"name":"lfm2.5:latest","size":5200000000}]}"#.to_string(),
+        );
+        let got = ollama_installed_models(&probe).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].name, "gemma4:26b");
+        assert_eq!(got[0].size_bytes, 18000000000);
+    }
+
+    #[test]
+    fn none_when_daemon_down() {
+        assert!(ollama_installed_models(&MockProbe::default()).is_none());
     }
 }
