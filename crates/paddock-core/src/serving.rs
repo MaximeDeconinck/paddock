@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::PaddockError;
 use crate::catalog::RuntimeKind;
 use crate::hardware::SystemProbe;
+use crate::runtime::ServePlan;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServingRecord {
@@ -120,6 +121,60 @@ impl Registry {
         }
         live.sort_by_key(|r| r.started_at);
         live
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub plan: ServePlan,
+    pub last_served_at: i64,
+}
+
+/// Persistent log of spawned (llama.cpp/mlx) serves, so the TUI can offer them
+/// for one-key relaunch. Self-contained: stores the full `ServePlan`.
+pub struct History {
+    dir: PathBuf,
+}
+
+impl History {
+    pub fn at(dir: impl AsRef<Path>) -> Self {
+        Self {
+            dir: dir.as_ref().to_path_buf(),
+        }
+    }
+    pub fn open_default() -> Self {
+        Self::at(default_serving_dir())
+    }
+    fn path(&self) -> PathBuf {
+        self.dir.join("history.json")
+    }
+
+    pub fn load(&self) -> Vec<HistoryEntry> {
+        std::fs::read(self.path())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// Upsert by `plan.model_ref`, stamping `last_served_at`. Best-effort: a
+    /// write failure is ignored (history is a convenience, not load-bearing).
+    pub fn record(&self, plan: &ServePlan, now: i64) {
+        let mut entries = self.load();
+        entries.retain(|e| e.plan.model_ref != plan.model_ref);
+        entries.push(HistoryEntry {
+            plan: plan.clone(),
+            last_served_at: now,
+        });
+        if std::fs::create_dir_all(&self.dir).is_err() {
+            return;
+        }
+        let Ok(json) = serde_json::to_vec_pretty(&entries) else {
+            return;
+        };
+        let tmp = self.dir.join("history.json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, self.path());
+        }
     }
 }
 
@@ -579,5 +634,62 @@ mod match_tests {
     fn no_match_is_not_found() {
         let rs = vec![rec(1, "a")];
         assert!(matches!(match_records(&rs, "zzz"), RecordMatch::NotFound));
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use crate::catalog::RuntimeKind;
+
+    fn plan(model: &str, port: u16) -> crate::runtime::ServePlan {
+        crate::runtime::ServePlan {
+            server_argv: Some(vec![
+                "mlx_lm.server".into(),
+                "--model".into(),
+                model.into(),
+                "--port".into(),
+                port.to_string(),
+            ]),
+            pre_steps: vec![],
+            endpoint: format!("http://127.0.0.1:{port}"),
+            openai_url: format!("http://127.0.0.1:{port}/v1/chat/completions"),
+            model_ref: model.into(),
+            ready_path: "/v1/models".into(),
+            install: None,
+            port_ignored: false,
+            runtime: RuntimeKind::MlxLm,
+            ctx: 0,
+            port: Some(port),
+        }
+    }
+
+    #[test]
+    fn record_then_load_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("paddock-hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let h = History::at(&dir);
+        h.record(&plan("mlx-community/A", 8080), 1000);
+        let loaded = h.load();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].plan.model_ref, "mlx-community/A");
+        assert_eq!(loaded[0].last_served_at, 1000);
+    }
+
+    #[test]
+    fn record_upserts_by_model_ref() {
+        let dir = std::env::temp_dir().join(format!("paddock-hist-up-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let h = History::at(&dir);
+        h.record(&plan("mlx-community/A", 8080), 1000);
+        h.record(&plan("mlx-community/A", 8081), 2000); // same model_ref, later
+        h.record(&plan("mlx-community/B", 8082), 1500);
+        let loaded = h.load();
+        assert_eq!(loaded.len(), 2, "A upserted, B added");
+        let a = loaded
+            .iter()
+            .find(|e| e.plan.model_ref == "mlx-community/A")
+            .unwrap();
+        assert_eq!(a.last_served_at, 2000);
     }
 }
