@@ -216,12 +216,25 @@ fn serve_model(
 /// Full serve lifecycle: confirm install, spawn the server child when needed,
 /// wait for readiness, run pre-steps (e.g. `ollama pull`), print the endpoint
 /// block, then wait on the child. Shared with the TUI (Task 3).
-pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
+pub(crate) fn serve_with_plan(mut plan: ServePlan, foreground: bool) -> Result<()> {
     if plan.port_ignored {
         eprintln!("warning: --port is ignored for the Ollama daemon (fixed 11434)");
     }
     if let Some(install) = &plan.install {
         confirm_and_install(install)?;
+    }
+
+    // Spawned servers (llama.cpp/mlx) default to 8080; pick a free port so
+    // concurrent servers don't collide (and so the readiness probe can't be
+    // answered by a different process already on the port). The Ollama daemon
+    // has a fixed port and no server_argv, so it's untouched.
+    if plan.server_argv.is_some()
+        && let Some(requested) = plan.port
+        && let Some(free) = paddock_core::serving::free_port(requested)
+        && free != requested
+    {
+        eprintln!("port {requested} is busy - serving on {free} instead");
+        plan = plan.with_port(free);
     }
 
     let log_dir = paddock_core::serving::default_serving_dir().join("logs");

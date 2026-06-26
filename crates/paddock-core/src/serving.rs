@@ -195,6 +195,14 @@ pub fn terminate(pid: u32) {
     unsafe { libc_kill(pid as i32, 15) };
 }
 
+/// First free local TCP port at or above `start` (scans up to `start + 50`).
+/// Returns None if the whole range is taken. Best-effort: a TOCTOU window
+/// remains between this check and the server actually binding the port.
+pub fn free_port(start: u16) -> Option<u16> {
+    (start..=start.saturating_add(50))
+        .find(|&p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadedModel {
     pub name: String,
@@ -298,6 +306,23 @@ pub fn warm_up_ollama(probe: &dyn SystemProbe, model_ref: &str) -> bool {
     })
     .to_string();
     probe.http_post_local(OLLAMA_GENERATE_URL, &body).is_some()
+}
+
+#[cfg(test)]
+mod free_port_tests {
+    use super::*;
+
+    #[test]
+    fn free_port_skips_an_occupied_port() {
+        // Hold a listener on a high port, then free_port(that) must skip it.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = held.local_addr().unwrap().port();
+        let got = free_port(taken).expect("a free port above the taken one");
+        assert_ne!(got, taken);
+        assert!(got >= taken);
+        // and the returned port is actually bindable
+        std::net::TcpListener::bind(("127.0.0.1", got)).unwrap();
+    }
 }
 
 #[cfg(test)]

@@ -175,6 +175,24 @@ pub struct ServePlan {
     pub port: Option<u16>,
 }
 
+impl ServePlan {
+    /// Rebind a spawned-server plan to a different local port: rewrites the
+    /// `--port` argument, `endpoint`, `openai_url`, and `port`. Intended for
+    /// llama.cpp/mlx plans (the Ollama daemon has a fixed port and no --port).
+    pub fn with_port(mut self, port: u16) -> Self {
+        if let Some(argv) = self.server_argv.as_mut()
+            && let Some(i) = argv.iter().position(|a| a == "--port")
+            && let Some(slot) = argv.get_mut(i + 1)
+        {
+            *slot = port.to_string();
+        }
+        self.endpoint = format!("http://127.0.0.1:{port}");
+        self.openai_url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        self.port = Some(port);
+        self
+    }
+}
+
 /// Serve strategy mirrors `plan_run`, plus a llama.cpp fallback for HF GGUF
 /// (llama-server can download from HF directly via `-hf repo:quant`).
 ///
@@ -646,6 +664,20 @@ mod tests {
         let p2 = plan_serve(&m, &m.variants[0], &ollama_running(), Some(9999), None).unwrap();
         assert_eq!(p2.endpoint, "http://127.0.0.1:11434");
         assert!(p2.port_ignored);
+    }
+
+    #[test]
+    fn with_port_rewrites_argv_endpoint_and_url() {
+        let m = hf_model();
+        let p = plan_serve(&m, &m.variants[0], &llama_cpp_only(), None, None)
+            .unwrap()
+            .with_port(8090);
+        assert_eq!(p.port, Some(8090));
+        assert_eq!(p.endpoint, "http://127.0.0.1:8090");
+        assert_eq!(p.openai_url, "http://127.0.0.1:8090/v1/chat/completions");
+        let argv = p.server_argv.unwrap();
+        let i = argv.iter().position(|a| a == "--port").unwrap();
+        assert_eq!(argv[i + 1], "8090");
     }
 
     #[test]
