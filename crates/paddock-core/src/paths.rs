@@ -80,10 +80,14 @@ mod tests {
 
     #[test]
     fn hf_home_overrides_cache_dir() {
-        // SAFETY: single-threaded test; set+read+remove the env var.
+        // Read the value, then remove the var BEFORE asserting, so a failed
+        // assert never leaks HF_HOME into other tests in this (multithreaded)
+        // test binary. No other test reads HF_HOME, so the brief set is safe.
+        // SAFETY: env mutation; no concurrent reader of HF_HOME in this crate.
         unsafe { std::env::set_var("HF_HOME", "/tmp/xyzhf") };
-        assert_eq!(hf_cache_dir(), std::path::PathBuf::from("/tmp/xyzhf/hub"));
+        let got = hf_cache_dir();
         unsafe { std::env::remove_var("HF_HOME") };
+        assert_eq!(got, std::path::PathBuf::from("/tmp/xyzhf/hub"));
     }
 
     #[test]

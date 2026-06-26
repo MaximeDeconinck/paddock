@@ -406,7 +406,9 @@ fn hf_cache_has(model_ref: &str) -> bool {
 
 /// A minimal Ollama `ServePlan` for an installed tag (no catalog needed). The
 /// daemon serves it; `serve_with_plan` only warms it (no registry entry, no
-/// free-port step since `server_argv` is None).
+/// free-port step since `server_argv` is None). No `ollama pull` pre-step: these
+/// rows come from `ollama_installed_models`, so the model is already pulled.
+/// `ctx` is 0 (unused on the Ollama path, which has no `server_argv`).
 fn ollama_serve_plan(name: &str) -> ServePlan {
     ServePlan {
         server_argv: None,
@@ -450,6 +452,9 @@ pub fn list_available(
     }
 
     // llama.cpp/mlx from history, minus running, minus evicted-from-cache.
+    // Ollama-runtime history rows (model_ref `hf.co/...`) never match the HF hub
+    // cache layout, so `hf_cache_has` filters them out here - intentional: they
+    // are surfaced by `ollama_installed_models` above instead.
     let mut hist = history.load();
     hist.sort_by_key(|e| std::cmp::Reverse(e.last_served_at));
     for e in hist {
