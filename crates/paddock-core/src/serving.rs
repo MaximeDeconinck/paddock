@@ -383,6 +383,91 @@ pub fn warm_up_ollama(probe: &dyn SystemProbe, model_ref: &str) -> bool {
     probe.http_post_local(OLLAMA_GENERATE_URL, &body).is_some()
 }
 
+/// A locally-available model not currently running, for the servers tab's grey
+/// group. `enter` serves `plan`. Display fields are raw (the TUI formats them).
+#[derive(Debug, Clone)]
+pub struct AvailableRow {
+    pub model: String,
+    pub runtime: RuntimeKind,
+    /// Some for Ollama-installed rows (disk size).
+    pub size_bytes: Option<u64>,
+    /// Some for history rows (unix seconds of last serve).
+    pub last_served_at: Option<i64>,
+    pub plan: ServePlan,
+}
+
+/// True if the HF hub cache still holds the repo for `model_ref`
+/// (`{org}/{name}[:quant]`). One stat, not a scan.
+fn hf_cache_has(model_ref: &str) -> bool {
+    let repo = model_ref.split(':').next().unwrap_or(model_ref);
+    let dir = format!("models--{}", repo.replace('/', "--"));
+    crate::paths::hf_cache_dir().join(dir).exists()
+}
+
+/// A minimal Ollama `ServePlan` for an installed tag (no catalog needed). The
+/// daemon serves it; `serve_with_plan` only warms it (no registry entry, no
+/// free-port step since `server_argv` is None).
+fn ollama_serve_plan(name: &str) -> ServePlan {
+    ServePlan {
+        server_argv: None,
+        pre_steps: vec![],
+        endpoint: "http://127.0.0.1:11434".to_string(),
+        openai_url: "http://127.0.0.1:11434/v1/chat/completions".to_string(),
+        model_ref: name.to_string(),
+        ready_path: "/api/version".to_string(),
+        install: None,
+        port_ignored: false,
+        runtime: RuntimeKind::Ollama,
+        ctx: 0,
+        port: None,
+    }
+}
+
+/// Locally-available models not in `running`, for the grey group.
+pub fn list_available(
+    history: &History,
+    probe: &dyn SystemProbe,
+    running: &[ServerRow],
+) -> Vec<AvailableRow> {
+    let is_running = |model: &str| running.iter().any(|r| r.model == model);
+
+    let mut rows = Vec::new();
+
+    // Ollama installed (authoritative), minus the loaded ones.
+    if let Some(installed) = ollama_installed_models(probe) {
+        for m in installed {
+            if is_running(&m.name) {
+                continue;
+            }
+            rows.push(AvailableRow {
+                model: m.name.clone(),
+                runtime: RuntimeKind::Ollama,
+                size_bytes: Some(m.size_bytes),
+                last_served_at: None,
+                plan: ollama_serve_plan(&m.name),
+            });
+        }
+    }
+
+    // llama.cpp/mlx from history, minus running, minus evicted-from-cache.
+    let mut hist = history.load();
+    hist.sort_by_key(|e| std::cmp::Reverse(e.last_served_at));
+    for e in hist {
+        if is_running(&e.plan.model_ref) || !hf_cache_has(&e.plan.model_ref) {
+            continue;
+        }
+        rows.push(AvailableRow {
+            model: e.plan.model_ref.clone(),
+            runtime: e.plan.runtime,
+            size_bytes: None,
+            last_served_at: Some(e.last_served_at),
+            plan: e.plan,
+        });
+    }
+
+    rows
+}
+
 #[cfg(test)]
 mod free_port_tests {
     use super::*;
@@ -735,5 +820,37 @@ mod installed_tests {
     #[test]
     fn none_when_daemon_down() {
         assert!(ollama_installed_models(&MockProbe::default()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod available_tests {
+    use super::*;
+    use crate::hardware::MockProbe;
+
+    #[test]
+    fn merges_ollama_installed_and_dedups_running() {
+        let dir = std::env::temp_dir().join(format!("paddock-avail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let history = History::at(&dir); // empty history for this case
+        let mut probe = MockProbe::default();
+        probe.http.insert(
+            "http://127.0.0.1:11434/api/tags".to_string(),
+            r#"{"models":[{"name":"gemma4:26b","size":17000000000},{"name":"lfm2.5:latest","size":5200000000}]}"#.to_string(),
+        );
+        // gemma is already running -> must be excluded from available.
+        let running = vec![ServerRow {
+            model: "gemma4:26b".into(),
+            runtime: RuntimeKind::Ollama,
+            endpoint: "http://127.0.0.1:11434".into(),
+            openai_url: "http://127.0.0.1:11434/v1/chat/completions".into(),
+            ctx: None,
+            started_at: None,
+            stop: StopHandle::OllamaModel("gemma4:26b".into()),
+        }];
+        let avail = list_available(&history, &probe, &running);
+        let names: Vec<&str> = avail.iter().map(|a| a.model.as_str()).collect();
+        assert!(names.contains(&"lfm2.5:latest"));
+        assert!(!names.contains(&"gemma4:26b"), "running model excluded");
     }
 }

@@ -33,6 +33,16 @@ fn resolve(base: &Path) -> PathBuf {
     paddock
 }
 
+/// HuggingFace hub cache root (`~/.cache/huggingface/hub`), where mlx and
+/// `-hf` GGUF models land. `HF_HOME` overrides the `~/.cache/huggingface` base.
+pub fn hf_cache_dir() -> PathBuf {
+    if let Ok(h) = std::env::var("HF_HOME") {
+        return PathBuf::from(h).join("hub");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".cache/huggingface/hub")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +76,14 @@ mod tests {
 
         assert_eq!(std::fs::read(dir.join("catalog.db")).unwrap(), b"new");
         assert!(legacy.exists(), "legacy dir is left untouched");
+    }
+
+    #[test]
+    fn hf_home_overrides_cache_dir() {
+        // SAFETY: single-threaded test; set+read+remove the env var.
+        unsafe { std::env::set_var("HF_HOME", "/tmp/xyzhf") };
+        assert_eq!(hf_cache_dir(), std::path::PathBuf::from("/tmp/xyzhf/hub"));
+        unsafe { std::env::remove_var("HF_HOME") };
     }
 
     #[test]
