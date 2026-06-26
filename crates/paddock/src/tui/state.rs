@@ -5,7 +5,7 @@ use paddock_core::estimate::{MemoryBudget, resolve_ctx};
 use paddock_core::hardware::RuntimesStatus;
 use paddock_core::runtime::{RunPlan, ServePlan, plan_run, plan_serve};
 use paddock_core::score::UseCase;
-use paddock_core::serving::{ServerRow, StopHandle};
+use paddock_core::serving::{AvailableRow, ServerRow, StopHandle};
 
 use crate::app::ScoredModel;
 
@@ -20,6 +20,12 @@ pub enum Mode {
 pub enum Tab {
     Models,
     Servers,
+}
+
+enum SelectedRow<'a> {
+    Running(&'a ServerRow),
+    Available(&'a AvailableRow),
+    None,
 }
 
 /// Background-sync lifecycle as seen by the UI. Pure data; the event loop owns
@@ -107,6 +113,8 @@ pub struct TuiState {
     pub tab: Tab,
     /// Live servers shown on the Servers tab; refreshed by the background task.
     pub servers: Vec<ServerRow>,
+    /// Locally-available (not running) models shown greyed below the running ones.
+    pub available: Vec<AvailableRow>,
     /// Cursor within `servers`.
     pub server_selected: usize,
 }
@@ -135,6 +143,7 @@ impl TuiState {
             last_sync: None,
             tab: Tab::Models,
             servers: Vec::new(),
+            available: Vec::new(),
             server_selected: 0,
         }
     }
@@ -165,18 +174,39 @@ impl TuiState {
             .min(self.rows.len().saturating_sub(1));
     }
 
-    /// Replace the servers snapshot, keeping the cursor on the same row when it
-    /// survives the refresh, otherwise clamping to the new length. Identity is
-    /// the unique `stop` handle (pid / Ollama model), not the model name, so
-    /// two rows sharing a model name (same model served on two ports) don't
-    /// collapse onto each other.
-    pub fn set_servers(&mut self, servers: Vec<ServerRow>) {
-        let selected = self.servers.get(self.server_selected).map(|r| r.stop.clone());
-        self.servers = servers;
-        self.server_selected = selected
-            .and_then(|h| self.servers.iter().position(|r| r.stop == h))
+    /// Replace both groups. Cursor preserved by identity (running by model,
+    /// available by model) then clamped to the combined length.
+    pub fn set_snapshot(&mut self, running: Vec<ServerRow>, available: Vec<AvailableRow>) {
+        let prev = self.selected_combined_key();
+        self.servers = running;
+        self.available = available;
+        let len = self.servers.len() + self.available.len();
+        self.server_selected = prev
+            .and_then(|k| self.combined_keys().position(|c| c == k))
             .unwrap_or(0)
-            .min(self.servers.len().saturating_sub(1));
+            .min(len.saturating_sub(1));
+    }
+
+    /// Stable identity per combined row for cursor preservation across refreshes.
+    fn combined_keys(&self) -> impl Iterator<Item = String> + '_ {
+        let running = self.servers.iter().map(|r| format!("r:{}", r.model));
+        let avail = self.available.iter().map(|a| format!("a:{}", a.model));
+        running.chain(avail)
+    }
+    fn selected_combined_key(&self) -> Option<String> {
+        self.combined_keys().nth(self.server_selected)
+    }
+
+    /// What the servers-tab cursor points at.
+    fn selected_row(&self) -> SelectedRow<'_> {
+        let n = self.servers.len();
+        if self.server_selected < n {
+            SelectedRow::Running(&self.servers[self.server_selected])
+        } else if let Some(a) = self.available.get(self.server_selected - n) {
+            SelectedRow::Available(a)
+        } else {
+            SelectedRow::None
+        }
     }
 
     /// Drop the currently-selected server row (optimistic update after a stop;
@@ -185,11 +215,11 @@ impl TuiState {
         if self.server_selected < self.servers.len() {
             self.servers.remove(self.server_selected);
         }
-        self.server_selected = self
-            .server_selected
-            .min(self.servers.len().saturating_sub(1));
+        let len = self.servers.len() + self.available.len();
+        self.server_selected = self.server_selected.min(len.saturating_sub(1));
     }
 
+    #[cfg(test)]
     pub fn selected_server(&self) -> Option<&ServerRow> {
         self.servers.get(self.server_selected)
     }
@@ -288,16 +318,22 @@ impl TuiState {
                             self.server_selected = self.server_selected.saturating_sub(1)
                         }
                         K::Down => {
-                            self.server_selected = (self.server_selected + 1)
-                                .min(self.servers.len().saturating_sub(1));
+                            let len = self.servers.len() + self.available.len();
+                            self.server_selected =
+                                (self.server_selected + 1).min(len.saturating_sub(1));
+                        }
+                        K::Enter => {
+                            if let SelectedRow::Available(a) = self.selected_row() {
+                                return Action::Serve(a.plan.clone());
+                            }
                         }
                         K::Char('x') => {
-                            if let Some(r) = self.selected_server() {
+                            if let SelectedRow::Running(r) = self.selected_row() {
                                 return Action::StopServer(r.stop.clone());
                             }
                         }
                         K::Char('c') => {
-                            if let Some(r) = self.selected_server() {
+                            if let SelectedRow::Running(r) = self.selected_row() {
                                 return Action::CopyEndpoint(r.openai_url.clone());
                             }
                         }
@@ -454,7 +490,35 @@ mod tests {
         row
     }
 
-    use paddock_core::serving::{ServerRow, StopHandle};
+    use paddock_core::serving::{AvailableRow, ServerRow, StopHandle};
+
+    fn avail(model: &str) -> AvailableRow {
+        AvailableRow {
+            model: model.into(),
+            runtime: RuntimeKind::MlxLm,
+            size_bytes: None,
+            last_served_at: Some(0),
+            plan: paddock_core::runtime::ServePlan {
+                server_argv: Some(vec![
+                    "mlx_lm.server".into(),
+                    "--model".into(),
+                    model.into(),
+                    "--port".into(),
+                    "8080".into(),
+                ]),
+                pre_steps: vec![],
+                endpoint: "http://127.0.0.1:8080".into(),
+                openai_url: "http://127.0.0.1:8080/v1/chat/completions".into(),
+                model_ref: model.into(),
+                ready_path: "/v1/models".into(),
+                install: None,
+                port_ignored: false,
+                runtime: RuntimeKind::MlxLm,
+                ctx: 0,
+                port: Some(8080),
+            },
+        }
+    }
 
     fn srv(pid: u32, model: &str, port: u16) -> ServerRow {
         ServerRow {
@@ -718,7 +782,7 @@ mod tests {
     #[test]
     fn servers_tab_navigation_is_clamped() {
         let mut s = state();
-        s.set_servers(vec![srv(1, "a", 8080), srv(2, "b", 8081)]);
+        s.set_snapshot(vec![srv(1, "a", 8080), srv(2, "b", 8081)], vec![]);
         s.handle_key(key(KeyCode::Tab)); // -> Servers
         assert_eq!(s.server_selected, 0);
         s.handle_key(key(KeyCode::Up)); // clamped at top
@@ -730,15 +794,15 @@ mod tests {
     }
 
     #[test]
-    fn set_servers_preserves_selection_by_handle() {
+    fn set_snapshot_preserves_selection_by_model() {
         let mut s = state();
-        s.set_servers(vec![srv(10, "a", 8080), srv(20, "b", 8081)]);
+        s.set_snapshot(vec![srv(10, "a", 8080), srv(20, "b", 8081)], vec![]);
         s.tab = Tab::Servers;
-        s.server_selected = 1; // pid 20
-        s.set_servers(vec![srv(20, "b", 8081)]); // pid 10 dropped
-        // The cursor follows pid 20 to its new index, keyed on the stop handle.
+        s.server_selected = 1; // model "b"
+        s.set_snapshot(vec![srv(20, "b", 8081)], vec![]); // model "a" dropped
+        // The cursor follows model "b" to its new index, keyed on the model name.
         assert_eq!(s.server_selected, 0);
-        assert_eq!(s.selected_server().unwrap().stop, StopHandle::Pid(20));
+        assert_eq!(s.selected_server().unwrap().model, "b");
     }
 
     #[test]
@@ -758,7 +822,7 @@ mod tests {
     #[test]
     fn x_on_servers_tab_returns_stop_action() {
         let mut s = state();
-        s.set_servers(vec![srv(42, "qwen", 8080)]);
+        s.set_snapshot(vec![srv(42, "qwen", 8080)], vec![]);
         s.tab = Tab::Servers;
         match s.handle_key(key(KeyCode::Char('x'))) {
             Action::StopServer(h) => assert_eq!(h, StopHandle::Pid(42)),
@@ -769,7 +833,7 @@ mod tests {
     #[test]
     fn c_on_servers_tab_returns_copy_action() {
         let mut s = state();
-        s.set_servers(vec![srv(42, "qwen", 8080)]);
+        s.set_snapshot(vec![srv(42, "qwen", 8080)], vec![]);
         s.tab = Tab::Servers;
         match s.handle_key(key(KeyCode::Char('c'))) {
             Action::CopyEndpoint(url) => {
@@ -782,7 +846,10 @@ mod tests {
     #[test]
     fn remove_selected_drops_and_clamps() {
         let mut s = state();
-        s.set_servers(vec![srv(1, "a", 8080), srv(2, "b", 8081), srv(3, "c", 8082)]);
+        s.set_snapshot(
+            vec![srv(1, "a", 8080), srv(2, "b", 8081), srv(3, "c", 8082)],
+            vec![],
+        );
         s.tab = Tab::Servers;
         s.server_selected = 2; // last (model "c")
         s.remove_selected();
@@ -828,5 +895,45 @@ mod tests {
         assert_eq!(s.mode, Mode::List, "Detail popup must close when serving");
         assert!(s.detail_plan.is_none());
         assert!(s.detail_serve_plan.is_none());
+    }
+
+    #[test]
+    fn navigation_spans_running_then_available() {
+        let mut s = state();
+        s.set_snapshot(vec![srv(1, "run-a", 8080)], vec![avail("avail-b"), avail("avail-c")]);
+        s.tab = Tab::Servers;
+        assert_eq!(s.server_selected, 0);
+        s.handle_key(key(KeyCode::Down));
+        s.handle_key(key(KeyCode::Down));
+        assert_eq!(s.server_selected, 2);
+        s.handle_key(key(KeyCode::Down)); // clamped
+        assert_eq!(s.server_selected, 2);
+    }
+
+    #[test]
+    fn enter_on_available_serves_its_plan() {
+        let mut s = state();
+        s.set_snapshot(vec![], vec![avail("avail-b")]);
+        s.tab = Tab::Servers;
+        match s.handle_key(key(KeyCode::Enter)) {
+            Action::Serve(p) => assert_eq!(p.model_ref, "avail-b"),
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_on_running_is_noop() {
+        let mut s = state();
+        s.set_snapshot(vec![srv(1, "run-a", 8080)], vec![]);
+        s.tab = Tab::Servers;
+        assert!(matches!(s.handle_key(key(KeyCode::Enter)), Action::None));
+    }
+
+    #[test]
+    fn x_on_available_is_noop() {
+        let mut s = state();
+        s.set_snapshot(vec![], vec![avail("avail-b")]);
+        s.tab = Tab::Servers;
+        assert!(matches!(s.handle_key(key(KeyCode::Char('x'))), Action::None));
     }
 }
