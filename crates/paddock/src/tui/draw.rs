@@ -342,8 +342,12 @@ fn draw_detail(frame: &mut Frame, state: &TuiState, profile: &HardwareProfile) {
     let Some(r) = state.rows.get(state.selected) else {
         return;
     };
+    let sel = state.detail_variant.min(r.model.variants.len().saturating_sub(1));
     let lines = detail_lines(
         r,
+        sel,
+        &state.budget,
+        profile.bandwidth_gbps,
         state.detail_plan.as_ref(),
         state.detail_serve_plan.as_ref(),
     );
@@ -362,21 +366,32 @@ fn draw_detail(frame: &mut Frame, state: &TuiState, profile: &HardwareProfile) {
     let [text_area, chart_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(SPEED_CHART_HEIGHT)]).areas(inner);
     frame.render_widget(Paragraph::new(lines), text_area);
-    draw_speed_chart(frame, chart_area, r, profile.bandwidth_gbps);
+    draw_speed_chart(
+        frame,
+        chart_area,
+        &r.model.to_model_variant(&r.model.variants[sel]),
+        r.model.context_max,
+        profile.bandwidth_gbps,
+    );
 }
 
 /// Generation speed as a function of context depth - the KV cache is
 /// re-streamed every token, so tok/s decays as the conversation grows.
 /// Sampled from the same estimator the table uses (anchored at 8k there).
-fn draw_speed_chart(frame: &mut Frame, area: Rect, r: &ScoredModel, bandwidth_gbps: f64) {
-    let v = r.model.to_model_variant(&r.model.variants[r.variant_idx]);
-    let max_ctx = r.model.context_max.clamp(8_192, 131_072);
+fn draw_speed_chart(
+    frame: &mut Frame,
+    area: Rect,
+    v: &paddock_core::estimate::ModelVariant,
+    context_max: u32,
+    bandwidth_gbps: f64,
+) {
+    let max_ctx = context_max.clamp(8_192, 131_072);
     const SAMPLES: u32 = 64;
     let points: Vec<(f64, f64)> = (0..=SAMPLES)
         .map(|i| {
             let ctx = max_ctx as u64 * i as u64 / SAMPLES as u64;
             let tps =
-                estimate_speed(&v, bandwidth_gbps, kv_cache_bytes(&v, ctx as u32)).generation_tps;
+                estimate_speed(v, bandwidth_gbps, kv_cache_bytes(v, ctx as u32)).generation_tps;
             (ctx as f64, tps)
         })
         .collect();
@@ -431,117 +446,77 @@ fn draw_speed_chart(frame: &mut Frame, area: Rect, r: &ScoredModel, bandwidth_gb
 
 fn detail_lines<'a>(
     r: &'a ScoredModel,
+    selected: usize,
+    budget: &paddock_core::estimate::MemoryBudget,
+    bandwidth_gbps: f64,
     plan: Option<&'a Result<RunPlan, String>>,
     serve_plan: Option<&'a Result<ServePlan, String>>,
 ) -> Vec<Line<'a>> {
-    let v = &r.model.variants[r.variant_idx];
-    let section = |s: &'a str| {
-        Line::from(Span::styled(
-            s,
-            Style::new()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ))
-    };
-    let kv = |k: &'a str, val: String| {
-        Line::from(vec![
-            Span::styled(format!("  {k:<14}"), Style::new().fg(Color::DarkGray)),
-            Span::styled(val, Style::new().fg(Color::Gray)),
-        ])
-    };
+    use paddock_core::estimate::{DEFAULT_CONTEXT, estimate_memory};
 
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                r.model.name.as_str(),
-                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("  {}", v.quant), Style::new().fg(Color::Gray)),
-        ]),
+        Line::from(Span::styled(
+            r.model.name.as_str(),
+            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+        )),
         Line::default(),
-        section("score"),
-        kv("total", format!("{:.0}/100", r.score.total)),
-        kv(
-            "breakdown",
-            format!(
-                "fit {:.0} · speed {:.0} · quality {:.0} · context {:.0}",
-                r.score.fit, r.score.speed, r.score.quality, r.score.context
-            ),
-        ),
-        Line::default(),
-        section("memory"),
-        kv("weights", gib(r.memory.weights_bytes)),
-        kv("kv cache @8k", gib(r.memory.kv_cache_bytes)),
-        kv("overhead", gib(r.memory.overhead_bytes)),
-        kv(
-            "total",
-            format!(
-                "{} vs GPU limit {} ({})",
-                gib(r.memory.total_bytes),
-                gib(r.memory.gpu_limit_bytes),
-                verdict_label(r.memory.verdict)
-            ),
-        ),
-        Line::default(),
-        section("speed"),
-        kv(
-            "generation",
-            format!(
-                "~{:.0} tok/s ({})",
-                r.speed.generation_tps,
-                r.speed.tier.label()
-            ),
-        ),
-        kv(
-            "prompt",
-            format!(
-                "~{:.0}–{:.0} tok/s",
-                r.speed.prompt_tps_range.0, r.speed.prompt_tps_range.1
-            ),
-        ),
-        Line::default(),
-        section("run"),
+        Line::from(Span::styled(
+            format!("  {:<14} {:>10} {:>7}  {}", "QUANT", "MEMORY", "TOK/S", "FIT"),
+            Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        )),
     ];
+
+    for &i in &paddock_core::score::variants_by_quality(
+        &r.model.variants.iter().map(|v| r.model.to_model_variant(v)).collect::<Vec<_>>(),
+    ) {
+        let v = r.model.to_model_variant(&r.model.variants[i]);
+        let mem = estimate_memory(&v, DEFAULT_CONTEXT, budget);
+        let tps = estimate_speed(&v, bandwidth_gbps, kv_cache_bytes(&v, DEFAULT_CONTEXT)).generation_tps;
+        let marker = if i == selected { "> " } else { "  " };
+        let row_style = if i == selected {
+            Style::new().fg(Color::White).bg(ACCENT_DEEP)
+        } else {
+            Style::new().fg(Color::Gray)
+        };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{marker}{:<14} {:>10} {:>7}  {}",
+                r.model.variants[i].quant,
+                gib(mem.total_bytes),
+                format!("{:.0}", tps),
+                verdict_label(mem.verdict),
+            ),
+            row_style,
+        )));
+    }
+
+    lines.push(Line::default());
     match plan {
-        Some(Ok(plan)) => lines.push(Line::from(vec![
-            Span::styled("  $ ", Style::new().fg(Color::DarkGray)),
-            Span::styled(plan.display(), Style::new().fg(ACCENT)),
+        Some(Ok(p)) => lines.push(Line::from(vec![
+            Span::styled("  x to run  ", Style::new().fg(Color::DarkGray)),
+            Span::styled(p.display(), Style::new().fg(Color::Gray)),
         ])),
         Some(Err(e)) => lines.push(Line::from(Span::styled(
-            format!("  {e}"),
-            Style::new()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
+            format!("  run unavailable: {e}"),
+            Style::new().fg(ACCENT),
         ))),
         None => {}
     }
-    // One-line serve hint right under the run command, plan-derived so the
-    // endpoint shown is exactly the one `s` would serve on.
     match serve_plan {
-        Some(Ok(sp)) => {
-            let runtime = crate::output::runtime_label(sp.runtime);
-            lines.push(Line::from(vec![
-                Span::styled("  s to serve on ", Style::new().fg(Color::DarkGray)),
-                Span::styled(sp.endpoint.clone(), Style::new().fg(ACCENT)),
-                Span::styled(format!(" ({runtime})"), Style::new().fg(Color::DarkGray)),
-            ]));
-        }
+        Some(Ok(sp)) => lines.push(Line::from(vec![
+            Span::styled("  s to serve on ", Style::new().fg(Color::DarkGray)),
+            Span::styled(sp.endpoint.clone(), Style::new().fg(ACCENT)),
+        ])),
         Some(Err(e)) => lines.push(Line::from(Span::styled(
-            format!("  {e}"),
-            Style::new()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
+            format!("  serve unavailable: {e}"),
+            Style::new().fg(ACCENT),
         ))),
         None => {}
     }
-    if r.memory.verdict == FitVerdict::FitsWithSysctlTuning {
-        let mb = r.memory.total_bytes / (1024 * 1024) + 1024;
-        lines.push(Line::default());
-        lines.push(section("tuning"));
-        lines.push(kv("hint", format!("sudo sysctl iogpu.wired_limit_mb={mb}")));
-    }
-    // Trailing gap before the speed chart rendered in the area below.
-    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "  up/down pick quant · esc back",
+        Style::new().fg(Color::DarkGray),
+    )));
     lines
 }
 
