@@ -196,41 +196,50 @@ fn context_subscore(context_max: u32) -> f64 {
 /// Quant descent order for "best quant that fits".
 pub const QUANT_DESCENT: &[&str] = &["Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q3_K_M", "Q2_K"];
 
-/// Pick the best variant of one model: walk the descent, first FitsGpu wins;
-/// if none fits the GPU, retry accepting FitsWithSysctlTuning, then FitsRamOnly.
-/// Unknown quants (IQ4_XS, F16, MLX bits) are appended after the descent list,
-/// sorted by descending bpw.
-pub fn best_variant<'a>(
-    variants: &'a [ModelVariant],
-    budget: &MemoryBudget,
-) -> Option<&'a ModelVariant> {
+/// Variant indices ordered best-quality-first: by the QUANT_DESCENT ladder,
+/// then higher bpw, then quant label. Unknown quants (IQ4_XS, F16, MLX bits)
+/// are appended after the descent list, sorted by descending bpw. The order
+/// `best_variant` walks.
+pub fn variants_by_quality(variants: &[ModelVariant]) -> Vec<usize> {
     let rank = |v: &ModelVariant| {
         QUANT_DESCENT
             .iter()
             .position(|q| *q == v.quant)
             .unwrap_or(QUANT_DESCENT.len())
     };
-    let mut ordered: Vec<&ModelVariant> = variants.iter().collect();
-    ordered.sort_by(|a, b| {
-        rank(a)
-            .cmp(&rank(b))
+    let mut order: Vec<usize> = (0..variants.len()).collect();
+    order.sort_by(|&a, &b| {
+        rank(&variants[a])
+            .cmp(&rank(&variants[b]))
             .then(
-                b.bpw
-                    .partial_cmp(&a.bpw)
+                variants[b]
+                    .bpw
+                    .partial_cmp(&variants[a].bpw)
                     .unwrap_or(std::cmp::Ordering::Equal),
             )
-            .then_with(|| a.quant.cmp(&b.quant))
+            .then_with(|| variants[a].quant.cmp(&variants[b].quant))
     });
+    order
+}
+
+/// Pick the best variant of one model: walk the quality order, first FitsGpu
+/// wins; if none fits the GPU, retry accepting FitsWithSysctlTuning, then
+/// FitsRamOnly. None if nothing fits even RAM.
+pub fn best_variant<'a>(
+    variants: &'a [ModelVariant],
+    budget: &MemoryBudget,
+) -> Option<&'a ModelVariant> {
+    let order = variants_by_quality(variants);
     for accept in [
         FitVerdict::FitsGpu,
         FitVerdict::FitsWithSysctlTuning,
         FitVerdict::FitsRamOnly,
     ] {
-        if let Some(v) = ordered
+        if let Some(&i) = order
             .iter()
-            .find(|v| estimate_memory(v, DEFAULT_CONTEXT, budget).verdict == accept)
+            .find(|&&i| estimate_memory(&variants[i], DEFAULT_CONTEXT, budget).verdict == accept)
         {
-            return Some(v);
+            return Some(&variants[i]);
         }
     }
     None
@@ -326,6 +335,18 @@ mod tests {
         let tunable = vec![variant("Q4_K_M", 4.83, 45_000_000_000)]; // ~30.1GB total < 34.4GB tunable
         let b2 = best_variant(&tunable, &budget());
         assert!(b2.is_some());
+    }
+
+    #[test]
+    fn variants_by_quality_orders_best_first() {
+        let variants = vec![
+            variant("Q2_K", 3.35, 8_000_000_000),
+            variant("Q8_0", 8.5, 8_000_000_000),
+            variant("Q4_K_M", 4.83, 8_000_000_000),
+        ];
+        let order = variants_by_quality(&variants);
+        let labels: Vec<&str> = order.iter().map(|&i| variants[i].quant.as_str()).collect();
+        assert_eq!(labels, vec!["Q8_0", "Q4_K_M", "Q2_K"]);
     }
 
     #[test]

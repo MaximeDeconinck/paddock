@@ -27,19 +27,22 @@ Sleep 2.5s
 Down@250ms 5
 Sleep 1.5s
 
-# Open the detail popup of the selected model.
-Enter
-Sleep 3s
-Escape
-Sleep 1s
-
-# Search.
+# Search for a model with several quantizations.
 Type "/"
 Sleep 500ms
 Type@120ms "qwen"
 Sleep 500ms
 Enter
-Sleep 2s
+Sleep 1.5s
+
+# Open the detail popup and pick a smaller quant (the quant picker): the table
+# lists every quant with its memory / tok-s / fit; arrows move the selection.
+Enter
+Sleep 2.5s
+Down@500ms 3
+Sleep 2.5s
+Escape
+Sleep 1s
 
 # Re-score for the coding use-case, then back to general.
 Type "c"
