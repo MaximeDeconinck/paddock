@@ -201,14 +201,30 @@ Every subcommand takes `--json` for machine-readable output; `paddock run x --js
 
 ### TUI keys
 
+Two tabs: **models** (the ranking) and **servers** (what is running, plus an *available* group of installed Ollama models and previously served catalog entries you can relaunch). `tab` switches between them.
+
+**Models tab:**
+
 | Key | Action |
 |-----|--------|
-| `↑`/`↓` or `j`/`k` | move selection |
+| `↑`/`↓` | move selection |
 | `Enter` | open detail view (memory breakdown, run plan) |
 | `x` | run the selected model |
 | `s` | serve the selected model (OpenAI-compatible endpoint) |
 | `/` | search (type to filter, `Enter` apply, `Esc` clear) |
 | `g` / `c` / `r` / `h` | re-score for general / coding / reasoning / chat |
+| `tab` | switch to the servers tab |
+| `q`, `Ctrl-C` | quit |
+
+**Servers tab:**
+
+| Key | Action |
+|-----|--------|
+| `↑`/`↓` | move selection |
+| `Enter` | relaunch the selected available model |
+| `x` | stop the selected running server |
+| `c` | copy the endpoint URL |
+| `tab` | switch to the models tab |
 | `q`, `Ctrl-C` | quit |
 
 ## How the estimates work

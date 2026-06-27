@@ -1,5 +1,7 @@
 # Demo of the paddock TUI for the README.
 # Regenerate after UI changes: cargo build --release && vhs docs/demo.tape
+# A running server + installed Ollama models make the servers tab non-empty;
+# seed one first, e.g. `paddock serve <cached-model>`.
 
 Output docs/demo.gif
 
@@ -39,12 +41,21 @@ Sleep 500ms
 Enter
 Sleep 2s
 
-# Switch the scoring to the coding use-case.
+# Re-score for the coding use-case, then back to general.
 Type "c"
-Sleep 2.5s
-
-# Back to general, quit.
+Sleep 2s
 Type "g"
 Sleep 1.5s
+
+# Switch to the servers tab: running endpoints on top, the AVAILABLE group
+# below (greyed, relaunchable) - Ollama models + previously served catalog entries.
+Tab
+Sleep 3s
+Down@300ms 4
+Sleep 2.5s
+
+# Back to the models tab, quit.
+Tab
+Sleep 1s
 Type "q"
 Sleep 1s
