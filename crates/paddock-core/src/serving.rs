@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::PaddockError;
 use crate::catalog::RuntimeKind;
 use crate::hardware::SystemProbe;
+use crate::runtime::ServePlan;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServingRecord {
@@ -123,6 +124,60 @@ impl Registry {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub plan: ServePlan,
+    pub last_served_at: i64,
+}
+
+/// Persistent log of spawned (llama.cpp/mlx) serves, so the TUI can offer them
+/// for one-key relaunch. Self-contained: stores the full `ServePlan`.
+pub struct History {
+    dir: PathBuf,
+}
+
+impl History {
+    pub fn at(dir: impl AsRef<Path>) -> Self {
+        Self {
+            dir: dir.as_ref().to_path_buf(),
+        }
+    }
+    pub fn open_default() -> Self {
+        Self::at(default_serving_dir())
+    }
+    fn path(&self) -> PathBuf {
+        self.dir.join("history.json")
+    }
+
+    pub fn load(&self) -> Vec<HistoryEntry> {
+        std::fs::read(self.path())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// Upsert by `plan.model_ref`, stamping `last_served_at`. Best-effort: a
+    /// write failure is ignored (history is a convenience, not load-bearing).
+    pub fn record(&self, plan: &ServePlan, now: i64) {
+        let mut entries = self.load();
+        entries.retain(|e| e.plan.model_ref != plan.model_ref);
+        entries.push(HistoryEntry {
+            plan: plan.clone(),
+            last_served_at: now,
+        });
+        if std::fs::create_dir_all(&self.dir).is_err() {
+            return;
+        }
+        let Ok(json) = serde_json::to_vec_pretty(&entries) else {
+            return;
+        };
+        let tmp = self.dir.join("history.json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, self.path());
+        }
+    }
+}
+
 /// `kill(pid, 0)` liveness probe (signal 0 = existence check, no signal sent).
 /// kill→-1/EPERM (alive process owned by another user) reads as dead here -
 /// acceptable, we only track our own children.
@@ -212,10 +267,30 @@ pub struct LoadedModel {
 const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 const OLLAMA_OPENAI_URL: &str = "http://127.0.0.1:11434/v1/chat/completions";
 const OLLAMA_PS_URL: &str = "http://127.0.0.1:11434/api/ps";
+const OLLAMA_TAGS_URL: &str = "http://127.0.0.1:11434/api/tags";
 
 /// Models currently loaded in the local Ollama daemon, None when unreachable.
 pub fn ollama_loaded_models(probe: &dyn SystemProbe) -> Option<Vec<LoadedModel>> {
     let body = probe.http_get_local(OLLAMA_PS_URL)?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    Some(
+        v["models"]
+            .as_array()?
+            .iter()
+            .filter_map(|m| {
+                Some(LoadedModel {
+                    name: m["name"].as_str()?.to_string(),
+                    size_bytes: m["size"].as_u64().unwrap_or(0),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Models installed in the local Ollama daemon (`/api/tags`), None when
+/// unreachable. Reuses `LoadedModel { name, size_bytes }`.
+pub fn ollama_installed_models(probe: &dyn SystemProbe) -> Option<Vec<LoadedModel>> {
+    let body = probe.http_get_local(OLLAMA_TAGS_URL)?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
     Some(
         v["models"]
@@ -306,6 +381,96 @@ pub fn warm_up_ollama(probe: &dyn SystemProbe, model_ref: &str) -> bool {
     })
     .to_string();
     probe.http_post_local(OLLAMA_GENERATE_URL, &body).is_some()
+}
+
+/// A locally-available model not currently running, for the servers tab's grey
+/// group. `enter` serves `plan`. Display fields are raw (the TUI formats them).
+#[derive(Debug, Clone)]
+pub struct AvailableRow {
+    pub model: String,
+    pub runtime: RuntimeKind,
+    /// Some for Ollama-installed rows (disk size).
+    pub size_bytes: Option<u64>,
+    /// Some for history rows (unix seconds of last serve).
+    pub last_served_at: Option<i64>,
+    pub plan: ServePlan,
+}
+
+/// True if the HF hub cache still holds the repo for `model_ref`
+/// (`{org}/{name}[:quant]`). One stat, not a scan.
+fn hf_cache_has(model_ref: &str) -> bool {
+    let repo = model_ref.split(':').next().unwrap_or(model_ref);
+    let dir = format!("models--{}", repo.replace('/', "--"));
+    crate::paths::hf_cache_dir().join(dir).exists()
+}
+
+/// A minimal Ollama `ServePlan` for an installed tag (no catalog needed). The
+/// daemon serves it; `serve_with_plan` only warms it (no registry entry, no
+/// free-port step since `server_argv` is None). No `ollama pull` pre-step: these
+/// rows come from `ollama_installed_models`, so the model is already pulled.
+/// `ctx` is 0 (unused on the Ollama path, which has no `server_argv`).
+fn ollama_serve_plan(name: &str) -> ServePlan {
+    ServePlan {
+        server_argv: None,
+        pre_steps: vec![],
+        endpoint: "http://127.0.0.1:11434".to_string(),
+        openai_url: "http://127.0.0.1:11434/v1/chat/completions".to_string(),
+        model_ref: name.to_string(),
+        ready_path: "/api/version".to_string(),
+        install: None,
+        port_ignored: false,
+        runtime: RuntimeKind::Ollama,
+        ctx: 0,
+        port: None,
+    }
+}
+
+/// Locally-available models not in `running`, for the grey group.
+pub fn list_available(
+    history: &History,
+    probe: &dyn SystemProbe,
+    running: &[ServerRow],
+) -> Vec<AvailableRow> {
+    let is_running = |model: &str| running.iter().any(|r| r.model == model);
+
+    let mut rows = Vec::new();
+
+    // Ollama installed (authoritative), minus the loaded ones.
+    if let Some(installed) = ollama_installed_models(probe) {
+        for m in installed {
+            if is_running(&m.name) {
+                continue;
+            }
+            rows.push(AvailableRow {
+                model: m.name.clone(),
+                runtime: RuntimeKind::Ollama,
+                size_bytes: Some(m.size_bytes),
+                last_served_at: None,
+                plan: ollama_serve_plan(&m.name),
+            });
+        }
+    }
+
+    // llama.cpp/mlx from history, minus running, minus evicted-from-cache.
+    // Ollama-runtime history rows (model_ref `hf.co/...`) never match the HF hub
+    // cache layout, so `hf_cache_has` filters them out here - intentional: they
+    // are surfaced by `ollama_installed_models` above instead.
+    let mut hist = history.load();
+    hist.sort_by_key(|e| std::cmp::Reverse(e.last_served_at));
+    for e in hist {
+        if is_running(&e.plan.model_ref) || !hf_cache_has(&e.plan.model_ref) {
+            continue;
+        }
+        rows.push(AvailableRow {
+            model: e.plan.model_ref.clone(),
+            runtime: e.plan.runtime,
+            size_bytes: None,
+            last_served_at: Some(e.last_served_at),
+            plan: e.plan,
+        });
+    }
+
+    rows
 }
 
 #[cfg(test)]
@@ -579,5 +744,118 @@ mod match_tests {
     fn no_match_is_not_found() {
         let rs = vec![rec(1, "a")];
         assert!(matches!(match_records(&rs, "zzz"), RecordMatch::NotFound));
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use crate::catalog::RuntimeKind;
+
+    fn plan(model: &str, port: u16) -> crate::runtime::ServePlan {
+        crate::runtime::ServePlan {
+            server_argv: Some(vec![
+                "mlx_lm.server".into(),
+                "--model".into(),
+                model.into(),
+                "--port".into(),
+                port.to_string(),
+            ]),
+            pre_steps: vec![],
+            endpoint: format!("http://127.0.0.1:{port}"),
+            openai_url: format!("http://127.0.0.1:{port}/v1/chat/completions"),
+            model_ref: model.into(),
+            ready_path: "/v1/models".into(),
+            install: None,
+            port_ignored: false,
+            runtime: RuntimeKind::MlxLm,
+            ctx: 0,
+            port: Some(port),
+        }
+    }
+
+    #[test]
+    fn record_then_load_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("paddock-hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let h = History::at(&dir);
+        h.record(&plan("mlx-community/A", 8080), 1000);
+        let loaded = h.load();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].plan.model_ref, "mlx-community/A");
+        assert_eq!(loaded[0].last_served_at, 1000);
+    }
+
+    #[test]
+    fn record_upserts_by_model_ref() {
+        let dir = std::env::temp_dir().join(format!("paddock-hist-up-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let h = History::at(&dir);
+        h.record(&plan("mlx-community/A", 8080), 1000);
+        h.record(&plan("mlx-community/A", 8081), 2000); // same model_ref, later
+        h.record(&plan("mlx-community/B", 8082), 1500);
+        let loaded = h.load();
+        assert_eq!(loaded.len(), 2, "A upserted, B added");
+        let a = loaded
+            .iter()
+            .find(|e| e.plan.model_ref == "mlx-community/A")
+            .unwrap();
+        assert_eq!(a.last_served_at, 2000);
+    }
+}
+
+#[cfg(test)]
+mod installed_tests {
+    use super::*;
+    use crate::hardware::MockProbe;
+
+    #[test]
+    fn parses_ollama_tags() {
+        let mut probe = MockProbe::default();
+        probe.http.insert(
+            "http://127.0.0.1:11434/api/tags".to_string(),
+            r#"{"models":[{"name":"gemma4:26b","size":18000000000},{"name":"lfm2.5:latest","size":5200000000}]}"#.to_string(),
+        );
+        let got = ollama_installed_models(&probe).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].name, "gemma4:26b");
+        assert_eq!(got[0].size_bytes, 18000000000);
+    }
+
+    #[test]
+    fn none_when_daemon_down() {
+        assert!(ollama_installed_models(&MockProbe::default()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod available_tests {
+    use super::*;
+    use crate::hardware::MockProbe;
+
+    #[test]
+    fn merges_ollama_installed_and_dedups_running() {
+        let dir = std::env::temp_dir().join(format!("paddock-avail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let history = History::at(&dir); // empty history for this case
+        let mut probe = MockProbe::default();
+        probe.http.insert(
+            "http://127.0.0.1:11434/api/tags".to_string(),
+            r#"{"models":[{"name":"gemma4:26b","size":17000000000},{"name":"lfm2.5:latest","size":5200000000}]}"#.to_string(),
+        );
+        // gemma is already running -> must be excluded from available.
+        let running = vec![ServerRow {
+            model: "gemma4:26b".into(),
+            runtime: RuntimeKind::Ollama,
+            endpoint: "http://127.0.0.1:11434".into(),
+            openai_url: "http://127.0.0.1:11434/v1/chat/completions".into(),
+            ctx: None,
+            started_at: None,
+            stop: StopHandle::OllamaModel("gemma4:26b".into()),
+        }];
+        let avail = list_available(&history, &probe, &running);
+        let names: Vec<&str> = avail.iter().map(|a| a.model.as_str()).collect();
+        assert!(names.contains(&"lfm2.5:latest"));
+        assert!(!names.contains(&"gemma4:26b"), "running model excluded");
     }
 }

@@ -1,14 +1,14 @@
 //! Builds the exact command to run a model - pure data, no exec, no prompt.
 //! The binary owns display, confirmation and process replacement.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::catalog::{self, CatalogModel, CatalogVariant, RuntimeKind, Source};
 use crate::error::PaddockError;
 use crate::estimate::DEFAULT_CONTEXT;
 use crate::hardware::RuntimesStatus;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallPlan {
     pub kind: RuntimeKind,
     pub argv: Vec<String>,
@@ -146,7 +146,7 @@ const OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
 
 /// Everything the binary needs to start serving and print a usable endpoint.
 /// Pure data: no spawn, no IO here.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServePlan {
     /// Server process to spawn as a foreground child; None when an already
     /// running daemon (Ollama) will do the serving.

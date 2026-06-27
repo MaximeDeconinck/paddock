@@ -33,6 +33,16 @@ fn resolve(base: &Path) -> PathBuf {
     paddock
 }
 
+/// HuggingFace hub cache root (`~/.cache/huggingface/hub`), where mlx and
+/// `-hf` GGUF models land. `HF_HOME` overrides the `~/.cache/huggingface` base.
+pub fn hf_cache_dir() -> PathBuf {
+    if let Ok(h) = std::env::var("HF_HOME") {
+        return PathBuf::from(h).join("hub");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".cache/huggingface/hub")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +76,18 @@ mod tests {
 
         assert_eq!(std::fs::read(dir.join("catalog.db")).unwrap(), b"new");
         assert!(legacy.exists(), "legacy dir is left untouched");
+    }
+
+    #[test]
+    fn hf_home_overrides_cache_dir() {
+        // Read the value, then remove the var BEFORE asserting, so a failed
+        // assert never leaks HF_HOME into other tests in this (multithreaded)
+        // test binary. No other test reads HF_HOME, so the brief set is safe.
+        // SAFETY: env mutation; no concurrent reader of HF_HOME in this crate.
+        unsafe { std::env::set_var("HF_HOME", "/tmp/xyzhf") };
+        let got = hf_cache_dir();
+        unsafe { std::env::remove_var("HF_HOME") };
+        assert_eq!(got, std::path::PathBuf::from("/tmp/xyzhf/hub"));
     }
 
     #[test]

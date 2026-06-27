@@ -237,6 +237,16 @@ pub(crate) fn serve_with_plan(mut plan: ServePlan, foreground: bool) -> Result<(
         plan = plan.with_port(free);
     }
 
+    // Remember spawned (llama.cpp/mlx) serves so the TUI can offer one-key
+    // relaunch. Best-effort; Ollama is covered by /api/tags, not recorded.
+    if plan.server_argv.is_some() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        paddock_core::serving::History::open_default().record(&plan, now);
+    }
+
     let log_dir = paddock_core::serving::default_serving_dir().join("logs");
 
     let mut detached_log: Option<std::path::PathBuf> = None;

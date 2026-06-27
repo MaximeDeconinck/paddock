@@ -79,7 +79,7 @@ fn event_loop(
     app: &App,
     db: &Db,
     sync_rx: &mut Option<std::sync::mpsc::Receiver<sync_task::SyncMsg>>,
-    servers_rx: &std::sync::mpsc::Receiver<Vec<paddock_core::serving::ServerRow>>,
+    servers_rx: &std::sync::mpsc::Receiver<servers_task::ServersSnapshot>,
 ) -> Result<Option<Exit>> {
     use std::sync::mpsc::TryRecvError;
     use sync_task::SyncMsg;
@@ -115,8 +115,8 @@ fn event_loop(
         while let Ok(snapshot) = servers_rx.try_recv() {
             latest = Some(snapshot);
         }
-        if let Some(snapshot) = latest {
-            state.set_servers(snapshot);
+        if let Some(s) = latest {
+            state.set_snapshot(s.running, s.available);
         }
 
         if !event::poll(Duration::from_millis(250))? {
@@ -146,11 +146,12 @@ fn event_loop(
                 state.tab = state::Tab::Servers;
                 // Immediate refresh (paddock-spawned + Ollama-loaded) so a newly
                 // served model shows without waiting for the next background tick.
-                let snapshot = paddock_core::serving::list_all_servers(
-                    &paddock_core::serving::Registry::open_default(),
-                    &paddock_core::hardware::RealSystemProbe,
-                );
-                state.set_servers(snapshot);
+                let registry = paddock_core::serving::Registry::open_default();
+                let history = paddock_core::serving::History::open_default();
+                let probe = paddock_core::hardware::RealSystemProbe;
+                let running = paddock_core::serving::list_all_servers(&registry, &probe);
+                let available = paddock_core::serving::list_available(&history, &probe, &running);
+                state.set_snapshot(running, available);
             }
             Action::Rescore(uc) => {
                 let rows = app.scored_models(db, uc, false)?;
