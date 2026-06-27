@@ -536,6 +536,7 @@ fn detail_lines<'a>(
         "  up/down pick quant · esc back",
         Style::new().fg(Color::DarkGray),
     )));
+    lines.push(Line::default()); // breathing room before the speed chart below
     lines
 }
 
