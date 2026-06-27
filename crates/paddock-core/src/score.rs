@@ -196,12 +196,10 @@ fn context_subscore(context_max: u32) -> f64 {
 /// Quant descent order for "best quant that fits".
 pub const QUANT_DESCENT: &[&str] = &["Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q3_K_M", "Q2_K"];
 
-/// Pick the best variant of one model: walk the descent, first FitsGpu wins;
-/// if none fits the GPU, retry accepting FitsWithSysctlTuning, then FitsRamOnly.
-/// Unknown quants (IQ4_XS, F16, MLX bits) are appended after the descent list,
-/// sorted by descending bpw.
 /// Variant indices ordered best-quality-first: by the QUANT_DESCENT ladder,
-/// then higher bpw, then quant label. The order `best_variant` walks.
+/// then higher bpw, then quant label. Unknown quants (IQ4_XS, F16, MLX bits)
+/// are appended after the descent list, sorted by descending bpw. The order
+/// `best_variant` walks.
 pub fn variants_by_quality(variants: &[ModelVariant]) -> Vec<usize> {
     let rank = |v: &ModelVariant| {
         QUANT_DESCENT
@@ -224,6 +222,9 @@ pub fn variants_by_quality(variants: &[ModelVariant]) -> Vec<usize> {
     order
 }
 
+/// Pick the best variant of one model: walk the quality order, first FitsGpu
+/// wins; if none fits the GPU, retry accepting FitsWithSysctlTuning, then
+/// FitsRamOnly. None if nothing fits even RAM.
 pub fn best_variant<'a>(
     variants: &'a [ModelVariant],
     budget: &MemoryBudget,
