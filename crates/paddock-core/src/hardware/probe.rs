@@ -77,10 +77,7 @@ impl SystemProbe for RealSystemProbe {
         .ok()?;
         let mut buf = String::new();
         stream.read_to_string(&mut buf).ok()?;
-        if !buf.starts_with("HTTP/1.1 2") && !buf.starts_with("HTTP/1.0 2") {
-            return None;
-        }
-        buf.split_once("\r\n\r\n").map(|(_, body)| body.to_string())
+        http_body(&buf)
     }
 
     fn http_post_local(&self, url: &str, json_body: &str) -> Option<String> {
@@ -106,10 +103,66 @@ impl SystemProbe for RealSystemProbe {
         .ok()?;
         let mut buf = String::new();
         stream.read_to_string(&mut buf).ok()?;
-        if !buf.starts_with("HTTP/1.1 2") && !buf.starts_with("HTTP/1.0 2") {
-            return None;
+        http_body(&buf)
+    }
+}
+
+/// Extract the body from a raw HTTP/1.x response, returning None on non-2xx or
+/// malformed input. De-chunks when the response used `Transfer-Encoding:
+/// chunked` (Ollama's `/api/tags` does), which the bodies are otherwise parsed
+/// as JSON and a raw chunked body would fail.
+fn http_body(raw: &str) -> Option<String> {
+    if !raw.starts_with("HTTP/1.1 2") && !raw.starts_with("HTTP/1.0 2") {
+        return None;
+    }
+    let (headers, body) = raw.split_once("\r\n\r\n")?;
+    if headers.to_lowercase().contains("transfer-encoding: chunked") {
+        dechunk(body)
+    } else {
+        Some(body.to_string())
+    }
+}
+
+/// Decode an HTTP/1.1 chunked body: repeated `<hex-size>\r\n<data>\r\n` until a
+/// `0`-size chunk. None on malformed framing.
+fn dechunk(mut s: &str) -> Option<String> {
+    let mut out = String::new();
+    loop {
+        let (size_line, rest) = s.split_once("\r\n")?;
+        let size = usize::from_str_radix(size_line.trim(), 16).ok()?;
+        if size == 0 {
+            break;
         }
-        buf.split_once("\r\n\r\n").map(|(_, body)| body.to_string())
+        out.push_str(rest.get(..size)?);
+        s = rest.get(size + 2..)?; // skip the chunk data + its trailing CRLF
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod http_body_tests {
+    use super::*;
+
+    #[test]
+    fn dechunk_decodes_chunked_body() {
+        assert_eq!(dechunk("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn http_body_dechunks_when_chunked() {
+        let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nd\r\n{\"models\":[]}\r\n0\r\n\r\n";
+        assert_eq!(http_body(resp).unwrap(), "{\"models\":[]}");
+    }
+
+    #[test]
+    fn http_body_passthrough_when_not_chunked() {
+        let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+        assert_eq!(http_body(resp).unwrap(), "{}");
+    }
+
+    #[test]
+    fn http_body_none_on_non_2xx() {
+        assert!(http_body("HTTP/1.1 503 Service Unavailable\r\n\r\n").is_none());
     }
 }
 
