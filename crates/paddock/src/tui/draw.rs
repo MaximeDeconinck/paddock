@@ -466,12 +466,17 @@ fn detail_lines<'a>(
         )),
     ];
 
+    // The selected quant's memory estimate, captured for the sysctl hint below.
+    let mut selected_mem = None;
     for &i in &paddock_core::score::variants_by_quality(
         &r.model.variants.iter().map(|v| r.model.to_model_variant(v)).collect::<Vec<_>>(),
     ) {
         let v = r.model.to_model_variant(&r.model.variants[i]);
         let mem = estimate_memory(&v, DEFAULT_CONTEXT, budget);
         let tps = estimate_speed(&v, bandwidth_gbps, kv_cache_bytes(&v, DEFAULT_CONTEXT)).generation_tps;
+        if i == selected {
+            selected_mem = Some(mem.clone());
+        }
         let marker = if i == selected { "> " } else { "  " };
         let row_style = if i == selected {
             Style::new().fg(Color::White).bg(ACCENT_DEEP)
@@ -512,6 +517,20 @@ fn detail_lines<'a>(
             Style::new().fg(ACCENT),
         ))),
         None => {}
+    }
+    // Actionable tuning hint when the chosen quant needs the GPU wired-limit
+    // raised (FitsWithSysctlTuning); same command the old detail view showed.
+    if let Some(mem) = &selected_mem
+        && mem.verdict == FitVerdict::FitsWithSysctlTuning
+    {
+        let mb = mem.total_bytes / (1024 * 1024) + 1024;
+        lines.push(Line::from(vec![
+            Span::styled("  unlock with  ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                format!("sudo sysctl iogpu.wired_limit_mb={mb}"),
+                Style::new().fg(Color::Gray),
+            ),
+        ]));
     }
     lines.push(Line::from(Span::styled(
         "  up/down pick quant · esc back",
