@@ -533,7 +533,7 @@ fn detail_lines<'a>(
         ]));
     }
     lines.push(Line::from(Span::styled(
-        "  up/down pick quant · esc back",
+        "  ↑↓ pick quant · esc back",
         Style::new().fg(Color::DarkGray),
     )));
     lines.push(Line::default()); // breathing room before the speed chart below
