@@ -101,6 +101,9 @@ pub struct TuiState {
     /// Serve plan for the selected row, computed alongside `detail_plan` so
     /// the detail popup can show the endpoint without calling plan_serve.
     pub detail_serve_plan: Option<Result<ServePlan, String>>,
+    /// Variant index (into the selected row's model.variants) chosen in the
+    /// detail popup. Only meaningful in Mode::Detail.
+    pub detail_variant: usize,
     /// Background catalog-sync status, shown in the footer.
     pub sync_status: SyncStatus,
     /// Spinner animation frame, advanced once per event-loop tick.
@@ -138,6 +141,7 @@ impl TuiState {
             last_error: None,
             detail_plan: None,
             detail_serve_plan: None,
+            detail_variant: 0,
             sync_status: SyncStatus::Idle,
             tick: 0,
             last_sync: None,
@@ -274,6 +278,8 @@ impl TuiState {
             },
             Mode::Detail => match key.code {
                 K::Esc | K::Char('q') | K::Enter => self.close_detail(),
+                K::Up => self.move_detail_variant(-1),
+                K::Down => self.move_detail_variant(1),
                 K::Char('x') => return self.run_selected(),
                 K::Char('s') => return self.serve_selected(),
                 _ => {}
@@ -296,10 +302,13 @@ impl TuiState {
                                 (self.selected + 1).min(self.rows.len().saturating_sub(1));
                         }
                         K::Enter => {
-                            if !self.rows.is_empty() {
+                            if let Some(idx) =
+                                self.rows.get(self.selected).map(|r| r.variant_idx)
+                            {
+                                self.detail_variant = idx;
+                                self.mode = Mode::Detail;
                                 self.detail_plan = self.plan_for_selected();
                                 self.detail_serve_plan = self.serve_plan_for_selected();
-                                self.mode = Mode::Detail;
                             }
                         }
                         K::Char('x') => return self.run_selected(),
@@ -370,11 +379,55 @@ impl TuiState {
         Action::Rescore(uc)
     }
 
+    /// The variant index that run/serve should use: the chosen quant in Detail,
+    /// otherwise the selected row's scored best.
+    fn active_variant_idx(&self) -> usize {
+        match self.mode {
+            Mode::Detail => self.detail_variant,
+            _ => self
+                .rows
+                .get(self.selected)
+                .map(|r| r.variant_idx)
+                .unwrap_or(0),
+        }
+    }
+
+    /// Move the detail quant selection by `delta` within the quality order, then
+    /// recompute the cached detail plans for the new quant.
+    fn move_detail_variant(&mut self, delta: isize) {
+        let order = match self.rows.get(self.selected) {
+            Some(row) => {
+                let mvs: Vec<_> = row
+                    .model
+                    .variants
+                    .iter()
+                    .map(|v| row.model.to_model_variant(v))
+                    .collect();
+                paddock_core::score::variants_by_quality(&mvs)
+            }
+            None => return,
+        };
+        if order.is_empty() {
+            return;
+        }
+        let pos = order
+            .iter()
+            .position(|&i| i == self.detail_variant)
+            .unwrap_or(0);
+        let new_pos = (pos as isize + delta).clamp(0, order.len() as isize - 1) as usize;
+        self.detail_variant = order[new_pos];
+        self.detail_plan = self.plan_for_selected();
+        self.detail_serve_plan = self.serve_plan_for_selected();
+    }
+
     /// Single source for run-plan computation (Detail entry and `x` both use
     /// it), so the render path never calls plan_run.
     fn plan_for_selected(&self) -> Option<Result<RunPlan, String>> {
         let row = self.rows.get(self.selected)?;
-        let variant = &row.model.variants[row.variant_idx];
+        let idx = self
+            .active_variant_idx()
+            .min(row.model.variants.len().saturating_sub(1));
+        let variant = &row.model.variants[idx];
         // TUI has no flag surface, so ctx is auto-sized against the memory budget.
         let mv = row.model.to_model_variant(variant);
         let ctx = resolve_ctx(None, &mv, &self.budget, row.model.context_max);
@@ -386,7 +439,10 @@ impl TuiState {
     /// TUI has no flag surface, so `port` is always None.
     fn serve_plan_for_selected(&self) -> Option<Result<ServePlan, String>> {
         let row = self.rows.get(self.selected)?;
-        let variant = &row.model.variants[row.variant_idx];
+        let idx = self
+            .active_variant_idx()
+            .min(row.model.variants.len().saturating_sub(1));
+        let variant = &row.model.variants[idx];
         let mv = row.model.to_model_variant(variant);
         let ctx = resolve_ctx(None, &mv, &self.budget, row.model.context_max);
         Some(
@@ -492,6 +548,54 @@ mod tests {
         let mut row = fake_row(name);
         row.model.context_max = context_max;
         row
+    }
+
+    /// Multi-variant HuggingFace (GGUF) fixture: one CatalogVariant per quant,
+    /// so detail-mode quant navigation has something to move across.
+    fn fake_hf_row(name: &str, quants: &[&str]) -> ScoredModel {
+        let variants: Vec<CatalogVariant> = quants
+            .iter()
+            .map(|q| CatalogVariant {
+                quant: (*q).into(),
+                bpw: paddock_core::catalog::quant_bpw(q).unwrap_or(4.0),
+                file_size_bytes: None,
+                layers: 32,
+                kv_heads: 8,
+                head_dim: 128,
+                embedding_dim: 4096,
+                runtime_compat: vec![RuntimeKind::LlamaCpp], // GGUF, not Ollama -> llama-cli/-server
+                source_tag: None,
+            })
+            .collect();
+        let model = CatalogModel {
+            id: 0,
+            name: name.to_string(),
+            family: None,
+            source: Source::HuggingFace,
+            repo: Some(format!("bartowski/{name}")),
+            params_total: 8_000_000_000,
+            params_active: 8_000_000_000,
+            architecture: None,
+            context_max: 8192,
+            released_at: None,
+            released_approx: false,
+            variants,
+        };
+        let budget = MemoryBudget {
+            gpu_effective_bytes: 24 * (1u64 << 30),
+            ram_total_bytes: 32 * (1u64 << 30),
+        };
+        let mv = model.to_model_variant(&model.variants[0]);
+        let memory = estimate_memory(&mv, DEFAULT_CONTEXT, &budget);
+        let speed = estimate_speed(&mv, 400.0, memory.kv_cache_bytes);
+        let score = score_variant(&mv, &memory, &speed, UseCase::General, None);
+        ScoredModel {
+            model,
+            variant_idx: 0,
+            memory,
+            speed,
+            score,
+        }
     }
 
     use paddock_core::serving::{AvailableRow, ServerRow, StopHandle};
@@ -939,5 +1043,51 @@ mod tests {
         s.set_snapshot(vec![], vec![avail("avail-b")]);
         s.tab = Tab::Servers;
         assert!(matches!(s.handle_key(key(KeyCode::Char('x'))), Action::None));
+    }
+
+    #[test]
+    fn entering_detail_sets_detail_variant_to_scored_best() {
+        let mut s = state();
+        s.rows = vec![fake_row("Llama3-8B")];
+        s.all_rows = s.rows.clone();
+        s.selected = 0;
+        s.handle_key(key(KeyCode::Enter));
+        assert_eq!(s.mode, Mode::Detail);
+        assert_eq!(s.detail_variant, s.rows[0].variant_idx);
+    }
+
+    #[test]
+    fn detail_arrows_move_quant_within_quality_order() {
+        let mut s = state();
+        s.rows = vec![fake_hf_row("M", &["Q8_0", "Q4_K_M", "Q2_K"])];
+        s.all_rows = s.rows.clone();
+        s.selected = 0;
+        s.handle_key(key(KeyCode::Enter)); // detail_variant = variant_idx (0 = Q8_0)
+        assert_eq!(s.rows[0].model.variants[s.detail_variant].quant, "Q8_0");
+        s.handle_key(key(KeyCode::Down)); // -> Q4_K_M
+        assert_eq!(s.rows[0].model.variants[s.detail_variant].quant, "Q4_K_M");
+        s.handle_key(key(KeyCode::Down)); // -> Q2_K
+        s.handle_key(key(KeyCode::Down)); // clamp at smallest
+        assert_eq!(s.rows[0].model.variants[s.detail_variant].quant, "Q2_K");
+        s.handle_key(key(KeyCode::Up)); // -> Q4_K_M
+        assert_eq!(s.rows[0].model.variants[s.detail_variant].quant, "Q4_K_M");
+    }
+
+    #[test]
+    fn serve_from_detail_uses_the_chosen_quant() {
+        let mut s = state();
+        s.rows = vec![fake_hf_row("M", &["Q8_0", "Q4_K_M", "Q2_K"])];
+        s.all_rows = s.rows.clone();
+        s.selected = 0;
+        s.handle_key(key(KeyCode::Enter));
+        s.handle_key(key(KeyCode::Down)); // choose Q4_K_M
+        match s.handle_key(key(KeyCode::Char('s'))) {
+            Action::Serve(p) => assert!(
+                p.model_ref.contains("Q4_K_M"),
+                "served plan should carry the chosen quant, got {}",
+                p.model_ref
+            ),
+            other => panic!("expected Serve, got {other:?}"),
+        }
     }
 }
