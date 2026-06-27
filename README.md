@@ -35,6 +35,8 @@ Running `paddock` with no arguments opens the interactive TUI. It opens instantl
 
 Press `Tab` to switch to the servers view: everything currently running shows there, both the llama.cpp/mlx servers paddock spawned and the models loaded in the Ollama daemon, with their endpoint, context, uptime and pid. Navigate with the arrow keys; `x` stops the selected server, `c` copies its OpenAI endpoint to the clipboard. Serving a model from the TUI (`s`) now runs it detached and lands you on the servers tab, so the TUI stays open. Below the running servers, the tab lists models available locally but not loaded, greyed out: your installed Ollama models and any llama.cpp/mlx model paddock has served before. Press `enter` on a greyed model to launch it.
 
+On the models tab, `enter` opens a model's detail popup, which lists every quantization it ships with their memory, tok/s and fit; use the arrow keys to pick a smaller quant for more speed and less memory, then `x` to run or `s` to serve the chosen one. Without opening the detail, `x`/`s` use the best quant that fits.
+
 Nine subcommands cover everything scriptable:
 
 ### `paddock scan`: what is this machine?
