@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use paddock_core::PaddockError;
 use paddock_core::catalog::CatalogModel;
+use paddock_core::estimate::ModelVariant;
 use paddock_core::hardware::{RealSystemProbe, SystemProbe};
 use paddock_core::runtime::{InstallPlan, RunPlan, ServePlan, plan_run, plan_serve};
 use paddock_core::score::{UseCase, best_variant};
@@ -175,6 +176,27 @@ fn resolve_model(app: &App, query: &str) -> Result<(CatalogModel, usize)> {
         .position(|v| std::ptr::eq(v, best))
         .expect("best_variant borrows from mvs");
     Ok((model, best_idx))
+}
+
+/// Index into `variants` of the variant whose quant label equals `label`
+/// (case-insensitive). On a label shared by several variants, returns the
+/// best-quality one (first in `variants_by_quality` order). Errors listing the
+/// available quants when nothing matches.
+// Wired into `run`/`serve` by Task 5 (--quant); tested here in isolation.
+#[allow(dead_code)]
+fn resolve_quant(variants: &[ModelVariant], label: &str) -> Result<usize> {
+    let order = paddock_core::score::variants_by_quality(variants);
+    if let Some(&idx) = order
+        .iter()
+        .find(|&&i| variants[i].quant.eq_ignore_ascii_case(label))
+    {
+        return Ok(idx);
+    }
+    let available: Vec<&str> = order.iter().map(|&i| variants[i].quant.as_str()).collect();
+    bail!(
+        "no quant `{label}` for this model; available: {}",
+        available.join(", ")
+    );
 }
 
 /// Resolve the launch context for a chosen model variant: explicit `--ctx`
@@ -792,6 +814,47 @@ mod tests {
     fn not_found_when_nothing_matches() {
         let models = vec![model("Llama3")];
         assert!(matches!(find_model(&models, "mistral"), Lookup::NotFound));
+    }
+
+    /// Minimal valid `ModelVariant` for resolve_quant tests. `bpw` is the only
+    /// field `variants_by_quality` uses (after the quant ladder), so collisions
+    /// are made deterministic by giving the better variant a higher `bpw`.
+    fn mv(quant: &str, bpw: f64) -> ModelVariant {
+        ModelVariant {
+            model_name: "test".into(),
+            quant: quant.into(),
+            bpw,
+            params_total: 8_000_000_000,
+            params_active: 8_000_000_000,
+            layers: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            embedding_dim: 4096,
+            context_max: 8192,
+        }
+    }
+
+    #[test]
+    fn resolve_quant_exact_and_case_insensitive() {
+        let vs = vec![mv("Q8_0", 8.5), mv("Q4_K_M", 4.83), mv("Q2_K", 3.35)];
+        assert_eq!(resolve_quant(&vs, "Q4_K_M").unwrap(), 1);
+        assert_eq!(resolve_quant(&vs, "q4_k_m").unwrap(), 1);
+    }
+
+    #[test]
+    fn resolve_quant_collision_picks_best_quality() {
+        // Same quant label, different bpw: variants_by_quality orders higher bpw
+        // first, so the index 1 variant (higher bpw) must win.
+        let vs = vec![mv("Q4_K_M", 4.5), mv("Q4_K_M", 5.0)];
+        assert_eq!(resolve_quant(&vs, "Q4_K_M").unwrap(), 1);
+    }
+
+    #[test]
+    fn resolve_quant_no_match_lists_available() {
+        let vs = vec![mv("Q8_0", 8.5), mv("Q4_K_M", 4.83)];
+        let err = resolve_quant(&vs, "Q3_K_M").unwrap_err().to_string();
+        assert!(err.contains("Q8_0"));
+        assert!(err.contains("Q4_K_M"));
     }
 
     #[test]
