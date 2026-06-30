@@ -50,13 +50,14 @@ fn main() -> Result<()> {
                 output::print_recommendations(&rows);
             }
         }
-        Some(Command::Run { model, ctx }) => run_model(&app, &model, ctx, cli.json)?,
+        Some(Command::Run { model, ctx, quant }) => run_model(&app, &model, ctx, quant, cli.json)?,
         Some(Command::Serve {
             model,
             port,
             ctx,
             foreground,
-        }) => serve_model(&app, &model, port, ctx, foreground, cli.json)?,
+            quant,
+        }) => serve_model(&app, &model, port, ctx, foreground, quant, cli.json)?,
         Some(Command::Ps) => {
             let registry = Registry::open_default();
             let probe = RealSystemProbe;
@@ -141,7 +142,7 @@ fn fit(app: &App, all: bool, use_case: UseCase, limit: usize, json: bool) -> Res
 /// Catalog lookup + best-fitting variant pick, shared by `run` and `serve`.
 /// Returns the model and the index into `model.variants` of the chosen quant.
 /// Exits the process on an ambiguous name (interactive disambiguation UX).
-fn resolve_model(app: &App, query: &str) -> Result<(CatalogModel, usize)> {
+fn resolve_model(app: &App, query: &str, quant: Option<&str>) -> Result<(CatalogModel, usize)> {
     let db = app.open_db()?;
     let models = db.list_models().context("reading catalog")?;
     let model = match find_model(&models, query) {
@@ -161,6 +162,14 @@ fn resolve_model(app: &App, query: &str) -> Result<(CatalogModel, usize)> {
         .iter()
         .map(|v| model.to_model_variant(v))
         .collect();
+
+    // Explicit --quant launches that variant even if it does not fit; the
+    // verdict is informational (consistent with the TUI quant picker).
+    if let Some(label) = quant {
+        let idx = resolve_quant(&mvs, label)?;
+        return Ok((model, idx));
+    }
+
     let Some(best) = best_variant(&mvs, &app.budget) else {
         bail!(
             "no quantization of `{}` fits this machine ({} RAM); try a smaller model from `paddock fit`",
@@ -183,7 +192,6 @@ fn resolve_model(app: &App, query: &str) -> Result<(CatalogModel, usize)> {
 /// best-quality one (first in `variants_by_quality` order). Errors listing the
 /// available quants when nothing matches.
 // Wired into `run`/`serve` by Task 5 (--quant); tested here in isolation.
-#[allow(dead_code)]
 fn resolve_quant(variants: &[ModelVariant], label: &str) -> Result<usize> {
     let order = paddock_core::score::variants_by_quality(variants);
     if let Some(&idx) = order
@@ -206,8 +214,14 @@ fn resolved_ctx(app: &App, model: &CatalogModel, idx: usize, ctx: Option<u32>) -
     paddock_core::estimate::resolve_ctx(ctx, &mv, &app.budget, model.context_max)
 }
 
-fn run_model(app: &App, query: &str, ctx: Option<u32>, json: bool) -> Result<()> {
-    let (model, idx) = resolve_model(app, query)?;
+fn run_model(
+    app: &App,
+    query: &str,
+    ctx: Option<u32>,
+    quant: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let (model, idx) = resolve_model(app, query, quant.as_deref())?;
 
     // API delta vs the original plan: plan_run is fallible (repo-less HF/MLX
     // models, non-GGUF quants). Surface the actionable error and exit non-zero.
@@ -230,9 +244,10 @@ fn serve_model(
     port: Option<u16>,
     ctx: Option<u32>,
     foreground: bool,
+    quant: Option<String>,
     json: bool,
 ) -> Result<()> {
-    let (model, idx) = resolve_model(app, query)?;
+    let (model, idx) = resolve_model(app, query, quant.as_deref())?;
     let ctx = Some(resolved_ctx(app, &model, idx, ctx));
     let plan = plan_serve(&model, &model.variants[idx], &app.profile.runtimes, port, ctx)?;
 
