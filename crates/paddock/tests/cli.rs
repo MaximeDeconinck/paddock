@@ -140,20 +140,26 @@ fn sync_help_lists_catalog_flags() {
 }
 
 #[test]
-fn ps_empty_registry_reports_no_servers() {
+fn ps_empty_registry_has_no_running_section() {
+    // The registry is isolated to a tempdir, so nothing paddock-spawned is
+    // running. The AVAILABLE section depends on the host's Ollama install, so
+    // we only assert on the RUNNING section being absent (no paddock servers).
     let (mut cmd, _dir) = paddock();
     let out = cmd.arg("ps").assert().success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout);
-    assert!(stdout.contains("no servers running"), "got: {stdout}");
+    assert!(!stdout.contains("RUNNING"), "got: {stdout}");
 }
 
 #[test]
-fn ps_json_empty_is_empty_array() {
+fn ps_json_has_running_and_available_keys() {
+    // With an isolated registry, `running` is always empty; `available` shape
+    // depends on the host's Ollama install.
     let (mut cmd, _dir) = paddock();
     let out = cmd.args(["ps", "--json"]).assert().success();
     let v: serde_json::Value =
         serde_json::from_slice(&out.get_output().stdout).expect("valid json");
-    assert_eq!(v, serde_json::json!([]));
+    assert_eq!(v["running"], serde_json::json!([]));
+    assert!(v["available"].is_array(), "available not an array: {v}");
 }
 
 #[test]

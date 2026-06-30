@@ -57,11 +57,21 @@ fn main() -> Result<()> {
             foreground,
         }) => serve_model(&app, &model, port, ctx, foreground, cli.json)?,
         Some(Command::Ps) => {
-            let records = Registry::open_default().list_live(&RealSystemProbe);
+            let registry = Registry::open_default();
+            let probe = RealSystemProbe;
+            let running = paddock_core::serving::list_all_servers(&registry, &probe);
+            let history = paddock_core::serving::History::open_default();
+            let available = paddock_core::serving::list_available(&history, &probe, &running);
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&records)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "running": &running,
+                        "available": &available,
+                    }))?
+                );
             } else {
-                output::print_ps_table(&records);
+                output::print_servers(&running, &available);
             }
         }
         Some(Command::Stop { target, yes }) => stop_servers(&target, yes)?,
