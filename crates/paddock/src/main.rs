@@ -190,8 +190,7 @@ fn resolve_model(app: &App, query: &str, quant: Option<&str>) -> Result<(Catalog
 /// Index into `variants` of the variant whose quant label equals `label`
 /// (case-insensitive). On a label shared by several variants, returns the
 /// best-quality one (first in `variants_by_quality` order). Errors listing the
-/// available quants when nothing matches.
-// Wired into `run`/`serve` by Task 5 (--quant); tested here in isolation.
+/// available quants when nothing matches. Backs `--quant` on `run`/`serve`.
 fn resolve_quant(variants: &[ModelVariant], label: &str) -> Result<usize> {
     let order = paddock_core::score::variants_by_quality(variants);
     if let Some(&idx) = order
