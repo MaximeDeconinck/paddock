@@ -322,7 +322,6 @@ mod tests {
     use super::*;
     use paddock_core::catalog::RuntimeKind;
     use paddock_core::runtime::ServePlan;
-    use paddock_core::serving::{AvailableRow, ServerRow, StopHandle};
 
     fn ollama_plan(name: &str) -> ServePlan {
         ServePlan {
