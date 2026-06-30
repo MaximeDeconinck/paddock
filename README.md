@@ -116,6 +116,8 @@ $ paddock run definitely-not-a-model
 Error: model `definitely-not-a-model` not found in catalog. Run `paddock sync` or check `paddock fit` for names.
 ```
 
+`--quant <label>` (for example `--quant Q4_K_M`) launches a specific quantization instead of the auto-picked best fit. Any quant the model offers is selectable, even one that does not fit this machine: it launches anyway and the fit verdict is informational. An unknown label errors and lists the model's available quants. `run` and `serve` both take it.
+
 ### `paddock serve <model>`: OpenAI-compatible endpoint
 
 Same model resolution as `run`, but instead of an interactive chat you get an HTTP endpoint any OpenAI-compatible client can talk to:
@@ -155,15 +157,20 @@ Context auto-sizes by default. For llama.cpp, paddock picks the largest context 
 
 These cover the llama.cpp / mlx servers paddock spawned (Ollama-loaded models are managed by `ollama ps` / `ollama stop`).
 
-`paddock ps` lists what's running, one row per server:
+`paddock ps` groups what it shows into two sections, matching the TUI servers tab: a `RUNNING` section (the llama.cpp / mlx servers paddock spawned plus the models loaded in the Ollama daemon) and an `AVAILABLE` section (your installed Ollama models and previously served catalog entries that aren't currently running, ready to relaunch):
 
 ```text
 $ paddock ps
+RUNNING
 MODEL          RUNTIME    ENDPOINT                CTX   UPTIME   PID
 qwen3-8b       llama.cpp  http://127.0.0.1:8080  32768     2m    51234
+
+AVAILABLE
+MODEL          RUNTIME
+llama3.2:3b    ollama
 ```
 
-`--json` emits the same data machine-readable for scripts.
+`--json` emits the same data machine-readable for scripts, as `{ "running": [...], "available": [...] }`.
 
 `paddock stop <target>` stops a server by model name, pid, or `all`:
 
