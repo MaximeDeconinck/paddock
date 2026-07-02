@@ -2,7 +2,7 @@
 
 use paddock_core::estimate::FitVerdict;
 use paddock_core::hardware::HardwareProfile;
-use paddock_core::serving::ServingRecord;
+use paddock_core::serving::{AvailableRow, ServerRow, StopHandle};
 
 use crate::app::ScoredModel;
 
@@ -232,27 +232,71 @@ pub fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// Render `ps` as a table; empty → a short notice.
-pub fn print_ps_table(records: &[ServingRecord]) {
-    if records.is_empty() {
-        println!("no servers running");
-        return;
+/// `paddock ps` text view: a RUNNING section then an AVAILABLE section.
+/// Empty sections are skipped; both empty prints "no servers running".
+/// `now` is unix seconds, injected for deterministic tests.
+pub fn servers_view(running: &[ServerRow], available: &[AvailableRow], now: i64) -> String {
+    if running.is_empty() && available.is_empty() {
+        return "no servers running".to_string();
     }
-    println!(
-        "{:<28} {:<9} {:<26} {:>7} {:>8} {:>7}",
-        "MODEL", "RUNTIME", "ENDPOINT", "CTX", "UPTIME", "PID"
-    );
-    for r in records {
-        println!(
-            "{:<28} {:<9} {:<26} {:>7} {:>8} {:>7}",
-            truncate(&r.model_ref, 28),
-            runtime_label(r.runtime),
-            truncate(&r.endpoint, 26),
-            r.ctx,
-            uptime_label(r.started_at),
-            r.pid,
-        );
+    let mut s = String::new();
+    if !running.is_empty() {
+        s.push_str("RUNNING\n");
+        s.push_str(&format!(
+            "{:<28} {:<9} {:<26} {:>7} {:>8} {:>7}\n",
+            "MODEL", "RUNTIME", "ENDPOINT", "CTX", "UPTIME", "PID"
+        ));
+        for r in running {
+            let ctx = r.ctx.map(|c| c.to_string()).unwrap_or_else(|| "-".into());
+            let uptime = r
+                .started_at
+                .map(|t| humanize_since(now - t))
+                .unwrap_or_else(|| "-".into());
+            let pid = match &r.stop {
+                StopHandle::Pid(p) => p.to_string(),
+                _ => "-".into(),
+            };
+            s.push_str(&format!(
+                "{:<28} {:<9} {:<26} {:>7} {:>8} {:>7}\n",
+                truncate(&r.model, 28),
+                runtime_label(r.runtime),
+                truncate(&r.endpoint, 26),
+                ctx,
+                uptime,
+                pid,
+            ));
+        }
     }
+    if !available.is_empty() {
+        if !running.is_empty() {
+            s.push('\n');
+        }
+        s.push_str("AVAILABLE\n");
+        s.push_str(&format!(
+            "{:<28} {:<9} {:>10} {:>12}\n",
+            "MODEL", "RUNTIME", "SIZE", "LAST-SERVED"
+        ));
+        for r in available {
+            let size = r.size_bytes.map(gib).unwrap_or_else(|| "-".into());
+            s.push_str(&format!(
+                "{:<28} {:<9} {:>10} {:>12}\n",
+                truncate(&r.model, 28),
+                runtime_label(r.runtime),
+                size,
+                age_label(r.last_served_at, false, now),
+            ));
+        }
+    }
+    s.trim_end().to_string()
+}
+
+/// Print the `paddock ps` view, computing `now` from the system clock.
+pub fn print_servers(running: &[ServerRow], available: &[AvailableRow]) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    println!("{}", servers_view(running, available, now));
 }
 
 pub fn runtime_label(rt: paddock_core::catalog::RuntimeKind) -> &'static str {
@@ -276,6 +320,56 @@ pub fn uptime_label(started_at: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paddock_core::catalog::RuntimeKind;
+    use paddock_core::runtime::ServePlan;
+
+    fn ollama_plan(name: &str) -> ServePlan {
+        ServePlan {
+            server_argv: None,
+            pre_steps: vec![],
+            endpoint: "http://127.0.0.1:11434".into(),
+            openai_url: "http://127.0.0.1:11434/v1/chat/completions".into(),
+            model_ref: name.into(),
+            ready_path: "/api/version".into(),
+            install: None,
+            port_ignored: false,
+            runtime: RuntimeKind::Ollama,
+            ctx: 0,
+            port: None,
+        }
+    }
+
+    #[test]
+    fn servers_view_empty_says_none() {
+        assert_eq!(servers_view(&[], &[], 1_780_000_000), "no servers running");
+    }
+
+    #[test]
+    fn servers_view_has_sections_and_dashes() {
+        let running = vec![ServerRow {
+            model: "qwen3:8b".into(),
+            runtime: RuntimeKind::Ollama,
+            endpoint: "http://127.0.0.1:11434".into(),
+            openai_url: "http://127.0.0.1:11434/v1/chat/completions".into(),
+            ctx: None,
+            started_at: None,
+            stop: StopHandle::OllamaModel("qwen3:8b".into()),
+        }];
+        let available = vec![AvailableRow {
+            model: "llama3".into(),
+            runtime: RuntimeKind::Ollama,
+            size_bytes: Some(4 * 1024 * 1024 * 1024),
+            last_served_at: None,
+            plan: ollama_plan("llama3"),
+        }];
+        let out = servers_view(&running, &available, 1_780_000_000);
+        assert!(out.contains("RUNNING"));
+        assert!(out.contains("AVAILABLE"));
+        assert!(out.contains("qwen3:8b"));
+        assert!(out.contains("llama3"));
+        assert!(out.contains('-'));
+        assert!(out.contains('?'));
+    }
 
     #[test]
     fn humanize_since_buckets() {

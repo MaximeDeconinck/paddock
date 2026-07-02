@@ -307,7 +307,7 @@ pub fn ollama_installed_models(probe: &dyn SystemProbe) -> Option<Vec<LoadedMode
 }
 
 /// How to stop a running server shown in a UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum StopHandle {
     /// A paddock-spawned child: SIGTERM the pid then unregister.
     Pid(u32),
@@ -319,7 +319,7 @@ pub enum StopHandle {
 /// registry plus Ollama-loaded models from `/api/ps`. Fields that don't apply
 /// to a source are `None` (Ollama has no ctx/start-time/pid; paddock-spawned
 /// has no size).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ServerRow {
     pub model: String,
     pub runtime: RuntimeKind,
@@ -385,7 +385,7 @@ pub fn warm_up_ollama(probe: &dyn SystemProbe, model_ref: &str) -> bool {
 
 /// A locally-available model not currently running, for the servers tab's grey
 /// group. `enter` serves `plan`. Display fields are raw (the TUI formats them).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AvailableRow {
     pub model: String,
     pub runtime: RuntimeKind,
@@ -535,6 +535,31 @@ mod record_tests {
 mod tests {
     use super::*;
     use crate::hardware::MockProbe;
+
+    #[test]
+    fn server_and_available_rows_serialize() {
+        let row = ServerRow {
+            model: "qwen3:8b".into(),
+            runtime: RuntimeKind::Ollama,
+            endpoint: "http://127.0.0.1:11434".into(),
+            openai_url: "http://127.0.0.1:11434/v1/chat/completions".into(),
+            ctx: None,
+            started_at: None,
+            stop: StopHandle::OllamaModel("qwen3:8b".into()),
+        };
+        let j = serde_json::to_string(&row).unwrap();
+        assert!(j.contains("qwen3:8b"));
+
+        let avail = AvailableRow {
+            model: "llama3".into(),
+            runtime: RuntimeKind::Ollama,
+            size_bytes: Some(4_000_000_000),
+            last_served_at: None,
+            plan: ollama_serve_plan("llama3"),
+        };
+        let j = serde_json::to_string(&avail).unwrap();
+        assert!(j.contains("llama3"));
+    }
 
     #[test]
     fn warm_up_posts_model_and_keep_alive() {

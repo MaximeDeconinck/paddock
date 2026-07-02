@@ -44,6 +44,9 @@ pub enum Command {
         /// Context window in tokens (llama.cpp only; Ollama/MLX manage their own)
         #[arg(long)]
         ctx: Option<u32>,
+        /// Quantization label to launch (e.g. Q4_K_M); default auto-picks the best fit
+        #[arg(long)]
+        quant: Option<String>,
     },
     /// Serve a model over HTTP and print the endpoint (OpenAI-compatible)
     Serve {
@@ -57,6 +60,9 @@ pub enum Command {
         /// Stay attached and stream logs (Ctrl-C stops); default runs detached
         #[arg(long, short = 'f')]
         foreground: bool,
+        /// Quantization label to launch (e.g. Q4_K_M); default auto-picks the best fit
+        #[arg(long)]
+        quant: Option<String>,
     },
     /// List running paddock servers
     Ps,

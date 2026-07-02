@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use paddock_core::PaddockError;
 use paddock_core::catalog::CatalogModel;
+use paddock_core::estimate::ModelVariant;
 use paddock_core::hardware::{RealSystemProbe, SystemProbe};
 use paddock_core::runtime::{InstallPlan, RunPlan, ServePlan, plan_run, plan_serve};
 use paddock_core::score::{UseCase, best_variant};
@@ -49,19 +50,30 @@ fn main() -> Result<()> {
                 output::print_recommendations(&rows);
             }
         }
-        Some(Command::Run { model, ctx }) => run_model(&app, &model, ctx, cli.json)?,
+        Some(Command::Run { model, ctx, quant }) => run_model(&app, &model, ctx, quant, cli.json)?,
         Some(Command::Serve {
             model,
             port,
             ctx,
             foreground,
-        }) => serve_model(&app, &model, port, ctx, foreground, cli.json)?,
+            quant,
+        }) => serve_model(&app, &model, port, ctx, foreground, quant, cli.json)?,
         Some(Command::Ps) => {
-            let records = Registry::open_default().list_live(&RealSystemProbe);
+            let registry = Registry::open_default();
+            let probe = RealSystemProbe;
+            let running = paddock_core::serving::list_all_servers(&registry, &probe);
+            let history = paddock_core::serving::History::open_default();
+            let available = paddock_core::serving::list_available(&history, &probe, &running);
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&records)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "running": &running,
+                        "available": &available,
+                    }))?
+                );
             } else {
-                output::print_ps_table(&records);
+                output::print_servers(&running, &available);
             }
         }
         Some(Command::Stop { target, yes }) => stop_servers(&target, yes)?,
@@ -130,7 +142,7 @@ fn fit(app: &App, all: bool, use_case: UseCase, limit: usize, json: bool) -> Res
 /// Catalog lookup + best-fitting variant pick, shared by `run` and `serve`.
 /// Returns the model and the index into `model.variants` of the chosen quant.
 /// Exits the process on an ambiguous name (interactive disambiguation UX).
-fn resolve_model(app: &App, query: &str) -> Result<(CatalogModel, usize)> {
+fn resolve_model(app: &App, query: &str, quant: Option<&str>) -> Result<(CatalogModel, usize)> {
     let db = app.open_db()?;
     let models = db.list_models().context("reading catalog")?;
     let model = match find_model(&models, query) {
@@ -150,6 +162,14 @@ fn resolve_model(app: &App, query: &str) -> Result<(CatalogModel, usize)> {
         .iter()
         .map(|v| model.to_model_variant(v))
         .collect();
+
+    // Explicit --quant launches that variant even if it does not fit; the
+    // verdict is informational (consistent with the TUI quant picker).
+    if let Some(label) = quant {
+        let idx = resolve_quant(&mvs, label)?;
+        return Ok((model, idx));
+    }
+
     let Some(best) = best_variant(&mvs, &app.budget) else {
         bail!(
             "no quantization of `{}` fits this machine ({} RAM); try a smaller model from `paddock fit`",
@@ -167,6 +187,25 @@ fn resolve_model(app: &App, query: &str) -> Result<(CatalogModel, usize)> {
     Ok((model, best_idx))
 }
 
+/// Index into `variants` of the variant whose quant label equals `label`
+/// (case-insensitive). On a label shared by several variants, returns the
+/// best-quality one (first in `variants_by_quality` order). Errors listing the
+/// available quants when nothing matches. Backs `--quant` on `run`/`serve`.
+fn resolve_quant(variants: &[ModelVariant], label: &str) -> Result<usize> {
+    let order = paddock_core::score::variants_by_quality(variants);
+    if let Some(&idx) = order
+        .iter()
+        .find(|&&i| variants[i].quant.eq_ignore_ascii_case(label))
+    {
+        return Ok(idx);
+    }
+    let available: Vec<&str> = order.iter().map(|&i| variants[i].quant.as_str()).collect();
+    bail!(
+        "no quant `{label}` for this model; available: {}",
+        available.join(", ")
+    );
+}
+
 /// Resolve the launch context for a chosen model variant: explicit `--ctx`
 /// wins, otherwise auto-size against this machine's memory budget.
 fn resolved_ctx(app: &App, model: &CatalogModel, idx: usize, ctx: Option<u32>) -> u32 {
@@ -174,8 +213,14 @@ fn resolved_ctx(app: &App, model: &CatalogModel, idx: usize, ctx: Option<u32>) -
     paddock_core::estimate::resolve_ctx(ctx, &mv, &app.budget, model.context_max)
 }
 
-fn run_model(app: &App, query: &str, ctx: Option<u32>, json: bool) -> Result<()> {
-    let (model, idx) = resolve_model(app, query)?;
+fn run_model(
+    app: &App,
+    query: &str,
+    ctx: Option<u32>,
+    quant: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let (model, idx) = resolve_model(app, query, quant.as_deref())?;
 
     // API delta vs the original plan: plan_run is fallible (repo-less HF/MLX
     // models, non-GGUF quants). Surface the actionable error and exit non-zero.
@@ -198,9 +243,10 @@ fn serve_model(
     port: Option<u16>,
     ctx: Option<u32>,
     foreground: bool,
+    quant: Option<String>,
     json: bool,
 ) -> Result<()> {
-    let (model, idx) = resolve_model(app, query)?;
+    let (model, idx) = resolve_model(app, query, quant.as_deref())?;
     let ctx = Some(resolved_ctx(app, &model, idx, ctx));
     let plan = plan_serve(&model, &model.variants[idx], &app.profile.runtimes, port, ctx)?;
 
@@ -782,6 +828,47 @@ mod tests {
     fn not_found_when_nothing_matches() {
         let models = vec![model("Llama3")];
         assert!(matches!(find_model(&models, "mistral"), Lookup::NotFound));
+    }
+
+    /// Minimal valid `ModelVariant` for resolve_quant tests. `bpw` is the only
+    /// field `variants_by_quality` uses (after the quant ladder), so collisions
+    /// are made deterministic by giving the better variant a higher `bpw`.
+    fn mv(quant: &str, bpw: f64) -> ModelVariant {
+        ModelVariant {
+            model_name: "test".into(),
+            quant: quant.into(),
+            bpw,
+            params_total: 8_000_000_000,
+            params_active: 8_000_000_000,
+            layers: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            embedding_dim: 4096,
+            context_max: 8192,
+        }
+    }
+
+    #[test]
+    fn resolve_quant_exact_and_case_insensitive() {
+        let vs = vec![mv("Q8_0", 8.5), mv("Q4_K_M", 4.83), mv("Q2_K", 3.35)];
+        assert_eq!(resolve_quant(&vs, "Q4_K_M").unwrap(), 1);
+        assert_eq!(resolve_quant(&vs, "q4_k_m").unwrap(), 1);
+    }
+
+    #[test]
+    fn resolve_quant_collision_picks_best_quality() {
+        // Same quant label, different bpw: variants_by_quality orders higher bpw
+        // first, so the index 1 variant (higher bpw) must win.
+        let vs = vec![mv("Q4_K_M", 4.5), mv("Q4_K_M", 5.0)];
+        assert_eq!(resolve_quant(&vs, "Q4_K_M").unwrap(), 1);
+    }
+
+    #[test]
+    fn resolve_quant_no_match_lists_available() {
+        let vs = vec![mv("Q8_0", 8.5), mv("Q4_K_M", 4.83)];
+        let err = resolve_quant(&vs, "Q3_K_M").unwrap_err().to_string();
+        assert!(err.contains("Q8_0"));
+        assert!(err.contains("Q4_K_M"));
     }
 
     #[test]
