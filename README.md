@@ -22,12 +22,25 @@ paddock answers all three with one command, and it is **Apple Silicon-first** by
 
 ## Install
 
+Homebrew (recommended):
+
 ```bash
-# from a checkout of this repository
+brew install maximedeconinck/tap/paddock
+```
+
+Or the install script:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/MaximeDeconinck/paddock/releases/latest/download/paddock-installer.sh | sh
+```
+
+From source (needs a Rust toolchain):
+
+```bash
 cargo install --path crates/paddock
 ```
 
-A Homebrew formula is coming. Requires macOS on Apple Silicon (M1 or later).
+Requires macOS on Apple Silicon (M1 or later).
 
 ## Usage
 
