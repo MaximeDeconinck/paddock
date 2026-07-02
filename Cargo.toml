@@ -36,6 +36,8 @@ tap = "MaximeDeconinck/homebrew-tap"
 targets = ["aarch64-apple-darwin"]
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
+# Build (but don't publish) artifacts on pull requests, to catch build breakage early
+pr-run-mode = "upload"
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether to install an updater program
