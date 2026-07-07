@@ -190,6 +190,9 @@ async fn fetch_hf_repo(
     let mut kv_heads = 0u32;
     let mut head_dim = 0u32;
     let mut embedding_dim = 0u32;
+    let mut expert_count: Option<u64> = None;
+    let mut expert_used_count: Option<u64> = None;
+    let mut expert_ffn_len: Option<u64> = None;
     // Infallible: `files.is_empty()` returned `Ok(None)` above.
     let probe_file = &files.iter().min_by_key(|f| f.2).unwrap().0.clone();
     let url = format!("https://huggingface.co/{repo}/resolve/main/{probe_file}");
@@ -201,6 +204,9 @@ async fn fetch_hf_repo(
         kv_heads = meta.head_count_kv.or(meta.head_count).unwrap_or(0) as u32;
         head_dim = meta.head_dim().unwrap_or(0) as u32;
         embedding_dim = meta.embedding_length.unwrap_or(0) as u32;
+        expert_count = meta.expert_count;
+        expert_used_count = meta.expert_used_count;
+        expert_ffn_len = meta.expert_feed_forward_length;
         if context_max == 0 {
             context_max = meta.context_length.unwrap_or(0) as u32;
         }
@@ -241,7 +247,15 @@ async fn fetch_hf_repo(
         source: Source::HuggingFace,
         repo: Some(repo.to_string()),
         params_total,
-        params_active: moe_active_params(repo, params_total),
+        params_active: moe_active_params(
+            repo,
+            params_total,
+            layers as u64,
+            embedding_dim as u64,
+            expert_count,
+            expert_used_count,
+            expert_ffn_len,
+        ),
         architecture,
         context_max: if context_max == 0 { 4096 } else { context_max },
         released_at: detail["createdAt"]
@@ -252,9 +266,46 @@ async fn fetch_hf_repo(
     }))
 }
 
-/// Known MoE active-parameter counts, keyed by substring of repo name (lowercase).
-/// v0.1 heuristic; HF API does not expose active params.
-fn moe_active_params(repo: &str, params_total: u64) -> u64 {
+/// Active per-token parameters for an MoE model. Analytic from GGUF expert
+/// metadata when available (subtract the non-activated experts' FFN weights),
+/// else the repo-name heuristic, else dense (`params_total`).
+fn moe_active_params(
+    repo: &str,
+    params_total: u64,
+    layers: u64,
+    embedding_dim: u64,
+    expert_count: Option<u64>,
+    expert_used_count: Option<u64>,
+    expert_ffn_len: Option<u64>,
+) -> u64 {
+    if let (Some(experts), Some(used), Some(ffn)) =
+        (expert_count, expert_used_count, expert_ffn_len)
+        && experts > used
+        && used > 0
+        && ffn > 0
+        && embedding_dim > 0
+        && layers > 0
+    {
+        // Subtract the FFN weights of experts not activated per token. 3 =
+        // SwiGLU matrices (gate, up, down). Everything else (attention,
+        // embeddings, shared + activated experts) stays counted.
+        let inactive = experts - used;
+        let per_expert_layer = 3u64.saturating_mul(embedding_dim).saturating_mul(ffn);
+        let inactive_params = inactive
+            .saturating_mul(per_expert_layer)
+            .saturating_mul(layers);
+        // Trust the analytic result only when it leaves a plausible remainder;
+        // absurd metadata (inactive >= total) falls back to the name heuristic.
+        if inactive_params < params_total {
+            return params_total - inactive_params;
+        }
+    }
+    moe_active_params_by_name(repo, params_total)
+}
+
+/// Name-based MoE active-param heuristic: a `KNOWN` substring table plus a
+/// generic `-aNNb` suffix scan. Fallback when GGUF expert metadata is absent.
+fn moe_active_params_by_name(repo: &str, params_total: u64) -> u64 {
     let r = repo.to_lowercase();
     const KNOWN: &[(&str, u64)] = &[
         ("mixtral-8x7b", 12_900_000_000),
@@ -337,7 +388,8 @@ pub async fn fetch_mlx(
             source: Source::Mlx,
             repo: Some(repo.to_string()),
             params_total,
-            params_active: moe_active_params(repo, params_total),
+            // config.json has no GGUF expert metadata: name heuristic only.
+            params_active: moe_active_params_by_name(repo, params_total),
             architecture: config["model_type"].as_str().map(String::from),
             context_max: context,
             released_at: item["createdAt"]
@@ -629,7 +681,7 @@ mod tests {
         // Qwen3-30B-A3B hits the known table
         let repo = "Qwen/Qwen3-30B-A3B-GGUF";
         let total = 30_500_000_000u64;
-        let active = moe_active_params(repo, total);
+        let active = moe_active_params(repo, total, 48, 2048, None, None, None);
         assert_eq!(active, 3_300_000_000);
     }
 
@@ -638,7 +690,7 @@ mod tests {
         // Generic "-a3b" style not in known table
         let repo = "some-org/SomeMoE-20B-A3B-GGUF";
         let total = 20_000_000_000u64;
-        let active = moe_active_params(repo, total);
+        let active = moe_active_params(repo, total, 48, 2048, None, None, None);
         assert_eq!(active, 3_000_000_000);
     }
 
@@ -647,8 +699,106 @@ mod tests {
         // "-a" in the org name must not shadow the real "-A3B" suffix.
         let repo = "meta-ai/SomeMoE-20B-A3B-GGUF";
         let total = 20_000_000_000u64;
-        let active = moe_active_params(repo, total);
+        let active = moe_active_params(repo, total, 48, 2048, None, None, None);
         assert_eq!(active, 3_000_000_000);
+    }
+
+    #[test]
+    fn moe_active_params_analytic_qwen3_30b() {
+        let active = moe_active_params(
+            "any/name-without-marker",
+            30_500_000_000,
+            48,
+            2048,
+            Some(128),
+            Some(8),
+            Some(768),
+        );
+        assert!(
+            (3_200_000_000..=3_400_000_000).contains(&active),
+            "got {active}"
+        );
+    }
+
+    #[test]
+    fn moe_active_params_analytic_mixtral_8x7b() {
+        let active = moe_active_params(
+            "any/name",
+            46_700_000_000,
+            32,
+            4096,
+            Some(8),
+            Some(2),
+            Some(14336),
+        );
+        assert!(
+            (12_500_000_000..=13_300_000_000).contains(&active),
+            "got {active}"
+        );
+    }
+
+    #[test]
+    fn moe_active_params_falls_back_to_name_when_no_ffn_len() {
+        let active = moe_active_params(
+            "org/model-30b-a3b",
+            30_000_000_000,
+            48,
+            2048,
+            Some(128),
+            Some(8),
+            None,
+        );
+        assert_eq!(active, 3_000_000_000);
+    }
+
+    #[test]
+    fn moe_active_params_dense_when_no_moe_signal() {
+        let active = moe_active_params("org/plain-13b", 13_000_000_000, 40, 5120, None, None, None);
+        assert_eq!(active, 13_000_000_000);
+    }
+
+    #[test]
+    fn moe_active_params_degenerate_metadata_falls_back() {
+        let active = moe_active_params(
+            "org/weird",
+            20_000_000_000,
+            32,
+            4096,
+            Some(8),
+            Some(8),
+            Some(14336),
+        );
+        assert_eq!(active, 20_000_000_000);
+    }
+
+    #[test]
+    fn moe_active_params_zero_used_falls_back() {
+        // Corrupt metadata: used=0 must not subtract all experts; fall back to dense.
+        let active = moe_active_params(
+            "org/plain-20b",
+            20_000_000_000,
+            32,
+            4096,
+            Some(8),
+            Some(0),
+            Some(14336),
+        );
+        assert_eq!(active, 20_000_000_000);
+    }
+
+    #[test]
+    fn moe_active_params_absurd_ffn_falls_back() {
+        // ffn so large that inactive >= total: must fall back, not return ~0.
+        let active = moe_active_params(
+            "org/plain-20b",
+            20_000_000_000,
+            32,
+            4096,
+            Some(8),
+            Some(2),
+            Some(u64::MAX / 1000),
+        );
+        assert_eq!(active, 20_000_000_000); // dense fallback, not 0
     }
 
     #[tokio::test]
