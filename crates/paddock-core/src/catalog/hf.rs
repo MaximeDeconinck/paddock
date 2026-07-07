@@ -281,6 +281,8 @@ fn moe_active_params(
     if let (Some(experts), Some(used), Some(ffn)) =
         (expert_count, expert_used_count, expert_ffn_len)
         && experts > used
+        && used > 0
+        && ffn > 0
         && embedding_dim > 0
         && layers > 0
     {
@@ -288,7 +290,7 @@ fn moe_active_params(
         // SwiGLU matrices (gate, up, down). Everything else (attention,
         // embeddings, shared + activated experts) stays counted.
         let inactive = experts - used;
-        let per_expert_layer = 3u64 * embedding_dim * ffn;
+        let per_expert_layer = 3u64.saturating_mul(embedding_dim).saturating_mul(ffn);
         let inactive_params = inactive
             .saturating_mul(per_expert_layer)
             .saturating_mul(layers);
@@ -760,6 +762,21 @@ mod tests {
             4096,
             Some(8),
             Some(8),
+            Some(14336),
+        );
+        assert_eq!(active, 20_000_000_000);
+    }
+
+    #[test]
+    fn moe_active_params_zero_used_falls_back() {
+        // Corrupt metadata: used=0 must not subtract all experts; fall back to dense.
+        let active = moe_active_params(
+            "org/plain-20b",
+            20_000_000_000,
+            32,
+            4096,
+            Some(8),
+            Some(0),
             Some(14336),
         );
         assert_eq!(active, 20_000_000_000);
