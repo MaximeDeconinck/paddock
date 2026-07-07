@@ -294,7 +294,11 @@ fn moe_active_params(
         let inactive_params = inactive
             .saturating_mul(per_expert_layer)
             .saturating_mul(layers);
-        return params_total.saturating_sub(inactive_params);
+        // Trust the analytic result only when it leaves a plausible remainder;
+        // absurd metadata (inactive >= total) falls back to the name heuristic.
+        if inactive_params < params_total {
+            return params_total - inactive_params;
+        }
     }
     moe_active_params_by_name(repo, params_total)
 }
@@ -780,6 +784,21 @@ mod tests {
             Some(14336),
         );
         assert_eq!(active, 20_000_000_000);
+    }
+
+    #[test]
+    fn moe_active_params_absurd_ffn_falls_back() {
+        // ffn so large that inactive >= total: must fall back, not return ~0.
+        let active = moe_active_params(
+            "org/plain-20b",
+            20_000_000_000,
+            32,
+            4096,
+            Some(8),
+            Some(2),
+            Some(u64::MAX / 1000),
+        );
+        assert_eq!(active, 20_000_000_000); // dense fallback, not 0
     }
 
     #[tokio::test]
