@@ -22,6 +22,8 @@ pub struct GgufMeta {
     pub expert_count: Option<u64>,
     /// `{arch}.expert_used_count` - experts active per token.
     pub expert_used_count: Option<u64>,
+    /// `{arch}.expert_feed_forward_length` - per-expert FFN hidden size (MoE).
+    pub expert_feed_forward_length: Option<u64>,
 }
 
 impl GgufMeta {
@@ -188,6 +190,8 @@ fn parse_kv(r: &mut Reader, meta: &mut GgufMeta) -> Result<(), PaddockError> {
         meta.parameter_count = value_u64;
     } else if key.ends_with(".expert_used_count") {
         meta.expert_used_count = value_u64;
+    } else if key.ends_with(".expert_feed_forward_length") {
+        meta.expert_feed_forward_length = value_u64;
     } else if key.ends_with(".expert_count") {
         meta.expert_count = value_u64;
     }
@@ -466,6 +470,21 @@ pub(crate) mod tests {
         assert_eq!(m.parameter_count, None);
         assert_eq!(m.expert_count, None);
         assert_eq!(m.expert_used_count, None);
+    }
+
+    #[test]
+    fn expert_feed_forward_length_parsed() {
+        let bytes = GgufBuilder::new()
+            .string("general.architecture", "qwen3moe")
+            .u32("qwen3moe.expert_count", 128)
+            .u32("qwen3moe.expert_used_count", 8)
+            .u32("qwen3moe.expert_feed_forward_length", 768)
+            .build();
+        let m = parse_gguf_header(&bytes).unwrap();
+        assert_eq!(m.expert_feed_forward_length, Some(768));
+        // The new key must not cross-populate the count fields.
+        assert_eq!(m.expert_count, Some(128));
+        assert_eq!(m.expert_used_count, Some(8));
     }
 
     #[test]
