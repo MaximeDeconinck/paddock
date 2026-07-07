@@ -130,6 +130,7 @@ fn all_tracked_filled(m: &GgufMeta) -> bool {
         && m.parameter_count.is_some()
         && m.expert_count.is_some()
         && m.expert_used_count.is_some()
+        && m.expert_feed_forward_length.is_some()
 }
 
 /// Parse one key/value pair, updating `meta` for tracked keys.
@@ -433,6 +434,7 @@ pub(crate) mod tests {
             .u32("llama.context_length", 131072)
             .u32("llama.expert_count", 8)
             .u32("llama.expert_used_count", 2)
+            .u32("llama.expert_feed_forward_length", 768)
             .u32_array("tokenizer.ggml.token_ids", &vec![7u32; 100_000])
             .build();
         let cut = full.len() - 200_000; // cut deep inside the array
@@ -447,6 +449,7 @@ pub(crate) mod tests {
         assert_eq!(m.context_length, Some(131072));
         assert_eq!(m.expert_count, Some(8));
         assert_eq!(m.expert_used_count, Some(2));
+        assert_eq!(m.expert_feed_forward_length, Some(768));
     }
 
     #[test]
