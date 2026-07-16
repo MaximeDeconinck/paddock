@@ -108,6 +108,7 @@ pub fn quant_bpw(quant: &str) -> Option<f64> {
         "Q4_0" => 4.55,
         "Q3_K_M" => 3.91,
         "Q2_K" => 3.35,
+        "Q1_0" => 1.1,
         "IQ4_XS" => 4.25,
         "F16" | "BF16" => 16.0,
         "MLX_4BIT" => 4.5,
@@ -122,7 +123,8 @@ pub fn quant_bpw(quant: &str) -> Option<f64> {
 /// so it must match a real filename in the repo.
 pub fn quant_from_filename(name: &str) -> Option<String> {
     const KNOWN: &[&str] = &[
-        "Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q4_0", "Q3_K_M", "Q2_K", "IQ4_XS", "BF16", "F16",
+        "Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q4_0", "Q3_K_M", "Q2_K", "Q1_0", "IQ4_XS", "BF16",
+        "F16",
     ];
     // UD_XL tags checked first because several contain a KNOWN base quant as
     // a substring (UD-Q2_K_XL contains Q2_K, etc.).
@@ -468,6 +470,15 @@ mod tests {
         assert_eq!(quant_bpw("Q4_K_M"), Some(4.83));
         assert_eq!(quant_bpw("nonsense"), None);
         assert_eq!(quant_bpw("UD-nonsense"), None);
+    }
+
+    #[test]
+    fn q1_0_quant_recognized() {
+        assert_eq!(
+            quant_from_filename("Bonsai-27B-Q1_0.gguf"),
+            Some("Q1_0".to_string())
+        );
+        assert_eq!(quant_bpw("Q1_0"), Some(1.1));
     }
 
     #[tokio::test]
