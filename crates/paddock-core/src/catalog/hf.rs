@@ -172,7 +172,7 @@ async fn fetch_hf_repo(
         // Separate vision projector file: not a model variant, and Ollama
         // cannot import such repos via hf.co (ollama/ollama#15447).
         let last_segment = name.rsplit('/').next().unwrap_or(name).to_lowercase();
-        if last_segment.starts_with("mmproj") && last_segment.ends_with(".gguf") {
+        if last_segment.contains("mmproj") && last_segment.ends_with(".gguf") {
             has_mmproj = true;
             continue;
         }
@@ -655,6 +655,43 @@ mod tests {
         assert_ne!(m.architecture.as_deref(), Some("clip"));
         // mmproj is a projector, not a variant → LlamaCpp-only.
         assert_eq!(m.variants.len(), 1);
+        assert_eq!(m.variants[0].runtime_compat, vec![RuntimeKind::LlamaCpp]);
+    }
+
+    #[tokio::test]
+    async fn mmproj_mid_name_not_a_variant() {
+        // Projector files named "<model>-mmproj-<quant>.gguf" (mmproj in the
+        // middle, not the prefix) must still be filtered out, not surfaced as
+        // variants.
+        let repo = "prism-ml/Bonsai-27B-gguf";
+        let detail_url = format!("{HF_API}/models/{repo}?blobs=true");
+        let list_url = format!("{HF_API}/models?filter=gguf&sort=downloads&limit=1");
+        let range_url = format!("https://huggingface.co/{repo}/resolve/main/Bonsai-27B-Q8_0.gguf");
+
+        let http = MockHttp::new()
+            .add_json(&list_url, json!([{"id": repo}]))
+            .add_json(
+                &detail_url,
+                json!({
+                    "id": repo,
+                    "gguf": {
+                        "architecture": "gemma3",
+                        "context_length": 8192,
+                        "total": 27000000000u64
+                    },
+                    "siblings": [
+                        {"rfilename": "Bonsai-27B-mmproj-Q8_0.gguf", "size": 629000000u64},
+                        {"rfilename": "Bonsai-27B-Q8_0.gguf", "size": 29000000000u64}
+                    ]
+                }),
+            )
+            .add_range(&range_url, llama_header());
+
+        let models = fetch_hf_gguf(&http, 1).await.unwrap();
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        assert_eq!(m.variants.len(), 1);
+        assert_eq!(m.variants[0].quant, "Q8_0");
         assert_eq!(m.variants[0].runtime_compat, vec![RuntimeKind::LlamaCpp]);
     }
 
