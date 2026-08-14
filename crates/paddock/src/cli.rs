@@ -99,6 +99,12 @@ pub enum Command {
         /// Skip Ollama library auto-discovery entirely
         #[arg(long)]
         no_discover: bool,
+        /// Max HuggingFace trending repos to index (recency pass; 0 disables)
+        #[arg(long, default_value_t = 40)]
+        hf_trending_limit: usize,
+        /// Newest Ollama library models reserved ahead of the discovery cap
+        #[arg(long, default_value_t = 20)]
+        ollama_newest_reserve: usize,
     },
     /// Menu bar status item showing active serve endpoints (macOS)
     Tray,

@@ -167,6 +167,10 @@ pub struct SyncOptions {
     /// (tags page + manifest + 256 KiB GGUF probe each; best-effort).
     /// None disables discovery.
     pub discover_limit: Option<usize>,
+    /// Max HF repos to index from the trending list (recency pass). 0 disables.
+    pub hf_trending_limit: usize,
+    /// Newest-only Ollama library names reserved ahead of the discovery cap.
+    pub ollama_newest_reserve: usize,
 }
 
 impl Default for SyncOptions {
@@ -176,6 +180,8 @@ impl Default for SyncOptions {
             mlx_limit: 60,
             ollama_registry: true,
             discover_limit: Some(60),
+            hf_trending_limit: 40,
+            ollama_newest_reserve: 20,
         }
     }
 }
@@ -247,11 +253,13 @@ pub async fn sync(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     if let Some(limit) = opts.discover_limit {
-        // Temporary literal until SyncOptions grows `ollama_newest_reserve`.
-        discover_library_models(http, db, &curated_models, limit, 20, now, &mut report).await;
+        // Clamp: the newest reserve must not eat more than half the cap, or a
+        // small --discover-limit would starve the popularity slots entirely.
+        let newest_reserve = opts.ollama_newest_reserve.min(limit / 2);
+        discover_library_models(http, db, &curated_models, limit, newest_reserve, now, &mut report)
+            .await;
     }
-    // Trending pass off (0) until SyncOptions grows an `hf_trending_limit`.
-    match hf::fetch_hf_gguf(http, opts.hf_limit, 0).await {
+    match hf::fetch_hf_gguf(http, opts.hf_limit, opts.hf_trending_limit).await {
         Ok(models) => {
             for m in models {
                 match db.upsert_model(&m) {
@@ -346,8 +354,10 @@ async fn enrich_curated_with_registry(
     }
 }
 
-/// Best-effort discovery of uncurated Ollama library models: index page in
-/// popularity order, minus the curated base names, first `limit` entries.
+/// Best-effort discovery of uncurated Ollama library models: up to
+/// `newest_reserve` newest-only names come first, then the popularity order,
+/// minus the curated base names, capped at `limit` entries - so recent models
+/// survive the cap.
 /// Each candidate costs a tags page + one manifest + one 256 KiB header
 /// probe; failures are reported per model and never fatal.
 async fn discover_library_models(
