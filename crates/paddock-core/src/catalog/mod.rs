@@ -247,7 +247,8 @@ pub async fn sync(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     if let Some(limit) = opts.discover_limit {
-        discover_library_models(http, db, &curated_models, limit, now, &mut report).await;
+        // Temporary literal until SyncOptions grows `ollama_newest_reserve`.
+        discover_library_models(http, db, &curated_models, limit, 20, now, &mut report).await;
     }
     // Trending pass off (0) until SyncOptions grows an `hf_trending_limit`.
     match hf::fetch_hf_gguf(http, opts.hf_limit, 0).await {
@@ -354,10 +355,11 @@ async fn discover_library_models(
     db: &db::Db,
     curated_models: &[CatalogModel],
     limit: usize,
+    newest_reserve: usize,
     now: i64,
     report: &mut SyncReport,
 ) {
-    let index = match ollama_registry::fetch_library_index(http).await {
+    let index = match ollama_registry::fetch_library_index(http, newest_reserve).await {
         Ok(names) => names,
         Err(e) => {
             report.errors.push(format!("ollama discovery index: {e}"));
