@@ -102,7 +102,7 @@ pub enum Command {
         /// Max HuggingFace trending repos to index (recency pass; 0 disables)
         #[arg(long, default_value_t = 40)]
         hf_trending_limit: usize,
-        /// Newest Ollama library models reserved ahead of the discovery cap
+        /// Newest Ollama library models reserved ahead of the discovery cap (capped at half of --discover-limit)
         #[arg(long, default_value_t = 20)]
         ollama_newest_reserve: usize,
     },
