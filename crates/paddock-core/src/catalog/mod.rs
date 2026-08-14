@@ -249,7 +249,8 @@ pub async fn sync(
     if let Some(limit) = opts.discover_limit {
         discover_library_models(http, db, &curated_models, limit, now, &mut report).await;
     }
-    match hf::fetch_hf_gguf(http, opts.hf_limit).await {
+    // Trending pass off (0) until SyncOptions grows an `hf_trending_limit`.
+    match hf::fetch_hf_gguf(http, opts.hf_limit, 0).await {
         Ok(models) => {
             for m in models {
                 match db.upsert_model(&m) {
@@ -511,8 +512,10 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("ollama discovery index"))
         );
-        assert!(report.errors.iter().any(|e| e.contains("huggingface")));
-        assert!(report.errors.iter().any(|e| e.contains("mlx")));
+        // HF list failures degrade to an empty id list (no error reported);
+        // MLX still surfaces its list error.
+        assert!(!report.errors.iter().any(|e| e.starts_with("huggingface:")));
+        assert!(report.errors.iter().any(|e| e.starts_with("mlx:")));
         // last_sync set even on network failure
         let ts = db.last_sync().unwrap();
         assert!(ts.is_some(), "last_sync should be set");
@@ -540,13 +543,14 @@ mod tests {
         let report = sync(&http, &db, &opts).await.unwrap();
 
         assert_eq!(report.ollama_tags, 0);
-        // Only the two non-registry network sources may fail.
+        // HF degrades silently to an empty list; only MLX reports an error.
         assert_eq!(
             report.errors.len(),
-            2,
-            "expected exactly hf+mlx errors, got {:?}",
+            1,
+            "expected exactly the mlx error, got {:?}",
             report.errors
         );
+        assert!(report.errors[0].contains("mlx"));
     }
 
     /// MockHttp serving tag pages for some bases; everything else fails.

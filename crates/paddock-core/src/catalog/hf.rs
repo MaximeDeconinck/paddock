@@ -108,22 +108,54 @@ const HF_API: &str = "https://huggingface.co/api";
 /// How many bytes of a GGUF file to fetch when the API lacks metadata.
 const GGUF_HEADER_PROBE_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Sync popular GGUF repos from HuggingFace. Returns models (not yet persisted).
+/// Union two repo-id lists, popularity order first, then trending ids not
+/// already seen, deduplicated by id (preserving first occurrence).
+fn merge_repo_ids(popularity: Vec<String>, trending: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for id in popularity.into_iter().chain(trending.into_iter()) {
+        if seen.insert(id.clone()) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// Fetch the repo ids for one HF models query (`?...` after `{HF_API}/models`).
+/// A failed/absent list yields an empty vec (a bad query must not kill sync).
+async fn fetch_repo_ids(http: &dyn HttpClient, query: &str) -> Vec<String> {
+    let Ok(list) = http.get_json(&format!("{HF_API}/models?{query}")).await else {
+        return Vec::new();
+    };
+    list.as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(String::from))
+        .collect()
+}
+
+/// Sync popular + trending GGUF repos from HuggingFace (union, deduped).
+/// Returns models (not yet persisted).
 pub async fn fetch_hf_gguf(
     http: &dyn HttpClient,
     limit: usize,
+    trending_limit: usize,
 ) -> Result<Vec<CatalogModel>, PaddockError> {
-    let list = http
-        .get_json(&format!(
-            "{HF_API}/models?filter=gguf&sort=downloads&limit={limit}"
-        ))
-        .await?;
+    let popularity =
+        fetch_repo_ids(http, &format!("filter=gguf&sort=downloads&limit={limit}")).await;
+    let trending = if trending_limit > 0 {
+        fetch_repo_ids(
+            http,
+            &format!("filter=gguf&sort=trendingScore&limit={trending_limit}"),
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+    let ids = merge_repo_ids(popularity, trending);
     let mut out = Vec::new();
-    for item in list.as_array().unwrap_or(&Vec::new()) {
-        let Some(repo) = item["id"].as_str() else {
-            continue;
-        };
-        match fetch_hf_repo(http, repo).await {
+    for repo in ids {
+        match fetch_hf_repo(http, &repo).await {
             Ok(Some(m)) => out.push(m),
             Ok(None) => {}
             Err(_) => {} // one bad repo must not kill the sync
@@ -523,6 +555,14 @@ mod tests {
         MockHttp::new()
     }
 
+    #[test]
+    fn merge_repo_ids_dedups_popularity_first() {
+        let popularity = vec!["org/a".to_string(), "org/b".to_string()];
+        let trending = vec!["org/b".to_string(), "org/new".to_string()];
+        let merged = merge_repo_ids(popularity, trending);
+        assert_eq!(merged, vec!["org/a", "org/b", "org/new"]);
+    }
+
     #[tokio::test]
     async fn fetch_hf_repo_full_flow() {
         let repo = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF";
@@ -560,7 +600,7 @@ mod tests {
             )
             .add_range(&range_url, gguf_bytes);
 
-        let models = fetch_hf_gguf(&http, 1).await.unwrap();
+        let models = fetch_hf_gguf(&http, 1, 0).await.unwrap();
         assert_eq!(models.len(), 1);
         let m = &models[0];
         assert_eq!(m.params_total, 8030000000);
@@ -609,7 +649,7 @@ mod tests {
             )
             .add_range(&range_url, llama_header());
 
-        let models = fetch_hf_gguf(&http, 1).await.unwrap();
+        let models = fetch_hf_gguf(&http, 1, 0).await.unwrap();
         assert_eq!(models.len(), 1);
         let m = &models[0];
         // mmproj-BF16.gguf must NOT surface as a BF16 model variant
@@ -647,7 +687,7 @@ mod tests {
             )
             .add_range(&range_url, llama_header());
 
-        let models = fetch_hf_gguf(&http, 1).await.unwrap();
+        let models = fetch_hf_gguf(&http, 1, 0).await.unwrap();
         assert_eq!(models.len(), 1);
         let m = &models[0];
         assert_eq!(m.params_total, 27_000_000_000);
@@ -687,7 +727,7 @@ mod tests {
             )
             .add_range(&range_url, llama_header());
 
-        let models = fetch_hf_gguf(&http, 1).await.unwrap();
+        let models = fetch_hf_gguf(&http, 1, 0).await.unwrap();
         assert_eq!(models.len(), 1);
         let m = &models[0];
         assert_eq!(m.variants.len(), 1);
@@ -946,7 +986,7 @@ mod tests {
             )
             .add_range(&range_url, gguf_bytes);
 
-        let models = fetch_hf_gguf(&http, 2).await.unwrap();
+        let models = fetch_hf_gguf(&http, 2, 0).await.unwrap();
         assert_eq!(
             models.len(),
             1,
@@ -958,8 +998,36 @@ mod tests {
     #[tokio::test]
     async fn fetch_hf_gguf_failing_http_returns_empty() {
         let http = failing_http();
-        // failing_http has no list url registered; fetch_hf_gguf returns error from outer call
-        let result = fetch_hf_gguf(&http, 5).await;
-        assert!(result.is_err());
+        // failing_http has no list url registered; a failed list query is
+        // swallowed to an empty id list, so the sync yields Ok(empty).
+        let models = fetch_hf_gguf(&http, 5, 0).await.unwrap();
+        assert!(models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn trending_only_repo_is_discovered() {
+        let pop_url = format!("{HF_API}/models?filter=gguf&sort=downloads&limit=1");
+        let trend_url = format!("{HF_API}/models?filter=gguf&sort=trendingScore&limit=5");
+        let new_repo = "meta-models/Muse-Glimmer-30B-GGUF";
+        let detail_url = format!("{HF_API}/models/{new_repo}?blobs=true");
+        let range_url =
+            format!("https://huggingface.co/{new_repo}/resolve/main/Muse-Glimmer-30B-Q4_K_M.gguf");
+
+        let http = MockHttp::new()
+            .add_json(&pop_url, json!([]))
+            .add_json(&trend_url, json!([{"id": new_repo}]))
+            .add_json(
+                &detail_url,
+                json!({
+                    "id": new_repo,
+                    "gguf": {"architecture": "llama", "context_length": 8192, "total": 30000000000u64},
+                    "siblings": [{"rfilename": "Muse-Glimmer-30B-Q4_K_M.gguf", "size": 18000000000u64}]
+                }),
+            )
+            .add_range(&range_url, llama_header());
+
+        let models = fetch_hf_gguf(&http, 1, 5).await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].repo.as_deref(), Some(new_repo));
     }
 }
