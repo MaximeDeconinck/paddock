@@ -84,6 +84,8 @@ fn main() -> Result<()> {
             no_ollama_registry,
             discover_limit,
             no_discover,
+            hf_trending_limit,
+            ollama_newest_reserve,
         }) => {
             let db = app.open_db()?;
             let http = paddock_core::catalog::hf::ReqwestClient::new()?;
@@ -92,6 +94,8 @@ fn main() -> Result<()> {
                 mlx_limit,
                 ollama_registry: !no_ollama_registry,
                 discover_limit: (!no_discover).then_some(discover_limit),
+                hf_trending_limit,
+                ollama_newest_reserve,
             };
             let report = tokio::runtime::Runtime::new()?
                 .block_on(paddock_core::catalog::sync(&http, &db, &opts))?;

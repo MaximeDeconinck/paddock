@@ -167,6 +167,10 @@ pub struct SyncOptions {
     /// (tags page + manifest + 256 KiB GGUF probe each; best-effort).
     /// None disables discovery.
     pub discover_limit: Option<usize>,
+    /// Max HF repos to index from the trending list (recency pass). 0 disables.
+    pub hf_trending_limit: usize,
+    /// Newest-only Ollama library names reserved ahead of the discovery cap.
+    pub ollama_newest_reserve: usize,
 }
 
 impl Default for SyncOptions {
@@ -176,6 +180,8 @@ impl Default for SyncOptions {
             mlx_limit: 60,
             ollama_registry: true,
             discover_limit: Some(60),
+            hf_trending_limit: 40,
+            ollama_newest_reserve: 20,
         }
     }
 }
@@ -247,9 +253,13 @@ pub async fn sync(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     if let Some(limit) = opts.discover_limit {
-        discover_library_models(http, db, &curated_models, limit, now, &mut report).await;
+        // Clamp: the newest reserve must not eat more than half the cap, or a
+        // small --discover-limit would starve the popularity slots entirely.
+        let newest_reserve = opts.ollama_newest_reserve.min(limit / 2);
+        discover_library_models(http, db, &curated_models, limit, newest_reserve, now, &mut report)
+            .await;
     }
-    match hf::fetch_hf_gguf(http, opts.hf_limit).await {
+    match hf::fetch_hf_gguf(http, opts.hf_limit, opts.hf_trending_limit).await {
         Ok(models) => {
             for m in models {
                 match db.upsert_model(&m) {
@@ -344,8 +354,10 @@ async fn enrich_curated_with_registry(
     }
 }
 
-/// Best-effort discovery of uncurated Ollama library models: index page in
-/// popularity order, minus the curated base names, first `limit` entries.
+/// Best-effort discovery of uncurated Ollama library models: up to
+/// `newest_reserve` newest-only names come first, then the popularity order,
+/// minus the curated base names, capped at `limit` entries - so recent models
+/// survive the cap.
 /// Each candidate costs a tags page + one manifest + one 256 KiB header
 /// probe; failures are reported per model and never fatal.
 async fn discover_library_models(
@@ -353,10 +365,11 @@ async fn discover_library_models(
     db: &db::Db,
     curated_models: &[CatalogModel],
     limit: usize,
+    newest_reserve: usize,
     now: i64,
     report: &mut SyncReport,
 ) {
-    let index = match ollama_registry::fetch_library_index(http).await {
+    let index = match ollama_registry::fetch_library_index(http, newest_reserve).await {
         Ok(names) => names,
         Err(e) => {
             report.errors.push(format!("ollama discovery index: {e}"));
@@ -511,8 +524,10 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("ollama discovery index"))
         );
-        assert!(report.errors.iter().any(|e| e.contains("huggingface")));
-        assert!(report.errors.iter().any(|e| e.contains("mlx")));
+        // HF list failures degrade to an empty id list (no error reported);
+        // MLX still surfaces its list error.
+        assert!(!report.errors.iter().any(|e| e.starts_with("huggingface:")));
+        assert!(report.errors.iter().any(|e| e.starts_with("mlx:")));
         // last_sync set even on network failure
         let ts = db.last_sync().unwrap();
         assert!(ts.is_some(), "last_sync should be set");
@@ -540,13 +555,14 @@ mod tests {
         let report = sync(&http, &db, &opts).await.unwrap();
 
         assert_eq!(report.ollama_tags, 0);
-        // Only the two non-registry network sources may fail.
+        // HF degrades silently to an empty list; only MLX reports an error.
         assert_eq!(
             report.errors.len(),
-            2,
-            "expected exactly hf+mlx errors, got {:?}",
+            1,
+            "expected exactly the mlx error, got {:?}",
             report.errors
         );
+        assert!(report.errors[0].contains("mlx"));
     }
 
     /// MockHttp serving tag pages for some bases; everything else fails.

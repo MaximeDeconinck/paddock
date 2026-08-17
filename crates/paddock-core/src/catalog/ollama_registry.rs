@@ -73,14 +73,13 @@ fn extract_tag_names(html: &str, base: &str) -> Vec<String> {
     tags
 }
 
-/// Fetch the library index page and extract every model name, in page order
-/// (= popularity order), deduplicated.
+/// Extract every `{name}` from `href="/library/{name}"` in page order,
+/// stripping any `:tag` suffix, deduplicated (first occurrence wins).
 ///
 /// PRE-VERIFIED (live curl, 2026-06-10): `https://ollama.com/library` exposes
 /// 234 model names via the URL pattern `href="/library/{name}"` - same
 /// semi-stable URL-scheme extraction as `fetch_model_tags`.
-pub async fn fetch_library_index(http: &dyn HttpClient) -> Result<Vec<String>, PaddockError> {
-    let html = http.get_text("https://ollama.com/library").await?;
+pub fn parse_library_names(html: &str) -> Vec<String> {
     let needle = "href=\"/library/";
     let mut names: Vec<String> = Vec::new();
     for (idx, _) in html.match_indices(needle) {
@@ -96,7 +95,50 @@ pub async fn fetch_library_index(http: &dyn HttpClient) -> Result<Vec<String>, P
             names.push(name);
         }
     }
-    Ok(names)
+    names
+}
+
+/// Union popularity + newest library names: the first `newest_reserve`
+/// newest-only names (not in popularity) go first so they survive the
+/// downstream discovery cap, then popularity order, then any remaining newest.
+/// Deduplicated, first occurrence wins.
+fn merge_library_names(
+    popularity: Vec<String>,
+    newest: Vec<String>,
+    newest_reserve: usize,
+) -> Vec<String> {
+    let pop_set: std::collections::HashSet<&str> =
+        popularity.iter().map(String::as_str).collect();
+    let reserved: Vec<String> = newest
+        .iter()
+        .filter(|n| !pop_set.contains(n.as_str()))
+        .take(newest_reserve)
+        .cloned()
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for name in reserved.into_iter().chain(popularity).chain(newest) {
+        if seen.insert(name.clone()) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Fetch the library index: the popularity page unioned with the
+/// `?sort=newest` page, so freshly added models are discoverable.
+/// `newest_reserve` newest-only names are placed first to survive the
+/// discovery cap. A failed newest fetch degrades to popularity-only.
+pub async fn fetch_library_index(
+    http: &dyn HttpClient,
+    newest_reserve: usize,
+) -> Result<Vec<String>, PaddockError> {
+    let popularity = parse_library_names(&http.get_text("https://ollama.com/library").await?);
+    let newest = match http.get_text("https://ollama.com/library?sort=newest").await {
+        Ok(html) => parse_library_names(&html),
+        Err(_) => Vec::new(),
+    };
+    Ok(merge_library_names(popularity, newest, newest_reserve))
 }
 
 /// Fetch the OCI manifest of `{base}:{tag}` and return the (digest, size) of
@@ -716,6 +758,21 @@ mod tests {
 <a href="/download">download</a>
 </body></html>"#;
 
+    #[test]
+    fn parse_library_names_extracts_from_href() {
+        let html = r#"<a href="/library/llama3.1">..</a><a href="/library/qwen3:8b">..</a><a href="/library/llama3.1">dup</a>"#;
+        let names = parse_library_names(html);
+        assert_eq!(names, vec!["llama3.1", "qwen3"]);
+    }
+
+    #[test]
+    fn merge_library_names_reserves_newest_headroom() {
+        let popularity = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let newest = vec!["new".to_string(), "a".to_string()];
+        let merged = merge_library_names(popularity, newest, 1);
+        assert_eq!(merged, vec!["new", "a", "b", "c"]);
+    }
+
     #[tokio::test]
     async fn fetch_library_index_extracts_names_deduped_in_order() {
         let mut http = MockHttp::default();
@@ -723,14 +780,14 @@ mod tests {
             "https://ollama.com/library".to_string(),
             LIBRARY_INDEX_HTML.to_string(),
         );
-        let names = fetch_library_index(&http).await.unwrap();
+        let names = fetch_library_index(&http, 20).await.unwrap();
         assert_eq!(names, vec!["gemma3", "deepseek-r1", "llama3.1", "lfm2.5"]);
     }
 
     #[tokio::test]
     async fn fetch_library_index_propagates_network_error() {
         let http = MockHttp::default();
-        assert!(fetch_library_index(&http).await.is_err());
+        assert!(fetch_library_index(&http, 20).await.is_err());
     }
 
     /// Manifest fixture shaped like a real registry.ollama.ai answer.
