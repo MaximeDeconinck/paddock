@@ -9,6 +9,10 @@ fn paddock() -> (Command, TempDir) {
     let dir = tempfile::tempdir().unwrap();
     c.env("PADDOCK_DB_PATH", dir.path().join("catalog.db"));
     c.env("PADDOCK_SERVING_DIR", dir.path().join("serving"));
+    c.env(
+        "PADDOCK_CALIBRATION_PATH",
+        dir.path().join("calibration.json"),
+    );
     (c, dir)
 }
 
@@ -188,4 +192,22 @@ fn logs_unknown_target_errors() {
         .assert()
         .code(1)
         .stderr(predicates::str::contains("no running server matches"));
+}
+
+#[test]
+fn bench_unknown_target_fails_cleanly() {
+    let (mut cmd, _dir) = paddock();
+    cmd.args(["bench", "definitely-not-running-anywhere"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("no running server matches"));
+}
+
+#[test]
+fn bench_rejects_zero_tokens() {
+    let (mut cmd, _dir) = paddock();
+    cmd.args(["bench", "--tokens", "0", "x"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--tokens must be at least 1"));
 }

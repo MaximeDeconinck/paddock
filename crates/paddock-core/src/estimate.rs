@@ -9,14 +9,15 @@
 use serde::{Deserialize, Serialize};
 
 /// Fraction of theoretical bandwidth actually achieved by llama.cpp/MLX kernels
-/// for dense models. Default calibrated on community benchmarks; a future
-/// `paddock bench` module will recalibrate this per-machine.
+/// for dense models. Default calibrated on community benchmarks; `paddock bench`
+/// overrides it per machine (see `SpeedCalibration`).
 pub const SPEED_EFFICIENCY: f64 = 0.75;
 /// Fraction of theoretical bandwidth achieved for MoE models: expert routing
 /// scatters weight reads, so kernels reach far less of peak bandwidth than the
 /// dense streaming case. Measured ≈0.29 on M5 (Qwen3.6-35B-A3B UD-Q4_K_XL,
 /// 2026-06) and ≈0.3 implied by community Qwen3-30B-A3B numbers on M3 Max;
-/// to be refined by the future bench module.
+/// known to underestimate on some machines, which is what `paddock bench`
+/// corrects per machine (see `SpeedCalibration`).
 pub const MOE_SPEED_EFFICIENCY: f64 = 0.3;
 /// Flat runtime overhead (buffers, tokenizer, Metal heaps).
 pub const OVERHEAD_BASE_BYTES: u64 = 500 * 1024 * 1024;
@@ -203,16 +204,64 @@ pub fn estimate_memory(
     }
 }
 
-/// Estimate generation speed given memory bandwidth.
+/// Per-machine bandwidth-efficiency factors consumed by
+/// `estimate_speed_calibrated`. Defaults are the community-calibrated
+/// constants; `paddock bench` replaces them with values measured on this
+/// machine (persisted by `calibration.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SpeedCalibration {
+    pub dense: f64,
+    pub moe: f64,
+}
+
+impl Default for SpeedCalibration {
+    fn default() -> Self {
+        Self {
+            dense: SPEED_EFFICIENCY,
+            moe: MOE_SPEED_EFFICIENCY,
+        }
+    }
+}
+
+impl SpeedCalibration {
+    /// Efficiency factor for a variant: MoE when `params_active < params_total`,
+    /// dense otherwise (the same class test the estimator always used).
+    pub fn for_variant(&self, v: &ModelVariant) -> f64 {
+        if v.params_active < v.params_total {
+            self.moe
+        } else {
+            self.dense
+        }
+    }
+}
+
+/// Estimate generation speed given memory bandwidth, at the default
+/// (uncalibrated) efficiency factors. Thin wrapper over
+/// `estimate_speed_calibrated`; kept so existing callers and tests are untouched.
 /// `bandwidth_gbps`: must be finite and ≥ 0; non-finite/negative values are treated as 0.0.
 /// `kv_cache_bytes`: every decoded token re-streams the KV cache built so far
 /// on top of the active weights, so speed decays with context depth. Callers
 /// pass the DEFAULT_CONTEXT cache from `estimate_memory`, keeping the MEMORY
 /// and TOK/S columns consistent at the same 8k depth; 0 models an empty
-/// context. NOTE: SPEED_EFFICIENCY/MOE_SPEED_EFFICIENCY were calibrated on
-/// shallow-context benchmarks - recalibrate both when `paddock bench` lands,
-/// not before, to avoid double-counting the decay.
+/// context.
 pub fn estimate_speed(v: &ModelVariant, bandwidth_gbps: f64, kv_cache_bytes: u64) -> SpeedEstimate {
+    estimate_speed_calibrated(
+        v,
+        bandwidth_gbps,
+        kv_cache_bytes,
+        &SpeedCalibration::default(),
+    )
+}
+
+/// `estimate_speed` with explicit efficiency factors. The bench calibrates at
+/// near-empty context (KV ~ 0), which is correct here: the KV term is modeled
+/// separately, so the efficiency captures kernel quality, not context depth.
+pub fn estimate_speed_calibrated(
+    v: &ModelVariant,
+    bandwidth_gbps: f64,
+    kv_cache_bytes: u64,
+    cal: &SpeedCalibration,
+) -> SpeedEstimate {
     let bpw = if v.bpw.is_finite() && v.bpw > 0.0 {
         v.bpw
     } else {
@@ -223,11 +272,7 @@ pub fn estimate_speed(v: &ModelVariant, bandwidth_gbps: f64, kv_cache_bytes: u64
     } else {
         0.0
     };
-    let efficiency = if v.params_active < v.params_total {
-        MOE_SPEED_EFFICIENCY
-    } else {
-        SPEED_EFFICIENCY
-    };
+    let efficiency = cal.for_variant(v);
     let bytes_per_token = v.params_active as f64 * bpw / 8.0 + kv_cache_bytes as f64;
     let generation_tps = if bytes_per_token > 0.0 {
         safe_bw * 1e9 / bytes_per_token * efficiency
@@ -423,6 +468,50 @@ mod tests {
     }
 
     #[test]
+    fn default_calibration_matches_constants() {
+        let cal = SpeedCalibration::default();
+        assert_eq!(cal.dense, SPEED_EFFICIENCY);
+        assert_eq!(cal.moe, MOE_SPEED_EFFICIENCY);
+        let dense = llama31_8b_q4km();
+        let mut moe = llama31_8b_q4km();
+        moe.params_total = 30_000_000_000;
+        moe.params_active = 3_000_000_000;
+        assert_eq!(cal.for_variant(&dense), SPEED_EFFICIENCY);
+        assert_eq!(cal.for_variant(&moe), MOE_SPEED_EFFICIENCY);
+    }
+
+    /// The calibrated estimator scales linearly with the class factor and the
+    /// default wrapper is exactly the calibrated one at default factors.
+    #[test]
+    fn calibrated_speed_scales_with_class_factor() {
+        let dense = llama31_8b_q4km();
+        let mut moe = llama31_8b_q4km();
+        moe.params_total = 30_000_000_000;
+        moe.params_active = 3_000_000_000;
+        let cal = SpeedCalibration {
+            dense: 0.5,
+            moe: 0.6,
+        };
+
+        let d_default = estimate_speed(&dense, 400.0, 0).generation_tps;
+        let d_cal = estimate_speed_calibrated(&dense, 400.0, 0, &cal).generation_tps;
+        assert!(
+            (d_cal / d_default - 0.5 / SPEED_EFFICIENCY).abs() < 1e-9,
+            "{d_cal} vs {d_default}"
+        );
+
+        let m_default = estimate_speed(&moe, 400.0, 0).generation_tps;
+        let m_cal = estimate_speed_calibrated(&moe, 400.0, 0, &cal).generation_tps;
+        assert!(
+            (m_cal / m_default - 0.6 / MOE_SPEED_EFFICIENCY).abs() < 1e-9,
+            "{m_cal} vs {m_default}"
+        );
+
+        let same = estimate_speed_calibrated(&dense, 400.0, 0, &SpeedCalibration::default());
+        assert_eq!(same.generation_tps, d_default);
+    }
+
+    #[test]
     fn tiers() {
         assert_eq!(SpeedTier::from_tps(45.0), SpeedTier::Instant);
         assert_eq!(SpeedTier::from_tps(20.0), SpeedTier::Smooth);
@@ -488,7 +577,10 @@ mod tests {
             gpu_effective_bytes: 24 * 1024 * 1024 * 1024,
             ram_total_bytes: 32 * 1024 * 1024 * 1024,
         };
-        assert_eq!(resolve_ctx(Some(16_384), &v, &budget, v.context_max), 16_384);
+        assert_eq!(
+            resolve_ctx(Some(16_384), &v, &budget, v.context_max),
+            16_384
+        );
         assert!(resolve_ctx(None, &v, &budget, v.context_max) >= 4096);
     }
 }

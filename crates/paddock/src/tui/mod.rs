@@ -31,6 +31,7 @@ pub fn run(app: App) -> Result<()> {
         UseCase::default(),
         app.profile.runtimes.clone(),
         app.budget.clone(),
+        app.calibration,
     );
 
     // Stale (>24h) or empty catalog -> kick off a background refresh. The TUI
@@ -58,7 +59,14 @@ pub fn run(app: App) -> Result<()> {
 
     // ratatui 0.29 helpers: raw mode + alternate screen + panic hook.
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut state, &app, &db, &mut sync_rx, &servers_rx);
+    let result = event_loop(
+        &mut terminal,
+        &mut state,
+        &app,
+        &db,
+        &mut sync_rx,
+        &servers_rx,
+    );
     ratatui::restore();
 
     // Launch AFTER restore so the child owns a clean tty. `launch` and

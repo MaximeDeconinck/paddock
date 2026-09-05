@@ -116,7 +116,10 @@ fn http_body(raw: &str) -> Option<String> {
         return None;
     }
     let (headers, body) = raw.split_once("\r\n\r\n")?;
-    if headers.to_lowercase().contains("transfer-encoding: chunked") {
+    if headers
+        .to_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
         dechunk(body)
     } else {
         Some(body.to_string())
@@ -145,7 +148,10 @@ mod http_body_tests {
 
     #[test]
     fn dechunk_decodes_chunked_body() {
-        assert_eq!(dechunk("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n").unwrap(), "hello world");
+        assert_eq!(
+            dechunk("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n").unwrap(),
+            "hello world"
+        );
     }
 
     #[test]

@@ -393,3 +393,50 @@ mod tests {
         assert_eq!(age_label(Some(NOW + DAY), false, NOW), "0d"); // future clamps
     }
 }
+
+/// Everything `paddock bench` learned, for the text and `--json` printers.
+#[derive(Debug, serde::Serialize)]
+pub struct BenchReport {
+    pub model_ref: String,
+    pub runtime: paddock_core::catalog::RuntimeKind,
+    pub measured_tps: f64,
+    pub tokens: u32,
+    pub timing: paddock_core::bench::TimingSource,
+    /// Catalog model name + quant + class when the ref resolved.
+    pub model: Option<String>,
+    pub quant: Option<String>,
+    pub class: Option<paddock_core::calibration::ModelClass>,
+    /// Estimate at KV ~ 0 with the calibration in force before this run.
+    pub estimated_tps: Option<f64>,
+    pub efficiency: Option<f64>,
+    pub previous_efficiency: Option<f64>,
+    pub calibration_updated: bool,
+    /// Why the calibration was not updated (unresolved ref, implausible value).
+    pub reason: Option<String>,
+}
+
+pub fn print_bench(r: &BenchReport) {
+    match (&r.model, &r.quant, r.class) {
+        (Some(m), Some(q), Some(c)) => println!("model      {m} {q} ({})", c.label()),
+        _ => println!("model      {} (not in catalog)", r.model_ref),
+    }
+    println!(
+        "measured   {:.1} tok/s ({} tokens, {})",
+        r.measured_tps,
+        r.tokens,
+        r.timing.label()
+    );
+    if let Some(est) = r.estimated_tps {
+        println!("estimated  {est:.1} tok/s (before calibration)");
+    }
+    if let Some(eff) = r.efficiency {
+        println!("efficiency {eff:.2}");
+    }
+    match (&r.reason, r.class, r.previous_efficiency, r.efficiency) {
+        (Some(reason), ..) => println!("calibration not updated: {reason}"),
+        (None, Some(c), Some(prev), Some(eff)) if r.calibration_updated => {
+            println!("calibration updated: {} {prev:.2} -> {eff:.2}", c.label())
+        }
+        _ => {}
+    }
+}

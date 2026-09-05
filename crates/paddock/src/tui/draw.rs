@@ -1,7 +1,9 @@
 //! Pure rendering - reads state, never mutates it, no IO.
 //! Palette: DarkGray/Gray/White + a single deep-blue accent.
 
-use paddock_core::estimate::{FitVerdict, estimate_speed, kv_cache_bytes};
+use paddock_core::estimate::{
+    FitVerdict, SpeedCalibration, estimate_speed_calibrated, kv_cache_bytes,
+};
 use paddock_core::hardware::{HardwareProfile, RuntimeStatus};
 use paddock_core::runtime::{RunPlan, ServePlan};
 use ratatui::Frame;
@@ -216,8 +218,19 @@ fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
         frame.render_widget(msg, area);
         return;
     }
-    let header = Row::new(["MODEL", "RUNTIME", "ENDPOINT / DETAIL", "CTX", "UPTIME", "PID"])
-        .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    let header = Row::new([
+        "MODEL",
+        "RUNTIME",
+        "ENDPOINT / DETAIL",
+        "CTX",
+        "UPTIME",
+        "PID",
+    ])
+    .style(
+        Style::new()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let mut rows: Vec<Row> = Vec::new();
     for r in &state.servers {
@@ -342,12 +355,15 @@ fn draw_detail(frame: &mut Frame, state: &TuiState, profile: &HardwareProfile) {
     let Some(r) = state.rows.get(state.selected) else {
         return;
     };
-    let sel = state.detail_variant.min(r.model.variants.len().saturating_sub(1));
+    let sel = state
+        .detail_variant
+        .min(r.model.variants.len().saturating_sub(1));
     let lines = detail_lines(
         r,
         sel,
         &state.budget,
         profile.bandwidth_gbps,
+        &state.calibration,
         state.detail_plan.as_ref(),
         state.detail_serve_plan.as_ref(),
     );
@@ -372,6 +388,7 @@ fn draw_detail(frame: &mut Frame, state: &TuiState, profile: &HardwareProfile) {
         &r.model.to_model_variant(&r.model.variants[sel]),
         r.model.context_max,
         profile.bandwidth_gbps,
+        &state.calibration,
     );
 }
 
@@ -384,6 +401,7 @@ fn draw_speed_chart(
     v: &paddock_core::estimate::ModelVariant,
     context_max: u32,
     bandwidth_gbps: f64,
+    cal: &SpeedCalibration,
 ) {
     let max_ctx = context_max.clamp(8_192, 131_072);
     const SAMPLES: u32 = 64;
@@ -391,7 +409,8 @@ fn draw_speed_chart(
         .map(|i| {
             let ctx = max_ctx as u64 * i as u64 / SAMPLES as u64;
             let tps =
-                estimate_speed(v, bandwidth_gbps, kv_cache_bytes(v, ctx as u32)).generation_tps;
+                estimate_speed_calibrated(v, bandwidth_gbps, kv_cache_bytes(v, ctx as u32), cal)
+                    .generation_tps;
             (ctx as f64, tps)
         })
         .collect();
@@ -449,6 +468,7 @@ fn detail_lines<'a>(
     selected: usize,
     budget: &paddock_core::estimate::MemoryBudget,
     bandwidth_gbps: f64,
+    cal: &SpeedCalibration,
     plan: Option<&'a Result<RunPlan, String>>,
     serve_plan: Option<&'a Result<ServePlan, String>>,
 ) -> Vec<Line<'a>> {
@@ -461,19 +481,30 @@ fn detail_lines<'a>(
         )),
         Line::default(),
         Line::from(Span::styled(
-            format!("  {:<14} {:>10} {:>7}  {}", "QUANT", "MEMORY", "TOK/S", "FIT"),
-            Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            format!(
+                "  {:<14} {:>10} {:>7}  {}",
+                "QUANT", "MEMORY", "TOK/S", "FIT"
+            ),
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
         )),
     ];
 
     // The selected quant's memory estimate, captured for the sysctl hint below.
     let mut selected_mem = None;
     for &i in &paddock_core::score::variants_by_quality(
-        &r.model.variants.iter().map(|v| r.model.to_model_variant(v)).collect::<Vec<_>>(),
+        &r.model
+            .variants
+            .iter()
+            .map(|v| r.model.to_model_variant(v))
+            .collect::<Vec<_>>(),
     ) {
         let v = r.model.to_model_variant(&r.model.variants[i]);
         let mem = estimate_memory(&v, DEFAULT_CONTEXT, budget);
-        let tps = estimate_speed(&v, bandwidth_gbps, kv_cache_bytes(&v, DEFAULT_CONTEXT)).generation_tps;
+        let tps =
+            estimate_speed_calibrated(&v, bandwidth_gbps, kv_cache_bytes(&v, DEFAULT_CONTEXT), cal)
+                .generation_tps;
         if i == selected {
             selected_mem = Some(mem.clone());
         }

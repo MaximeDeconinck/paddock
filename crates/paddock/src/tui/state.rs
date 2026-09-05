@@ -1,7 +1,7 @@
 //! Pure TUI state machine - no terminal IO, fully unit-testable.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use paddock_core::estimate::{MemoryBudget, resolve_ctx};
+use paddock_core::estimate::{MemoryBudget, SpeedCalibration, resolve_ctx};
 use paddock_core::hardware::RuntimesStatus;
 use paddock_core::runtime::{RunPlan, ServePlan, plan_run, plan_serve};
 use paddock_core::score::UseCase;
@@ -120,6 +120,8 @@ pub struct TuiState {
     pub available: Vec<AvailableRow>,
     /// Cursor within `servers`.
     pub server_selected: usize,
+    /// Per-machine speed calibration used by the detail table and speed chart.
+    pub calibration: SpeedCalibration,
 }
 
 impl TuiState {
@@ -128,8 +130,10 @@ impl TuiState {
         use_case: UseCase,
         runtimes: RuntimesStatus,
         budget: MemoryBudget,
+        calibration: SpeedCalibration,
     ) -> Self {
         Self {
+            calibration,
             all_rows: rows.clone(),
             rows,
             selected: 0,
@@ -302,9 +306,7 @@ impl TuiState {
                                 (self.selected + 1).min(self.rows.len().saturating_sub(1));
                         }
                         K::Enter => {
-                            if let Some(idx) =
-                                self.rows.get(self.selected).map(|r| r.variant_idx)
-                            {
+                            if let Some(idx) = self.rows.get(self.selected).map(|r| r.variant_idx) {
                                 self.detail_variant = idx;
                                 self.mode = Mode::Detail;
                                 self.detail_plan = self.plan_for_selected();
@@ -327,9 +329,7 @@ impl TuiState {
                     },
                     Tab::Servers => match key.code {
                         K::Char('q') => return Action::Quit,
-                        K::Up => {
-                            self.server_selected = self.server_selected.saturating_sub(1)
-                        }
+                        K::Up => self.server_selected = self.server_selected.saturating_sub(1),
                         K::Down => {
                             let len = self.servers.len() + self.available.len();
                             self.server_selected =
@@ -653,11 +653,31 @@ mod tests {
                 gpu_effective_bytes: 24 * (1u64 << 30),
                 ram_total_bytes: 32 * (1u64 << 30),
             },
+            SpeedCalibration::default(),
         )
     }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn tui_state_carries_calibration() {
+        let cal = SpeedCalibration {
+            dense: 0.55,
+            moe: 0.45,
+        };
+        let s = TuiState::new(
+            Vec::new(),
+            UseCase::General,
+            RuntimesStatus::default(),
+            MemoryBudget {
+                gpu_effective_bytes: 1,
+                ram_total_bytes: 2,
+            },
+            cal,
+        );
+        assert_eq!(s.calibration, cal);
     }
 
     #[test]
@@ -990,7 +1010,10 @@ mod tests {
     fn x_on_empty_servers_tab_is_noop() {
         let mut s = state();
         s.tab = Tab::Servers;
-        assert!(matches!(s.handle_key(key(KeyCode::Char('x'))), Action::None));
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Char('x'))),
+            Action::None
+        ));
     }
 
     #[test]
@@ -1008,7 +1031,10 @@ mod tests {
     #[test]
     fn navigation_spans_running_then_available() {
         let mut s = state();
-        s.set_snapshot(vec![srv(1, "run-a", 8080)], vec![avail("avail-b"), avail("avail-c")]);
+        s.set_snapshot(
+            vec![srv(1, "run-a", 8080)],
+            vec![avail("avail-b"), avail("avail-c")],
+        );
         s.tab = Tab::Servers;
         assert_eq!(s.server_selected, 0);
         s.handle_key(key(KeyCode::Down));
@@ -1042,7 +1068,10 @@ mod tests {
         let mut s = state();
         s.set_snapshot(vec![], vec![avail("avail-b")]);
         s.tab = Tab::Servers;
-        assert!(matches!(s.handle_key(key(KeyCode::Char('x'))), Action::None));
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Char('x'))),
+            Action::None
+        ));
     }
 
     #[test]

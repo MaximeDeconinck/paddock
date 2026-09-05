@@ -256,8 +256,16 @@ pub async fn sync(
         // Clamp: the newest reserve must not eat more than half the cap, or a
         // small --discover-limit would starve the popularity slots entirely.
         let newest_reserve = opts.ollama_newest_reserve.min(limit / 2);
-        discover_library_models(http, db, &curated_models, limit, newest_reserve, now, &mut report)
-            .await;
+        discover_library_models(
+            http,
+            db,
+            &curated_models,
+            limit,
+            newest_reserve,
+            now,
+            &mut report,
+        )
+        .await;
     }
     match hf::fetch_hf_gguf(http, opts.hf_limit, opts.hf_trending_limit).await {
         Ok(models) => {

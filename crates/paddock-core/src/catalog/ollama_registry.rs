@@ -107,8 +107,7 @@ fn merge_library_names(
     newest: Vec<String>,
     newest_reserve: usize,
 ) -> Vec<String> {
-    let pop_set: std::collections::HashSet<&str> =
-        popularity.iter().map(String::as_str).collect();
+    let pop_set: std::collections::HashSet<&str> = popularity.iter().map(String::as_str).collect();
     let reserved: Vec<String> = newest
         .iter()
         .filter(|n| !pop_set.contains(n.as_str()))
@@ -134,7 +133,10 @@ pub async fn fetch_library_index(
     newest_reserve: usize,
 ) -> Result<Vec<String>, PaddockError> {
     let popularity = parse_library_names(&http.get_text("https://ollama.com/library").await?);
-    let newest = match http.get_text("https://ollama.com/library?sort=newest").await {
+    let newest = match http
+        .get_text("https://ollama.com/library?sort=newest")
+        .await
+    {
         Ok(html) => parse_library_names(&html),
         Err(_) => Vec::new(),
     };
