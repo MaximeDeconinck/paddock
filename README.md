@@ -50,7 +50,7 @@ Press `Tab` to switch to the servers view: everything currently running shows th
 
 On the models tab, `enter` opens a model's detail popup, which lists every quantization it ships with their memory, tok/s and fit; use the arrow keys to pick a smaller quant for more speed and less memory, then `x` to run or `s` to serve the chosen one. Without opening the detail, `x`/`s` use the best quant that fits.
 
-Nine subcommands cover everything scriptable:
+Ten subcommands cover everything scriptable:
 
 ### `paddock scan`: what is this machine?
 
@@ -196,6 +196,25 @@ stopped qwen3-8b (pid 51234)
 
 `paddock logs <target>` prints a detached server's log (by model name or pid). Pass `-f` (`--follow`) to follow it live, like `tail -f`.
 
+### `paddock bench`: measure, then trust the numbers
+
+The speed column is an estimate. `paddock bench` replaces the guesswork with a measurement of *your* machine: it times one short generation against a server that is already running (llama.cpp, mlx-lm, or a model loaded in Ollama), derives the bandwidth efficiency the kernels actually reach on this Mac, and stores it so every future estimate uses it.
+
+```text
+$ paddock serve Qwen3.6-35B-A3B-GGUF
+...
+$ paddock bench
+model      Qwen3.6-35B-A3B-GGUF Q4_K_M (moe)
+measured   38.2 tok/s (128 tokens, server timings)
+estimated  16.5 tok/s (before calibration)
+efficiency 0.45
+calibration updated: moe 0.30 -> 0.45
+```
+
+With one server running no target is needed; otherwise pass a model-name substring or a pid, like `stop` and `logs`. `--tokens N` changes the length of the timed run (default 128). Ollama and llama.cpp report their own generation timings, so the number is exact; mlx-lm has none, so paddock falls back to tokens over wall time and says so.
+
+Calibration is per machine and per model class: one factor for dense models, one for MoE, last measurement wins, stored in `~/Library/Application Support/paddock/calibration.json`. Delete the file to go back to the defaults. Bench a model of the size you actually use: very small models are dominated by per-token overhead rather than bandwidth, so calibrating on a 1B model makes the estimates for 30B models pessimistic. If the served model cannot be matched to a catalog entry, paddock prints the measured speed and leaves the calibration alone; if the implied efficiency is implausible (outside 0.05 to 1.5, which means the model on the wire is not the one in the catalog), it refuses to write it.
+
 Some Hugging Face repos ship their vision projector as a separate `mmproj-*.gguf` file (Unsloth's Qwen3.6 uploads, for example). Ollama cannot import those repos via `hf.co/…` ([ollama/ollama#15447](https://github.com/ollama/ollama/issues/15447)); it would download the full weights and then fail. paddock detects the `mmproj` file at sync time, marks every variant of the repo llama.cpp-only, and serves it with `llama-server` (or proposes `brew install llama.cpp`) even when Ollama is installed and running. Run `paddock sync` to refresh these compatibility flags.
 
 ### `paddock tray`: menu bar (macOS)
@@ -275,7 +294,7 @@ tps = bandwidth / (params_active × bpw / 8) × efficiency
 
 `params_active` equals total parameters for dense models and the active-expert count for MoE models, which is why a 30B-A3B MoE generates faster than a dense 8B. The efficiency factor is the fraction of theoretical bandwidth that llama.cpp/MLX kernels actually sustain, and it differs by architecture: **0.75 for dense models** (calibrated against community benchmarks, e.g. Llama 3.1 8B Q4_K_M on an M2 Max: predicted ~62 tok/s, field reports 55–70) and **0.3 for MoE models** (calibrated on a real measurement: Qwen3.6-35B-A3B UD-Q4_K_XL on an M5 measured 22.6 tok/s vs ~23.7 predicted; community Qwen3-30B-A3B numbers on M3 Max imply the same ≈0.3). Expert routing scatters weight reads across memory, so MoE kernels get nowhere near the dense streaming case, and MoE estimates carry more variance than dense ones. Prompt processing is compute-bound, not bandwidth-bound; paddock reports it as a rough 5–10× multiple of generation speed.
 
-**Stated plainly:** these are bandwidth-bound theoretical estimates at fixed efficiency factors. They are good enough to rank models and avoid wasted downloads; they are not a benchmark. A real `paddock bench` module that measures *your* machine and recalibrates the factors per-device is on the roadmap.
+**Stated plainly:** these are bandwidth-bound theoretical estimates at fixed efficiency factors. They are good enough to rank models and avoid wasted downloads; they are not a benchmark. `paddock bench` measures your machine and replaces the efficiency factors with the values it observes, per model class; after one bench the TOK/S column reflects this Mac rather than the community average.
 
 ### Bits per weight
 
@@ -321,7 +340,7 @@ Geometric, because on a capable machine fit/speed/context all saturate near 100 
 ## Roadmap
 
 - **Tauri desktop app** on top of `paddock-core`
-- **`paddock bench`**: real measured tok/s, per-machine recalibration of the efficiency factor, offload-penalty modeling
+- **`paddock bench` v2**: bench from the TUI, prefill (prompt-speed) calibration, offload-penalty modeling
 - **MCP server**: let coding agents ask "what can this machine run?"
 - **Linux / Windows**: same idea, different memory model (discrete VRAM, CUDA/ROCm)
 
