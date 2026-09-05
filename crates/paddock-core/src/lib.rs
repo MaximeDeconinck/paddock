@@ -1,3 +1,4 @@
+pub mod bench;
 pub mod calibration;
 pub mod catalog;
 pub mod error;
