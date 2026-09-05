@@ -36,10 +36,9 @@ impl App {
             gpu_effective_bytes: profile.gpu.effective_limit_bytes,
             ram_total_bytes: profile.ram_total_bytes,
         };
-        let calibration = paddock_core::calibration::load(
-            &paddock_core::calibration::default_calibration_path(),
-        )
-        .to_speed_calibration();
+        let calibration =
+            paddock_core::calibration::load(&paddock_core::calibration::default_calibration_path())
+                .to_speed_calibration();
         Self {
             profile,
             budget,

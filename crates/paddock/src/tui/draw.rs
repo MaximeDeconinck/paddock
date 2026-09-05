@@ -218,8 +218,19 @@ fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
         frame.render_widget(msg, area);
         return;
     }
-    let header = Row::new(["MODEL", "RUNTIME", "ENDPOINT / DETAIL", "CTX", "UPTIME", "PID"])
-        .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    let header = Row::new([
+        "MODEL",
+        "RUNTIME",
+        "ENDPOINT / DETAIL",
+        "CTX",
+        "UPTIME",
+        "PID",
+    ])
+    .style(
+        Style::new()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let mut rows: Vec<Row> = Vec::new();
     for r in &state.servers {
@@ -344,7 +355,9 @@ fn draw_detail(frame: &mut Frame, state: &TuiState, profile: &HardwareProfile) {
     let Some(r) = state.rows.get(state.selected) else {
         return;
     };
-    let sel = state.detail_variant.min(r.model.variants.len().saturating_sub(1));
+    let sel = state
+        .detail_variant
+        .min(r.model.variants.len().saturating_sub(1));
     let lines = detail_lines(
         r,
         sel,
@@ -468,25 +481,30 @@ fn detail_lines<'a>(
         )),
         Line::default(),
         Line::from(Span::styled(
-            format!("  {:<14} {:>10} {:>7}  {}", "QUANT", "MEMORY", "TOK/S", "FIT"),
-            Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            format!(
+                "  {:<14} {:>10} {:>7}  {}",
+                "QUANT", "MEMORY", "TOK/S", "FIT"
+            ),
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
         )),
     ];
 
     // The selected quant's memory estimate, captured for the sysctl hint below.
     let mut selected_mem = None;
     for &i in &paddock_core::score::variants_by_quality(
-        &r.model.variants.iter().map(|v| r.model.to_model_variant(v)).collect::<Vec<_>>(),
+        &r.model
+            .variants
+            .iter()
+            .map(|v| r.model.to_model_variant(v))
+            .collect::<Vec<_>>(),
     ) {
         let v = r.model.to_model_variant(&r.model.variants[i]);
         let mem = estimate_memory(&v, DEFAULT_CONTEXT, budget);
-        let tps = estimate_speed_calibrated(
-            &v,
-            bandwidth_gbps,
-            kv_cache_bytes(&v, DEFAULT_CONTEXT),
-            cal,
-        )
-        .generation_tps;
+        let tps =
+            estimate_speed_calibrated(&v, bandwidth_gbps, kv_cache_bytes(&v, DEFAULT_CONTEXT), cal)
+                .generation_tps;
         if i == selected {
             selected_mem = Some(mem.clone());
         }

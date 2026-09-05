@@ -105,8 +105,7 @@ pub fn save(path: &Path, file: &CalibrationFile) -> Result<(), PaddockError> {
         std::fs::create_dir_all(parent)
             .map_err(|e| PaddockError::Other(format!("cannot create {parent:?}: {e}")))?;
     }
-    let json =
-        serde_json::to_vec_pretty(file).map_err(|e| PaddockError::Other(e.to_string()))?;
+    let json = serde_json::to_vec_pretty(file).map_err(|e| PaddockError::Other(e.to_string()))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json)
         .map_err(|e| PaddockError::Other(format!("cannot write calibration: {e}")))?;
@@ -170,7 +169,10 @@ mod tests {
     fn hostile_measurement_inputs_yield_zero() {
         assert_eq!(efficiency_from_measurement(f64::NAN, 1, 4.0, 400.0), 0.0);
         assert_eq!(efficiency_from_measurement(30.0, 0, 4.0, 400.0), 0.0);
-        assert_eq!(efficiency_from_measurement(30.0, 1_000_000_000, 4.0, 0.0), 0.0);
+        assert_eq!(
+            efficiency_from_measurement(30.0, 1_000_000_000, 4.0, 0.0),
+            0.0
+        );
         assert_eq!(
             efficiency_from_measurement(30.0, 1_000_000_000, f64::NAN, 400.0),
             0.0
@@ -229,7 +231,10 @@ mod tests {
         assert_eq!(back, file);
         let cal = back.to_speed_calibration();
         assert_eq!(cal.moe, 0.68);
-        assert_eq!(cal.dense, SPEED_EFFICIENCY, "missing class keeps the default");
+        assert_eq!(
+            cal.dense, SPEED_EFFICIENCY,
+            "missing class keeps the default"
+        );
         // The JSON has no `dense` key at all when the entry is absent.
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("\"dense\""), "{raw}");

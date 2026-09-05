@@ -17,8 +17,7 @@ use crate::hardware::SystemProbe;
 pub const DEFAULT_BENCH_TOKENS: u32 = 128;
 const WARM_UP_TOKENS: u32 = 8;
 /// Open-ended so the model does not stop early; ~20 prompt tokens.
-const BENCH_PROMPT: &str =
-    "Write a detailed, multi-paragraph history of the horse, from domestication to the present day.";
+const BENCH_PROMPT: &str = "Write a detailed, multi-paragraph history of the horse, from domestication to the present day.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -456,9 +455,15 @@ mod tests {
     #[test]
     fn measure_unreachable_server_is_a_clean_error() {
         let probe = MockProbe::default(); // no POST fixtures = connection refused
-        let err = measure(&probe, RuntimeKind::LlamaCpp, "http://127.0.0.1:8080", "x", 16)
-            .unwrap_err()
-            .to_string();
+        let err = measure(
+            &probe,
+            RuntimeKind::LlamaCpp,
+            "http://127.0.0.1:8080",
+            "x",
+            16,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("127.0.0.1:8080"), "{err}");
     }
 }
@@ -579,7 +584,10 @@ mod resolve_tests {
 
     #[test]
     fn ollama_full_curated_name_picks_best_quality_variant() {
-        assert_eq!(resolve_model_ref(&catalog(), "qwen3-coder:30b"), Some((1, 0)));
+        assert_eq!(
+            resolve_model_ref(&catalog(), "qwen3-coder:30b"),
+            Some((1, 0))
+        );
         // Curated name with two variants and no tag hit: Q8_0 is the higher quality.
         assert_eq!(resolve_model_ref(&catalog(), "llama3.1:8b"), Some((0, 1)));
     }
@@ -587,13 +595,22 @@ mod resolve_tests {
     #[test]
     fn ollama_base_name_with_unknown_tag_matches_quant_substring_else_best() {
         let c = catalog();
-        assert_eq!(resolve_model_ref(&c, "llama3.1:latest-q4_K_M"), Some((0, 0)));
+        assert_eq!(
+            resolve_model_ref(&c, "llama3.1:latest-q4_K_M"),
+            Some((0, 0))
+        );
         assert_eq!(resolve_model_ref(&c, "llama3.1:latest"), Some((0, 1)));
     }
 
     #[test]
     fn unknown_ref_is_unresolved() {
-        assert_eq!(resolve_model_ref(&catalog(), "definitely-not-a-model:1b"), None);
-        assert_eq!(resolve_model_ref(&catalog(), "hf.co/nobody/nothing:Q4_K_M"), None);
+        assert_eq!(
+            resolve_model_ref(&catalog(), "definitely-not-a-model:1b"),
+            None
+        );
+        assert_eq!(
+            resolve_model_ref(&catalog(), "hf.co/nobody/nothing:Q4_K_M"),
+            None
+        );
     }
 }

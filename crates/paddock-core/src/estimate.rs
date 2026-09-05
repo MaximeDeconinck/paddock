@@ -245,7 +245,12 @@ impl SpeedCalibration {
 /// and TOK/S columns consistent at the same 8k depth; 0 models an empty
 /// context.
 pub fn estimate_speed(v: &ModelVariant, bandwidth_gbps: f64, kv_cache_bytes: u64) -> SpeedEstimate {
-    estimate_speed_calibrated(v, bandwidth_gbps, kv_cache_bytes, &SpeedCalibration::default())
+    estimate_speed_calibrated(
+        v,
+        bandwidth_gbps,
+        kv_cache_bytes,
+        &SpeedCalibration::default(),
+    )
 }
 
 /// `estimate_speed` with explicit efficiency factors. The bench calibrates at
@@ -572,7 +577,10 @@ mod tests {
             gpu_effective_bytes: 24 * 1024 * 1024 * 1024,
             ram_total_bytes: 32 * 1024 * 1024 * 1024,
         };
-        assert_eq!(resolve_ctx(Some(16_384), &v, &budget, v.context_max), 16_384);
+        assert_eq!(
+            resolve_ctx(Some(16_384), &v, &budget, v.context_max),
+            16_384
+        );
         assert!(resolve_ctx(None, &v, &budget, v.context_max) >= 4096);
     }
 }

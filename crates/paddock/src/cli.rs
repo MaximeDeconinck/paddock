@@ -82,6 +82,14 @@ pub enum Command {
         #[arg(long, short = 'f')]
         follow: bool,
     },
+    /// Measure a running server's real tok/s and calibrate speed estimates
+    Bench {
+        /// Target: model name substring or a pid; omit when one server runs
+        target: Option<String>,
+        /// Tokens to generate for the timed run
+        #[arg(long, default_value_t = paddock_core::bench::DEFAULT_BENCH_TOKENS)]
+        tokens: u32,
+    },
     /// Refresh the model catalog
     Sync {
         /// Max Hugging Face GGUF repos to index

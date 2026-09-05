@@ -78,6 +78,9 @@ fn main() -> Result<()> {
         }
         Some(Command::Stop { target, yes }) => stop_servers(&target, yes)?,
         Some(Command::Logs { target, follow }) => show_logs(&target, follow)?,
+        Some(Command::Bench { target, tokens }) => {
+            bench_server(&app, target.as_deref(), tokens, cli.json)?
+        }
         Some(Command::Sync {
             hf_limit,
             mlx_limit,
@@ -252,7 +255,13 @@ fn serve_model(
 ) -> Result<()> {
     let (model, idx) = resolve_model(app, query, quant.as_deref())?;
     let ctx = Some(resolved_ctx(app, &model, idx, ctx));
-    let plan = plan_serve(&model, &model.variants[idx], &app.profile.runtimes, port, ctx)?;
+    let plan = plan_serve(
+        &model,
+        &model.variants[idx],
+        &app.profile.runtimes,
+        port,
+        ctx,
+    )?;
 
     if json {
         // Machine mode: print the plan, zero side effects (no spawn, no pull).
@@ -642,6 +651,157 @@ fn show_logs(target: &str, follow: bool) -> Result<()> {
         print!("{body}");
         Ok(())
     }
+}
+
+/// `paddock bench`: time one generation against a running server, derive this
+/// machine's efficiency for the model's class, persist it.
+fn bench_server(app: &App, target: Option<&str>, tokens: u32, json: bool) -> Result<()> {
+    use paddock_core::bench::{measure, resolve_model_ref};
+    use paddock_core::calibration::{
+        self, CalibrationEntry, ModelClass, default_calibration_path, efficiency_from_measurement,
+        validate_efficiency,
+    };
+    use paddock_core::estimate::estimate_speed_calibrated;
+    use paddock_core::serving::{ServerRowMatch, list_all_servers, match_server_rows};
+
+    if tokens == 0 {
+        bail!("--tokens must be at least 1");
+    }
+    let probe = RealSystemProbe;
+    let rows = list_all_servers(&Registry::open_default(), &probe);
+    let row = match match_server_rows(&rows, target) {
+        ServerRowMatch::Matched(r) => r,
+        ServerRowMatch::Ambiguous(cands) => {
+            match target {
+                None => eprintln!(
+                    "several servers are running - pick one with `paddock bench <target>`:"
+                ),
+                Some(t) => eprintln!("`{t}` matches several servers - be specific:"),
+            }
+            for r in cands {
+                eprintln!("  {} ({})", r.model, r.endpoint);
+            }
+            std::process::exit(1);
+        }
+        ServerRowMatch::NotFound => {
+            match target {
+                None => eprintln!("nothing to bench - serve a model first"),
+                Some(t) => {
+                    eprintln!("no running server matches `{t}`");
+                    if !rows.is_empty() {
+                        eprintln!(
+                            "running: {}",
+                            rows.iter()
+                                .map(|r| r.model.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                }
+            }
+            std::process::exit(1);
+        }
+    };
+
+    if !json {
+        eprintln!(
+            "benching {} on {} ({tokens} tokens)...",
+            row.model, row.endpoint
+        );
+    }
+    let measured = measure(&probe, row.runtime, &row.endpoint, &row.model, tokens)?;
+
+    let db = app.open_db()?;
+    let models = db.list_models().context("reading catalog")?;
+    let resolved = resolve_model_ref(&models, &row.model).map(|(mi, vi)| {
+        (
+            &models[mi],
+            models[mi].to_model_variant(&models[mi].variants[vi]),
+        )
+    });
+
+    let mut report = output::BenchReport {
+        model_ref: row.model.clone(),
+        runtime: row.runtime,
+        measured_tps: measured.tps,
+        tokens: measured.tokens,
+        timing: measured.timing,
+        model: None,
+        quant: None,
+        class: None,
+        estimated_tps: None,
+        efficiency: None,
+        previous_efficiency: None,
+        calibration_updated: false,
+        reason: None,
+    };
+    let mut rejected = false;
+
+    match resolved {
+        None => {
+            report.reason = Some(format!(
+                "`{}` not found in catalog (run `paddock sync`); measured only",
+                row.model
+            ));
+        }
+        Some((model, mv)) => {
+            let class = ModelClass::of(&mv);
+            let previous = match class {
+                ModelClass::Dense => app.calibration.dense,
+                ModelClass::Moe => app.calibration.moe,
+            };
+            report.model = Some(model.name.clone());
+            report.quant = Some(mv.quant.clone());
+            report.class = Some(class);
+            report.previous_efficiency = Some(previous);
+            // KV ~ 0: the same near-empty-context condition the bench runs under.
+            report.estimated_tps = Some(
+                estimate_speed_calibrated(&mv, app.profile.bandwidth_gbps, 0, &app.calibration)
+                    .generation_tps,
+            );
+            let eff = efficiency_from_measurement(
+                measured.tps,
+                mv.params_active,
+                mv.bpw,
+                app.profile.bandwidth_gbps,
+            );
+            report.efficiency = Some(eff);
+            match validate_efficiency(eff) {
+                Err(e) => {
+                    rejected = true;
+                    report.reason = Some(e.to_string());
+                }
+                Ok(eff) => {
+                    let path = default_calibration_path();
+                    let mut file = calibration::load(&path);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    file.set(
+                        class,
+                        CalibrationEntry {
+                            efficiency: eff,
+                            model: format!("{} {}", model.name, mv.quant),
+                            measured_at: now,
+                        },
+                    );
+                    calibration::save(&path, &file).context("writing calibration.json")?;
+                    report.calibration_updated = true;
+                }
+            }
+        }
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        output::print_bench(&report);
+    }
+    if rejected {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// Run a pre-step to completion (stdout/stderr inherited - progress streams

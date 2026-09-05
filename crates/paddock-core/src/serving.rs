@@ -364,6 +364,110 @@ pub fn list_all_servers(registry: &Registry, probe: &dyn SystemProbe) -> Vec<Ser
     rows
 }
 
+/// Result of resolving a `bench` target against unified server rows.
+pub enum ServerRowMatch<'a> {
+    Matched(&'a ServerRow),
+    /// Several rows hit (or several servers run and no target was given).
+    Ambiguous(Vec<&'a ServerRow>),
+    NotFound,
+}
+
+/// Resolve a `bench` target over `list_all_servers` rows: no target = the
+/// single running server; all-digits = pid of a paddock-spawned server;
+/// otherwise a case-insensitive substring of the model name.
+pub fn match_server_rows<'a>(rows: &'a [ServerRow], target: Option<&str>) -> ServerRowMatch<'a> {
+    let Some(target) = target else {
+        return match rows {
+            [] => ServerRowMatch::NotFound,
+            [one] => ServerRowMatch::Matched(one),
+            many => ServerRowMatch::Ambiguous(many.iter().collect()),
+        };
+    };
+    if let Ok(pid) = target.parse::<u32>() {
+        return match rows.iter().find(|r| r.stop == StopHandle::Pid(pid)) {
+            Some(r) => ServerRowMatch::Matched(r),
+            None => ServerRowMatch::NotFound,
+        };
+    }
+    let needle = target.to_lowercase();
+    let hits: Vec<&ServerRow> = rows
+        .iter()
+        .filter(|r| r.model.to_lowercase().contains(&needle))
+        .collect();
+    match hits.as_slice() {
+        [] => ServerRowMatch::NotFound,
+        [one] => ServerRowMatch::Matched(one),
+        _ => ServerRowMatch::Ambiguous(hits),
+    }
+}
+
+#[cfg(test)]
+mod server_row_match_tests {
+    use super::*;
+
+    fn row(model: &str, stop: StopHandle) -> ServerRow {
+        ServerRow {
+            model: model.into(),
+            runtime: RuntimeKind::LlamaCpp,
+            endpoint: "http://127.0.0.1:8080".into(),
+            openai_url: "http://127.0.0.1:8080/v1/chat/completions".into(),
+            ctx: None,
+            started_at: None,
+            stop,
+        }
+    }
+
+    #[test]
+    fn no_target_means_the_single_server() {
+        let rows = vec![row("qwen3-8b", StopHandle::Pid(1))];
+        assert!(matches!(
+            match_server_rows(&rows, None),
+            ServerRowMatch::Matched(r) if r.model == "qwen3-8b"
+        ));
+        assert!(matches!(
+            match_server_rows(&[], None),
+            ServerRowMatch::NotFound
+        ));
+        let two = vec![row("a", StopHandle::Pid(1)), row("b", StopHandle::Pid(2))];
+        assert!(matches!(
+            match_server_rows(&two, None),
+            ServerRowMatch::Ambiguous(v) if v.len() == 2
+        ));
+    }
+
+    #[test]
+    fn pid_and_substring_targets() {
+        let rows = vec![
+            row(
+                "hf.co/unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M",
+                StopHandle::Pid(51234),
+            ),
+            row("llama3.2:3b", StopHandle::OllamaModel("llama3.2:3b".into())),
+            row("llama3.1:8b", StopHandle::OllamaModel("llama3.1:8b".into())),
+        ];
+        assert!(matches!(
+            match_server_rows(&rows, Some("51234")),
+            ServerRowMatch::Matched(r) if r.model.starts_with("hf.co")
+        ));
+        assert!(matches!(
+            match_server_rows(&rows, Some("qwen3.6")),
+            ServerRowMatch::Matched(r) if r.model.contains("Qwen3.6")
+        ));
+        assert!(matches!(
+            match_server_rows(&rows, Some("llama3")),
+            ServerRowMatch::Ambiguous(v) if v.len() == 2
+        ));
+        assert!(matches!(
+            match_server_rows(&rows, Some("nothing")),
+            ServerRowMatch::NotFound
+        ));
+        assert!(matches!(
+            match_server_rows(&rows, Some("99")),
+            ServerRowMatch::NotFound
+        ));
+    }
+}
+
 const OLLAMA_GENERATE_URL: &str = "http://127.0.0.1:11434/api/generate";
 /// How long a freshly served model stays loaded without traffic. Long enough
 /// to bridge the gap between `paddock serve` and the user's first request.
@@ -702,7 +806,10 @@ mod list_all_tests {
         assert_eq!(rows[0].model, "gemma:12b");
         assert_eq!(rows[0].runtime, RuntimeKind::Ollama);
         assert_eq!(rows[0].ctx, None);
-        assert_eq!(rows[0].stop, StopHandle::OllamaModel("gemma:12b".to_string()));
+        assert_eq!(
+            rows[0].stop,
+            StopHandle::OllamaModel("gemma:12b".to_string())
+        );
         assert_eq!(rows[0].endpoint, "http://127.0.0.1:11434");
     }
 

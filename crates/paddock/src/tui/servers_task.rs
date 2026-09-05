@@ -7,7 +7,9 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
 use paddock_core::hardware::RealSystemProbe;
-use paddock_core::serving::{AvailableRow, History, Registry, ServerRow, list_all_servers, list_available};
+use paddock_core::serving::{
+    AvailableRow, History, Registry, ServerRow, list_all_servers, list_available,
+};
 
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 

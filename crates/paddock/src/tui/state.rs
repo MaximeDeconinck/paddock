@@ -306,9 +306,7 @@ impl TuiState {
                                 (self.selected + 1).min(self.rows.len().saturating_sub(1));
                         }
                         K::Enter => {
-                            if let Some(idx) =
-                                self.rows.get(self.selected).map(|r| r.variant_idx)
-                            {
+                            if let Some(idx) = self.rows.get(self.selected).map(|r| r.variant_idx) {
                                 self.detail_variant = idx;
                                 self.mode = Mode::Detail;
                                 self.detail_plan = self.plan_for_selected();
@@ -331,9 +329,7 @@ impl TuiState {
                     },
                     Tab::Servers => match key.code {
                         K::Char('q') => return Action::Quit,
-                        K::Up => {
-                            self.server_selected = self.server_selected.saturating_sub(1)
-                        }
+                        K::Up => self.server_selected = self.server_selected.saturating_sub(1),
                         K::Down => {
                             let len = self.servers.len() + self.available.len();
                             self.server_selected =
@@ -1014,7 +1010,10 @@ mod tests {
     fn x_on_empty_servers_tab_is_noop() {
         let mut s = state();
         s.tab = Tab::Servers;
-        assert!(matches!(s.handle_key(key(KeyCode::Char('x'))), Action::None));
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Char('x'))),
+            Action::None
+        ));
     }
 
     #[test]
@@ -1032,7 +1031,10 @@ mod tests {
     #[test]
     fn navigation_spans_running_then_available() {
         let mut s = state();
-        s.set_snapshot(vec![srv(1, "run-a", 8080)], vec![avail("avail-b"), avail("avail-c")]);
+        s.set_snapshot(
+            vec![srv(1, "run-a", 8080)],
+            vec![avail("avail-b"), avail("avail-c")],
+        );
         s.tab = Tab::Servers;
         assert_eq!(s.server_selected, 0);
         s.handle_key(key(KeyCode::Down));
@@ -1066,7 +1068,10 @@ mod tests {
         let mut s = state();
         s.set_snapshot(vec![], vec![avail("avail-b")]);
         s.tab = Tab::Servers;
-        assert!(matches!(s.handle_key(key(KeyCode::Char('x'))), Action::None));
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Char('x'))),
+            Action::None
+        ));
     }
 
     #[test]
