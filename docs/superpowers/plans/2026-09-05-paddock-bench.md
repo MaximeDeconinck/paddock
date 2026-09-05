@@ -1713,7 +1713,7 @@ In the Roadmap, replace the `paddock bench` bullet with:
 
 - [ ] **Step 2: Grep for em-dashes in everything touched**
 
-Run: `rg -n "—" README.md crates/paddock-core/src/bench.rs crates/paddock-core/src/calibration.rs crates/paddock/src/main.rs crates/paddock/src/output.rs docs/superpowers/plans/2026-09-05-paddock-bench.md`
+Run: `rg -nP '\x{2014}' README.md crates/paddock-core/src/bench.rs crates/paddock-core/src/calibration.rs crates/paddock/src/main.rs crates/paddock/src/output.rs docs/superpowers/plans/2026-09-05-paddock-bench.md`
 Expected: no output.
 
 - [ ] **Step 3: Live smoke (needs a running server on this Mac)**
