@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use paddock_core::catalog::CatalogModel;
 use paddock_core::catalog::db::{Db, default_db_path};
 use paddock_core::estimate::{
-    DEFAULT_CONTEXT, FitVerdict, MemoryBudget, MemoryEstimate, SpeedEstimate, estimate_memory,
-    estimate_speed,
+    DEFAULT_CONTEXT, FitVerdict, MemoryBudget, MemoryEstimate, SpeedCalibration, SpeedEstimate,
+    estimate_memory, estimate_speed_calibrated,
 };
 use paddock_core::hardware::{HardwareProfile, RealSystemProbe, scan};
 use paddock_core::score::{Score, UseCase, best_variant, score_variant};
@@ -24,6 +24,9 @@ pub struct ScoredModel {
 pub struct App {
     pub profile: HardwareProfile,
     pub budget: MemoryBudget,
+    /// Per-machine efficiency factors from `paddock bench` (defaults when
+    /// no bench has run). Loaded once; every speed estimate uses it.
+    pub calibration: SpeedCalibration,
 }
 
 impl App {
@@ -33,7 +36,15 @@ impl App {
             gpu_effective_bytes: profile.gpu.effective_limit_bytes,
             ram_total_bytes: profile.ram_total_bytes,
         };
-        Self { profile, budget }
+        let calibration = paddock_core::calibration::load(
+            &paddock_core::calibration::default_calibration_path(),
+        )
+        .to_speed_calibration();
+        Self {
+            profile,
+            budget,
+            calibration,
+        }
     }
 
     pub fn open_db(&self) -> Result<Db> {
@@ -90,7 +101,12 @@ impl App {
             if !include_unfit && memory.verdict == FitVerdict::DoesNotFit {
                 continue;
             }
-            let speed = estimate_speed(mv, self.profile.bandwidth_gbps, memory.kv_cache_bytes);
+            let speed = estimate_speed_calibrated(
+                mv,
+                self.profile.bandwidth_gbps,
+                memory.kv_cache_bytes,
+                &self.calibration,
+            );
             let age_days = model.released_at.map(|r| (now - r) as f64 / 86_400.0);
             let score = score_variant(mv, &memory, &speed, use_case, age_days);
             rows.push(ScoredModel {

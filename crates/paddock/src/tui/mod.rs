@@ -31,6 +31,7 @@ pub fn run(app: App) -> Result<()> {
         UseCase::default(),
         app.profile.runtimes.clone(),
         app.budget.clone(),
+        app.calibration,
     );
 
     // Stale (>24h) or empty catalog -> kick off a background refresh. The TUI

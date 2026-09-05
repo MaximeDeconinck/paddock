@@ -1,7 +1,7 @@
 //! Pure TUI state machine - no terminal IO, fully unit-testable.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use paddock_core::estimate::{MemoryBudget, resolve_ctx};
+use paddock_core::estimate::{MemoryBudget, SpeedCalibration, resolve_ctx};
 use paddock_core::hardware::RuntimesStatus;
 use paddock_core::runtime::{RunPlan, ServePlan, plan_run, plan_serve};
 use paddock_core::score::UseCase;
@@ -120,6 +120,8 @@ pub struct TuiState {
     pub available: Vec<AvailableRow>,
     /// Cursor within `servers`.
     pub server_selected: usize,
+    /// Per-machine speed calibration used by the detail table and speed chart.
+    pub calibration: SpeedCalibration,
 }
 
 impl TuiState {
@@ -128,8 +130,10 @@ impl TuiState {
         use_case: UseCase,
         runtimes: RuntimesStatus,
         budget: MemoryBudget,
+        calibration: SpeedCalibration,
     ) -> Self {
         Self {
+            calibration,
             all_rows: rows.clone(),
             rows,
             selected: 0,
@@ -653,11 +657,31 @@ mod tests {
                 gpu_effective_bytes: 24 * (1u64 << 30),
                 ram_total_bytes: 32 * (1u64 << 30),
             },
+            SpeedCalibration::default(),
         )
     }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn tui_state_carries_calibration() {
+        let cal = SpeedCalibration {
+            dense: 0.55,
+            moe: 0.45,
+        };
+        let s = TuiState::new(
+            Vec::new(),
+            UseCase::General,
+            RuntimesStatus::default(),
+            MemoryBudget {
+                gpu_effective_bytes: 1,
+                ram_total_bytes: 2,
+            },
+            cal,
+        );
+        assert_eq!(s.calibration, cal);
     }
 
     #[test]
