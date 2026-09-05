@@ -2399,7 +2399,7 @@ dependencies = [
 
 [[package]]
 name = "paddock"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2419,7 +2419,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "objc2",
