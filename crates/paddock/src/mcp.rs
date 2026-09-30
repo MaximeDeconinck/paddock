@@ -34,15 +34,17 @@ pub(crate) const INSTRUCTIONS: &str = "\
 paddock knows which LLMs fit this Apple Silicon Mac, how fast they run, and how to serve them.
 Workflow: paddock_scan (hardware) -> paddock_fit or paddock_recommend (ranked models) -> \
 paddock_serve (start one, get an endpoint) -> paddock_ps / paddock_stop (manage).
-paddock_serve blocks until the server answers, up to timeout_secs (default 600); a first \
-run may download a multi-GB model. status \"starting\" means the timeout elapsed but the \
-server is still coming up. With runtime \"ollama\" the model is still downloading: call \
-paddock_serve again later with the same arguments (it returns ready once the pull finished). \
-With llama.cpp / mlx the server is loading: poll paddock_ps until it is listed, then use the \
+paddock_serve blocks until the model is loaded, up to timeout_secs (default 600); a first \
+run may download a multi-GB model. status \"ready\" means the model is loaded, for every \
+runtime. status \"starting\" means the timeout elapsed first and the server is still coming \
+up. With runtime \"ollama\" the model is still downloading or loading: call paddock_serve \
+again later with the same arguments (it returns ready once done); pid is the `ollama pull` \
+process while downloading, null while loading, and log_path is null. With runtime \
+\"llama_cpp\" the server is loading: poll paddock_ps until it is listed, then use the \
 endpoint; if it never appears the server may have exited, and log_path from the starting \
-result holds its log.
-For runtime \"ollama\" a starting result's pid is the `ollama pull` process (not a server) and \
-log_path is null.
+result holds its log. With runtime \"mlx_lm\" the model is still downloading/loading: the \
+server is already listed in paddock_ps (it answers HTTP early), and a request to openai_url \
+blocks until the load finishes; log_path holds its log.
 Calling paddock_serve again for a llama.cpp / mlx model that is already running starts another \
 instance on the next free port: check paddock_ps first and reuse a listed endpoint.
 openai_url speaks the OpenAI chat-completions protocol; put model_ref in the `model` field.
@@ -105,7 +107,7 @@ pub struct ServeInput {
     /// Port for llama.cpp / mlx servers (Ollama always uses 11434).
     #[serde(default)]
     pub port: Option<u16>,
-    /// Seconds to wait for readiness before returning status "starting" (default 600).
+    /// Seconds to wait for the model to load before returning status "starting" (default 600).
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
@@ -398,7 +400,7 @@ impl PaddockMcp {
 
     #[tool(
         name = "paddock_serve",
-        description = "Start serving a catalog model with the best available runtime and return an OpenAI-compatible endpoint. Picks the best fitting quant unless `quant` is given. Blocks until ready (up to timeout_secs, default 600; a first run may download the model). status \"starting\" means the timeout elapsed first: with runtime \"ollama\" the model is still downloading, so call paddock_serve again later with the same arguments (it returns ready once the pull finished); with llama.cpp / mlx the server is loading, so poll paddock_ps (log_path holds its log). For ollama a starting pid is the `ollama pull` process and log_path is null. Calling it again for a llama.cpp / mlx model that is already running starts another instance on the next free port, so check paddock_ps first. Never installs a runtime: a no_runtime error carries the command for the user."
+        description = "Start serving a catalog model with the best available runtime and return an OpenAI-compatible endpoint. Picks the best fitting quant unless `quant` is given. Blocks until the model is loaded (up to timeout_secs, default 600; a first run may download the model): status \"ready\" means loaded, for every runtime. status \"starting\" means the timeout elapsed first: with runtime \"ollama\" the model is still downloading or loading, so call paddock_serve again later with the same arguments (it returns ready once done; pid is the `ollama pull` process while downloading, null while loading; log_path is null); with \"llama_cpp\" the server is loading, so poll paddock_ps (log_path holds its log); with \"mlx_lm\" the model is still downloading/loading, the server is already listed in paddock_ps (it answers HTTP early) and a request to openai_url blocks until the load finishes. Calling it again for a llama.cpp / mlx model that is already running starts another instance on the next free port, so check paddock_ps first. Never installs a runtime: a no_runtime error carries the command for the user."
     )]
     async fn serve(&self, Parameters(input): Parameters<ServeInput>) -> CallToolResult {
         let app = self.app.clone();
@@ -752,7 +754,11 @@ mod tests {
                 port: None,
             };
             let v = serve_result("ready", &plan, None, None);
-            assert!(v["ctx"].is_null(), "{runtime:?}: ctx must be null, got {}", v["ctx"]);
+            assert!(
+                v["ctx"].is_null(),
+                "{runtime:?}: ctx must be null, got {}",
+                v["ctx"]
+            );
             assert!(v.as_object().unwrap().contains_key("ctx"));
         }
     }
@@ -806,7 +812,10 @@ mod tests {
     fn augmented_path_with_no_or_empty_path() {
         let home = std::path::Path::new("/Users/u");
         assert_eq!(split(&augmented_path(None, Some(home))), ALL_STANDARD);
-        assert_eq!(split(&augmented_path(Some("".as_ref()), Some(home))), ALL_STANDARD);
+        assert_eq!(
+            split(&augmented_path(Some("".as_ref()), Some(home))),
+            ALL_STANDARD
+        );
     }
 
     #[test]
@@ -821,6 +830,14 @@ mod tests {
                 "/Applications/Ollama.app/Contents/Resources",
             ]
         );
+    }
+
+    #[test]
+    fn instructions_explain_ready_and_mlx_starting() {
+        assert!(INSTRUCTIONS.contains("\"ready\" means the model is loaded, for every"));
+        assert!(INSTRUCTIONS.contains("\"mlx_lm\" the model is still downloading/loading"));
+        assert!(INSTRUCTIONS.contains("blocks until the load finishes"));
+        assert!(!INSTRUCTIONS.contains('\u{2014}'));
     }
 
     #[test]

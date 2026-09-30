@@ -473,6 +473,57 @@ fn run_checked_until(
     Ok(None)
 }
 
+/// Run `f` and return its result, or `None` if `deadline` passes first.
+/// `None` deadline: `f` runs inline on this thread (the CLI path). With a
+/// deadline, `f` runs on a spawned thread that is NOT aborted on expiry: it
+/// finishes in the background (e.g. a warm-up request that keeps the model
+/// loading after the caller moved on).
+pub(crate) fn run_with_deadline<T: Send + 'static>(
+    deadline: Option<Instant>,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let Some(deadline) = deadline else {
+        return Some(f());
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The receiver is gone on expiry; the result is simply dropped.
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+}
+
+/// True for runtimes that load the model lazily on the first request, so
+/// readiness alone does not mean "loaded".
+pub(crate) fn needs_warm_up(runtime: RuntimeKind) -> bool {
+    matches!(runtime, RuntimeKind::Ollama | RuntimeKind::MlxLm)
+}
+
+/// Send the request that makes a lazily-loading runtime load the model, and
+/// wait for it. `None` when the runtime needs no warm-up (llama.cpp: its
+/// `/health` is 200 only once loaded); otherwise whether the request
+/// succeeded. Ollama: `warm_up_ollama`. mlx: a one-token chat completion
+/// (`mlx_lm.server` answers `/v1/models` before loading the model).
+pub(crate) fn warm_up(probe: &dyn SystemProbe, plan: &ServePlan) -> Option<bool> {
+    match plan.runtime {
+        RuntimeKind::Ollama => Some(paddock_core::serving::warm_up_ollama(
+            probe,
+            &plan.model_ref,
+        )),
+        RuntimeKind::MlxLm => {
+            let body = serde_json::json!({
+                "model": plan.model_ref,
+                "messages": [{ "role": "user", "content": "hi" }],
+                "max_tokens": 1,
+            })
+            .to_string();
+            Some(probe.http_post_local(&plan.openai_url, &body).is_some())
+        }
+        RuntimeKind::LlamaCpp => None,
+    }
+}
+
 /// Build a serving registry record for a running server.
 pub(crate) fn build_record(plan: &ServePlan, pid: u32, log_path: Option<PathBuf>) -> ServingRecord {
     let started_at = std::time::SystemTime::now()
@@ -527,14 +578,15 @@ impl Drop for RegistryGuard {
 }
 
 /// Full serve lifecycle: install policy, port fallback, history record, spawn
-/// (foreground or detached), readiness wait, pre-steps, Ollama warm-up,
-/// registry entry. Returns as soon as the endpoint is ready. In `Foreground`
-/// mode the child handle is returned for the caller to wait on; in `Detached`
-/// mode the registry entry has already been written.
+/// (foreground or detached), readiness wait, pre-steps, warm-up (Ollama and
+/// mlx load lazily), registry entry. Returns once the model is loaded. In
+/// `Foreground` mode the child handle is returned for the caller to wait on;
+/// in `Detached` mode the registry entry has already been written.
 ///
-/// On a readiness timeout with a detached child, the child is left running
-/// and registered, and `NotReady { pid, log_path, plan }` is returned so the
-/// caller can report "starting". Every other failure kills the child.
+/// On a readiness, pre-step or warm-up timeout with a detached serve, the
+/// child (if any) is left running and registered, and
+/// `NotReady { pid, log_path, plan }` is returned so the caller can report
+/// "starting". Every other failure kills the child.
 pub fn serve(
     mut plan: ServePlan,
     mode: ServeMode,
@@ -611,14 +663,16 @@ pub fn serve(
     // Readiness + pre-steps; never leave an orphaned server behind on failure,
     // except the detached-timeout case, which is the whole point of `NotReady`.
     let timeout = readiness_deadline(child.is_some(), ready_timeout);
-    // Detached serves with a caller budget (MCP) bound the pre-steps too, so
-    // a multi-GB `ollama pull` cannot outlast `ready_timeout`. The CLI (None)
-    // and foreground serves wait for pre-steps to finish, as before.
+    // Detached serves with a caller budget (MCP) bound the pre-steps and the
+    // warm-up too, so a multi-GB `ollama pull` or model load cannot outlast
+    // `ready_timeout`. The CLI (None) and foreground serves wait for both to
+    // finish.
     let started = Instant::now();
     let prestep_deadline = match (mode, ready_timeout) {
         (ServeMode::Detached, Some(total)) => deadline_after(started, total),
         _ => None,
     };
+    let server_pid = child.as_ref().map(|c| c.id());
     let prepared =
         wait_ready(&RealSystemProbe, &plan, child.as_mut(), timeout, progress).and_then(|()| {
             for step in &plan.pre_steps {
@@ -631,14 +685,14 @@ pub fn serve(
                     });
                 }
             }
-            Ok(())
+            warm_up_until(&plan, server_pid, prestep_deadline, progress)
         });
     match prepared {
         Ok(()) => {}
         Err(LifecycleError::NotReady { pid, .. }) if mode == ServeMode::Detached => {
             // Register the spawned server (if any), left running. `pid` is
-            // either that server or a still-running pre-step.
-            let server_pid = child.as_ref().map(|c| c.id());
+            // that server (readiness or warm-up timeout; None for the Ollama
+            // daemon) or a still-running pre-step.
             if plan.runtime != RuntimeKind::Ollama
                 && let Some(server_pid) = server_pid
             {
@@ -672,17 +726,6 @@ pub fn serve(
         }
     }
 
-    // Ollama loads a model only on its first request and the daemon outlives
-    // us - warm it up now so "ready" means ready (and the model shows in
-    // /api/ps + the tray). Best-effort: a failure leaves a working endpoint
-    // that simply cold-starts on first use.
-    if plan.runtime == RuntimeKind::Ollama {
-        progress.note(&format!("loading {} into memory…", plan.model_ref));
-        if !paddock_core::serving::warm_up_ollama(&RealSystemProbe, &plan.model_ref) {
-            progress.note("warning: warm-up failed - the model will load on the first request");
-        }
-    }
-
     let pid = child.as_ref().map(|c| c.id());
     match mode {
         ServeMode::Foreground => Ok(ServeOutcome {
@@ -706,6 +749,39 @@ pub fn serve(
                 child: None,
             })
         }
+    }
+}
+
+/// Warm-up step of `serve`, after readiness and pre-steps. Ollama and mlx
+/// load a model only on its first request (and the Ollama daemon outlives
+/// us), so warm them up now: "ready" means loaded (and an Ollama model shows
+/// in /api/ps + the tray). Best-effort: a failed request leaves a working
+/// endpoint that simply cold-starts on first use. With a `deadline`
+/// (detached MCP serves), an unfinished warm-up is `NotReady` for
+/// `server_pid`; its request stays open in the background so the load
+/// completes.
+fn warm_up_until(
+    plan: &ServePlan,
+    server_pid: Option<u32>,
+    deadline: Option<Instant>,
+    progress: &dyn Progress,
+) -> Result<(), LifecycleError> {
+    if !needs_warm_up(plan.runtime) {
+        return Ok(());
+    }
+    progress.note(&format!("loading {} into memory…", plan.model_ref));
+    let request = plan.clone();
+    match run_with_deadline(deadline, move || warm_up(&RealSystemProbe, &request)) {
+        None => Err(LifecycleError::NotReady {
+            pid: server_pid,
+            log_path: None,
+            plan: Box::new(plan.clone()),
+        }),
+        Some(Some(false)) => {
+            progress.note("warning: warm-up failed - the model will load on the first request");
+            Ok(())
+        }
+        Some(_) => Ok(()),
     }
 }
 
@@ -1421,6 +1497,231 @@ mod tests {
             } => assert!(p.exists(), "log {p:?} must exist"),
             other => panic!("expected ServerExited with a log_path, got {other}"),
         }
+    }
+
+    #[test]
+    fn run_with_deadline_returns_result_when_it_completes() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(run_with_deadline(Some(deadline), || 7), Some(7));
+    }
+
+    #[test]
+    fn run_with_deadline_returns_none_quickly_on_expiry() {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let t0 = Instant::now();
+        let got = run_with_deadline(Some(deadline), || {
+            std::thread::sleep(Duration::from_secs(5));
+            1
+        });
+        assert_eq!(got, None);
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "must return at the deadline, took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_with_deadline_past_deadline_is_none() {
+        let past = Instant::now();
+        std::thread::sleep(Duration::from_millis(10));
+        let got = run_with_deadline(Some(past), || {
+            std::thread::sleep(Duration::from_millis(500));
+            1
+        });
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn run_with_deadline_without_deadline_runs_inline() {
+        let caller = std::thread::current().id();
+        let got = run_with_deadline(None, move || std::thread::current().id() == caller);
+        assert_eq!(got, Some(true));
+    }
+
+    fn mlx_plan() -> ServePlan {
+        ServePlan {
+            server_argv: Some(vec![
+                "mlx_lm.server".into(),
+                "--model".into(),
+                "mlx-community/Qwen2.5-0.5B-Instruct-4bit".into(),
+                "--port".into(),
+                "8080".into(),
+            ]),
+            pre_steps: vec![],
+            endpoint: "http://127.0.0.1:8080".into(),
+            openai_url: "http://127.0.0.1:8080/v1/chat/completions".into(),
+            model_ref: "mlx-community/Qwen2.5-0.5B-Instruct-4bit".into(),
+            ready_path: "/v1/models".into(),
+            install: None,
+            port_ignored: false,
+            runtime: RuntimeKind::MlxLm,
+            ctx: 0,
+            port: Some(8080),
+        }
+    }
+
+    #[test]
+    fn warm_up_mlx_posts_one_token_completion_to_openai_url() {
+        let plan = mlx_plan();
+        let mut probe = MockProbe::default();
+        probe
+            .posts
+            .insert(plan.openai_url.clone(), "{\"choices\":[]}".into());
+        assert_eq!(warm_up(&probe, &plan), Some(true));
+        let sent = probe.post_bodies.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "http://127.0.0.1:8080/v1/chat/completions");
+        let body: serde_json::Value = serde_json::from_str(&sent[0].1).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "model": "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "max_tokens": 1,
+            })
+        );
+        // No response (connection refused, non-2xx, read timeout) = failed.
+        assert_eq!(warm_up(&MockProbe::default(), &plan), Some(false));
+        assert!(needs_warm_up(RuntimeKind::MlxLm));
+    }
+
+    #[test]
+    fn warm_up_ollama_goes_to_generate_endpoint() {
+        let mut plan = mlx_plan();
+        plan.runtime = RuntimeKind::Ollama;
+        plan.server_argv = None;
+        plan.model_ref = "qwen3:8b".into();
+        let mut probe = MockProbe::default();
+        probe
+            .posts
+            .insert("http://127.0.0.1:11434/api/generate".into(), "{}".into());
+        assert_eq!(warm_up(&probe, &plan), Some(true));
+        let sent = probe.post_bodies.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "http://127.0.0.1:11434/api/generate");
+        let body: serde_json::Value = serde_json::from_str(&sent[0].1).unwrap();
+        assert_eq!(body["model"], "qwen3:8b");
+        assert!(needs_warm_up(RuntimeKind::Ollama));
+    }
+
+    #[test]
+    fn warm_up_llama_cpp_does_nothing() {
+        let probe = MockProbe::default();
+        assert_eq!(warm_up(&probe, &spawned_plan()), None);
+        assert!(probe.post_bodies.lock().unwrap().is_empty());
+        assert!(!needs_warm_up(RuntimeKind::LlamaCpp));
+    }
+
+    /// A stand-in for `mlx_lm.server` (python3 stdlib, no model): answers
+    /// every GET 200 at once (readiness), and the POST warm-up either at once
+    /// (`fast`) or after 60 s (`hang`, a model still loading).
+    fn fake_mlx_argv(post: &str) -> Vec<String> {
+        const SCRIPT: &str = r#"
+import sys, time, http.server
+mode = sys.argv[3]
+class H(http.server.BaseHTTPRequestHandler):
+    def reply(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+    def do_GET(self):
+        self.reply()
+    def do_POST(self):
+        if mode == "hang":
+            time.sleep(60)
+        self.reply()
+    def log_message(self, *a):
+        pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[2])), H).serve_forever()
+"#;
+        vec![
+            "python3".into(),
+            "-c".into(),
+            SCRIPT.into(),
+            "--port".into(),
+            "8080".into(),
+            post.into(),
+        ]
+    }
+
+    fn fake_mlx_plan(post: &str) -> ServePlan {
+        // Start the free-port search on an ephemeral port so parallel test
+        // runs do not race for 8080.
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut plan = mlx_plan();
+        plan.server_argv = Some(fake_mlx_argv(post));
+        plan.with_port(port)
+    }
+
+    #[test]
+    fn serve_detached_mlx_waits_for_warm_up_then_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ServingDirGuard::isolate(dir.path());
+        let outcome = serve(
+            fake_mlx_plan("fast"),
+            ServeMode::Detached,
+            InstallPolicy::Refuse,
+            Some(Duration::from_secs(20)),
+            &SilentProgress,
+        )
+        .expect("fake mlx server answers readiness and warm-up");
+        let pid = outcome.pid.expect("spawned child");
+        let registered = dir.path().join(format!("{pid}.json")).exists();
+        paddock_core::serving::terminate(pid);
+        assert!(registered, "ready mlx server must be registered");
+    }
+
+    #[test]
+    fn serve_detached_mlx_warm_up_past_timeout_is_not_ready_and_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ServingDirGuard::isolate(dir.path());
+        let t0 = Instant::now();
+        let result = serve(
+            fake_mlx_plan("hang"),
+            ServeMode::Detached,
+            InstallPolicy::Refuse,
+            Some(Duration::from_secs(4)),
+            &SilentProgress,
+        );
+        let err = match result {
+            Err(e) => e,
+            Ok(outcome) => {
+                // Never leak the fake server when the assertion fails.
+                if let Some(pid) = outcome.pid {
+                    paddock_core::serving::terminate(pid);
+                }
+                panic!("expected NotReady, got ready (warm-up not awaited)");
+            }
+        };
+        let elapsed = t0.elapsed();
+        let (pid, log_path) = match err {
+            LifecycleError::NotReady {
+                pid: Some(pid),
+                log_path,
+                ..
+            } => (pid, log_path),
+            other => panic!("expected NotReady with the server pid, got {other}"),
+        };
+        let alive = pid_alive(pid);
+        let registered = dir.path().join(format!("{pid}.json")).exists();
+        paddock_core::serving::terminate(pid);
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "warm-up must be bounded by timeout, took {elapsed:?}"
+        );
+        assert!(alive, "server must keep running after a warm-up timeout");
+        assert!(
+            registered,
+            "server must be registered after a warm-up timeout"
+        );
+        let log_path = log_path.expect("server log path");
+        assert!(log_path.ends_with(format!("{pid}.log")), "{log_path:?}");
     }
 
     #[test]
