@@ -18,8 +18,7 @@ use paddock_core::serving::Registry;
 use crate::app::App;
 use crate::cli::{Cli, Command};
 use crate::lifecycle::{
-    LifecycleError, RegistryGuard, StderrProgress, register_detached, resolve_model, resolved_ctx,
-    run_checked, spawn_checked, spawn_detached, wait_ready,
+    LifecycleError, RegistryGuard, StderrProgress, resolve_model, resolved_ctx, run_checked,
 };
 
 fn main() -> Result<()> {
@@ -216,113 +215,36 @@ fn serve_model(
     serve_with_plan(plan, foreground)
 }
 
-/// Full serve lifecycle: confirm install, spawn the server child when needed,
-/// wait for readiness, run pre-steps (e.g. `ollama pull`), print the endpoint
-/// block, then wait on the child. Shared with the TUI (Task 3).
-pub(crate) fn serve_with_plan(mut plan: ServePlan, foreground: bool) -> Result<()> {
-    if plan.port_ignored {
-        eprintln!("warning: --port is ignored for the Ollama daemon (fixed 11434)");
-    }
-    if let Some(install) = &plan.install {
-        confirm_and_install(install)?;
-    }
+/// CLI/TUI adapter over `lifecycle::serve`: same terminal output as before
+/// (endpoint block on stdout, progress on stderr), install confirmed on the
+/// tty, no readiness timeout. Shared with the TUI `s` key.
+pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
+    use crate::lifecycle::{InstallPolicy, ServeMode, serve};
+    use paddock_core::catalog::RuntimeKind;
 
-    // Spawned servers (llama.cpp/mlx) default to 8080; pick a free port so
-    // concurrent servers don't collide (and so the readiness probe can't be
-    // answered by a different process already on the port). The Ollama daemon
-    // has a fixed port and no server_argv, so it's untouched.
-    if plan.server_argv.is_some()
-        && let Some(requested) = plan.port
-        && let Some(free) = paddock_core::serving::free_port(requested)
-        && free != requested
-    {
-        eprintln!("port {requested} is busy - serving on {free} instead");
-        plan = plan.with_port(free);
-    }
-
-    // Remember spawned (llama.cpp/mlx) serves so the TUI can offer one-key
-    // relaunch. Best-effort; Ollama is covered by /api/tags, not recorded.
-    if plan.server_argv.is_some() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        paddock_core::serving::History::open_default().record(&plan, now);
-    }
-
-    let log_dir = paddock_core::serving::default_serving_dir().join("logs");
-
-    let mut detached_log: Option<std::path::PathBuf> = None;
-    let mut child = match &plan.server_argv {
-        Some(argv) => {
-            eprintln!("$ {}", argv.join(" "));
-            if foreground {
-                Some(spawn_checked(argv)?)
-            } else {
-                // Detached: spawn to a per-invocation placeholder (our own pid
-                // makes it unique across concurrent `serve`s), then rename to
-                // <child-pid>.log once the child pid is known.
-                let tmp_log = log_dir.join(format!("pending-{}.log", std::process::id()));
-                let c = spawn_detached(argv, &tmp_log)?;
-                let final_log = log_dir.join(format!("{}.log", c.id()));
-                let actual = match std::fs::rename(&tmp_log, &final_log) {
-                    Ok(()) => final_log,
-                    Err(_) => tmp_log, // rename failed → the data is still at the pending path
-                };
-                detached_log = Some(actual);
-                Some(c)
-            }
-        }
-        None => None,
+    let mode = if foreground {
+        ServeMode::Foreground
+    } else {
+        ServeMode::Detached
     };
-
-    // Readiness + pre-steps; never leave an orphaned server behind on failure.
-    let readiness_deadline_for =
-        |spawned: bool| crate::lifecycle::readiness_deadline(spawned, None);
-    let deadline = readiness_deadline_for(child.is_some());
-    let prepared = wait_ready(
-        &RealSystemProbe,
-        &plan,
-        child.as_mut(),
-        deadline,
+    let outcome = serve(
+        plan,
+        mode,
+        InstallPolicy::Ask(&confirm_and_install),
+        None,
         &StderrProgress,
     )
-    .map_err(anyhow::Error::from)
-    .and_then(|()| {
-        for step in &plan.pre_steps {
-            eprintln!("$ {}", step.join(" "));
-            run_checked(step, &StderrProgress)?;
-        }
-        Ok(())
-    });
-    if let Err(e) = prepared {
-        if let Some(c) = child.as_mut() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-        return Err(e);
-    }
-
-    // Ollama loads a model only on its first request and the daemon outlives
-    // us - warm it up now so "ready" means ready (and the model shows in
-    // /api/ps + the tray). Best-effort: a failure leaves a working endpoint
-    // that simply cold-starts on first use.
-    if plan.runtime == paddock_core::catalog::RuntimeKind::Ollama {
-        eprintln!("loading {} into memory…", plan.model_ref);
-        if !paddock_core::serving::warm_up_ollama(&RealSystemProbe, &plan.model_ref) {
-            eprintln!("warning: warm-up failed - the model will load on the first request");
-        }
-    }
-
+    .map_err(cli_fail)?;
+    let plan = outcome.plan;
     output::print_endpoint(&plan);
 
-    match child {
-        Some(mut c) if foreground => {
+    match outcome.child {
+        Some(mut c) => {
             // Best-effort registry entry for tray/UIs; the guard unregisters
             // on every exit path including `?`. SIGINT kills paddock and the
             // child together (default tty behavior) without running Drop -
             // the stale file is reaped by the next `list_live`.
-            let _guard = (plan.runtime != paddock_core::catalog::RuntimeKind::Ollama)
+            let _guard = (plan.runtime != RuntimeKind::Ollama)
                 .then(|| RegistryGuard::register(&plan, c.id(), None));
             eprintln!("serving - press Ctrl-C to stop");
             let status = c.wait()?;
@@ -331,27 +253,26 @@ pub(crate) fn serve_with_plan(mut plan: ServePlan, foreground: bool) -> Result<(
             }
             Ok(())
         }
-        // Detached child: register WITHOUT the drop-guard so it outlives us.
-        Some(c) => {
-            if plan.runtime == paddock_core::catalog::RuntimeKind::Ollama {
+        None => {
+            match outcome.pid {
                 // Cold-started the Ollama daemon; it serves in the background on
                 // its fixed port. ollama ps / ollama stop manage it, not paddock.
-                eprintln!("ollama daemon started in the background");
-            } else {
-                let log_path = detached_log.take();
-                register_detached(&plan, c.id(), log_path);
-                eprintln!(
-                    "serving in background · pid {} · paddock logs {}",
-                    c.id(),
-                    plan.model_ref
-                );
+                Some(_) if plan.runtime == RuntimeKind::Ollama => {
+                    eprintln!("ollama daemon started in the background");
+                }
+                Some(pid) => {
+                    eprintln!(
+                        "serving in background · pid {pid} · paddock logs {}",
+                        plan.model_ref
+                    );
+                }
+                // Already-running Ollama daemon: nothing was spawned, so nothing
+                // to detach or track - the daemon owns the model and `ollama ps`
+                // lists it. paddock's ps/stop/logs cover llama.cpp/mlx only.
+                None => {}
             }
             Ok(())
         }
-        // Already-running Ollama daemon: nothing was spawned, so nothing to
-        // detach or track - the daemon owns the model and `ollama ps` lists it.
-        // paddock's ps/stop/logs cover the spawned (llama.cpp/mlx) servers only.
-        None => Ok(()),
     }
 }
 
@@ -613,12 +534,12 @@ fn bench_server(app: &App, target: Option<&str>, tokens: u32, json: bool) -> Res
 /// run command. Keeping confirmation here keeps the guarantee in one place.
 pub(crate) fn launch(plan: RunPlan) -> Result<()> {
     if let Some(install) = &plan.install {
-        confirm_and_install(install)?;
+        confirm_and_install(install).map_err(cli_fail)?;
     }
     exec(&plan.argv)
 }
 
-fn confirm_and_install(install: &InstallPlan) -> Result<()> {
+pub(crate) fn confirm_and_install(install: &InstallPlan) -> Result<(), LifecycleError> {
     use std::io::IsTerminal;
 
     let cmd = install
@@ -635,13 +556,14 @@ fn confirm_and_install(install: &InstallPlan) -> Result<()> {
         std::process::exit(1);
     }
     eprint!("required runtime is not installed. install with `{cmd}`? [y/N] ");
-    std::io::stderr().flush()?;
+    std::io::stderr().flush().map_err(anyhow::Error::from)?;
     let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(anyhow::Error::from)?;
     let answer = answer.trim().to_ascii_lowercase();
     if answer != "y" && answer != "yes" {
-        eprintln!("install declined - nothing launched. Run `{cmd}` yourself, then retry.");
-        std::process::exit(1);
+        return Err(LifecycleError::InstallDeclined { command: cmd });
     }
     // Check the installer binary exists before running it (avoid exec-ENOENT).
     let installer = &install.argv[0];
@@ -654,7 +576,7 @@ fn confirm_and_install(install: &InstallPlan) -> Result<()> {
         .status()
         .with_context(|| format!("running `{cmd}`"))?;
     if !status.success() {
-        bail!("`{cmd}` failed ({status}); fix the install and retry");
+        return Err(anyhow::anyhow!("`{cmd}` failed ({status}); fix the install and retry").into());
     }
     Ok(())
 }

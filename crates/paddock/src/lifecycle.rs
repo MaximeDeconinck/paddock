@@ -1,23 +1,24 @@
 //! Serve / stop lifecycle shared by the CLI, the TUI and the MCP server.
-//! Everything here returns values: no printing, no stdin, no process::exit.
-//! Adapters render `LifecycleError` and report `Progress` their own way.
+//! Everything here returns values: no stdout, no stdin, no `process::exit`.
+//! Progress goes through `Progress`; the only direct output is best-effort
+//! registry warnings on stderr. Adapters render `LifecycleError` and report
+//! `Progress` their own way.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use paddock_core::catalog::CatalogModel;
+use paddock_core::catalog::{CatalogModel, RuntimeKind};
 use paddock_core::estimate::{MemoryBudget, ModelVariant};
-use paddock_core::hardware::SystemProbe;
+use paddock_core::hardware::{RealSystemProbe, SystemProbe};
 use paddock_core::runtime::{InstallPlan, ServePlan};
 use paddock_core::score::best_variant;
-use paddock_core::serving::{Registry, ServingRecord};
+use paddock_core::serving::{History, Registry, ServingRecord};
 
 use crate::app::App;
 
 /// How the lifecycle reports what it is doing. The CLI/TUI print to stderr
 /// (byte-for-byte today's messages); the MCP server discards everything
 /// because stdout is the protocol channel and stderr is for internal errors.
-#[allow(dead_code)] // wired up when serve/stop move here (later tasks)
 pub trait Progress {
     /// Informational line: "downloading/loading model - this can take a while",
     /// "port 8080 is busy - serving on 8081 instead", heartbeats.
@@ -42,7 +43,7 @@ impl Progress for StderrProgress {
     }
 }
 
-#[allow(dead_code)] // wired up when serve/stop move here (later tasks)
+#[allow(dead_code)] // used by the MCP adapter (later task)
 pub struct SilentProgress;
 
 impl Progress for SilentProgress {
@@ -55,7 +56,6 @@ impl Progress for SilentProgress {
 
 /// Every way serve/stop can fail. `Display` reproduces the CLI wording so the
 /// CLI adapter can print it as-is; the MCP adapter maps variants to codes.
-#[allow(dead_code)] // wired up when serve/stop move here (later tasks)
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
     #[error(
@@ -104,11 +104,13 @@ pub enum LifecycleError {
     #[error("ollama daemon not reachable on 11434 - is it running?")]
     OllamaUnreachable,
     #[error("no running server matches `{target}`{}", if running.is_empty() { String::new() } else { format!("\nrunning: {}", running.join(", ")) })]
+    #[allow(dead_code)] // constructed when stop moves here (Task 4)
     NoServerMatch {
         target: String,
         running: Vec<String>,
     },
     #[error("`{target}` matches several servers - be specific:{}", candidates.iter().map(|(m, p)| format!("\n  {m} (pid {p})")).collect::<String>())]
+    #[allow(dead_code)] // constructed when stop moves here (Task 4)
     AmbiguousServer {
         target: String,
         candidates: Vec<(String, u32)>,
@@ -126,16 +128,15 @@ impl From<paddock_core::PaddockError> for LifecycleError {
 }
 
 /// What to do when the plan needs a runtime that is not installed.
-#[allow(dead_code)] // wired up when serve/stop move here (later tasks)
 pub enum InstallPolicy<'a> {
     /// Ask the human (CLI/TUI): the callback prompts and installs, or returns
     /// `InstallDeclined`.
     Ask(&'a dyn Fn(&InstallPlan) -> Result<(), LifecycleError>),
     /// Never install (MCP): return `NoRuntime` before touching anything.
+    #[allow(dead_code)] // used by the MCP adapter (later task)
     Refuse,
 }
 
-#[allow(dead_code)] // wired up when serve/stop move here (later tasks)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeMode {
     /// Child inherits the tty; the caller waits on `ServeOutcome.child`.
@@ -145,13 +146,14 @@ pub enum ServeMode {
     Detached,
 }
 
-#[allow(dead_code)] // wired up when serve/stop move here (later tasks)
+#[derive(Debug)]
 pub struct ServeOutcome {
     /// Final plan (the port may have moved).
     pub plan: ServePlan,
     /// Spawned child pid; None when the already-running Ollama daemon serves.
     pub pid: Option<u32>,
     /// Detached log file, when a child was spawned detached.
+    #[allow(dead_code)] // read by the MCP adapter (later task)
     pub log_path: Option<PathBuf>,
     /// Foreground only: the child handle for the caller to wait on.
     pub child: Option<std::process::Child>,
@@ -476,6 +478,158 @@ impl RegistryGuard {
 impl Drop for RegistryGuard {
     fn drop(&mut self) {
         let _ = self.registry.unregister(self.pid);
+    }
+}
+
+/// Full serve lifecycle: install policy, port fallback, history record, spawn
+/// (foreground or detached), readiness wait, pre-steps, Ollama warm-up,
+/// registry entry. Returns as soon as the endpoint is ready. In `Foreground`
+/// mode the child handle is returned for the caller to wait on; in `Detached`
+/// mode the registry entry has already been written.
+///
+/// On a readiness timeout with a detached child, the child is left running
+/// and registered, and `NotReady { pid, log_path, plan }` is returned so the
+/// caller can report "starting". Every other failure kills the child.
+pub fn serve(
+    mut plan: ServePlan,
+    mode: ServeMode,
+    policy: InstallPolicy<'_>,
+    ready_timeout: Option<Duration>,
+    progress: &dyn Progress,
+) -> Result<ServeOutcome, LifecycleError> {
+    if plan.port_ignored {
+        progress.note("warning: --port is ignored for the Ollama daemon (fixed 11434)");
+    }
+    if let Some(install) = &plan.install {
+        match policy {
+            InstallPolicy::Ask(confirm) => confirm(install)?,
+            InstallPolicy::Refuse => {
+                return Err(LifecycleError::NoRuntime {
+                    install: install.clone(),
+                });
+            }
+        }
+    }
+
+    // Spawned servers (llama.cpp/mlx) default to 8080; pick a free port so
+    // concurrent servers don't collide (and so the readiness probe can't be
+    // answered by a different process already on the port). The Ollama daemon
+    // has a fixed port and no server_argv, so it's untouched.
+    if plan.server_argv.is_some()
+        && let Some(requested) = plan.port
+        && let Some(free) = paddock_core::serving::free_port(requested)
+        && free != requested
+    {
+        progress.note(&format!(
+            "port {requested} is busy - serving on {free} instead"
+        ));
+        plan = plan.with_port(free);
+    }
+
+    // Remember spawned (llama.cpp/mlx) serves so the TUI can offer one-key
+    // relaunch. Best-effort; Ollama is covered by /api/tags, not recorded.
+    if plan.server_argv.is_some() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        History::open_default().record(&plan, now);
+    }
+
+    let log_dir = paddock_core::serving::default_serving_dir().join("logs");
+    let mut log_path: Option<PathBuf> = None;
+    let mut child = match &plan.server_argv {
+        Some(argv) => {
+            progress.command(argv);
+            match mode {
+                ServeMode::Foreground => Some(spawn_checked(argv)?),
+                ServeMode::Detached => {
+                    // Spawn to a per-invocation placeholder (our own pid makes
+                    // it unique across concurrent serves), then rename to
+                    // <child-pid>.log once the child pid is known.
+                    let tmp_log = log_dir.join(format!("pending-{}.log", std::process::id()));
+                    let c = spawn_detached(argv, &tmp_log)?;
+                    let final_log = log_dir.join(format!("{}.log", c.id()));
+                    let actual = match std::fs::rename(&tmp_log, &final_log) {
+                        Ok(()) => final_log,
+                        Err(_) => tmp_log, // rename failed: the data is still at the pending path
+                    };
+                    log_path = Some(actual);
+                    Some(c)
+                }
+            }
+        }
+        None => None,
+    };
+
+    // Readiness + pre-steps; never leave an orphaned server behind on failure,
+    // except the detached-timeout case, which is the whole point of `NotReady`.
+    let timeout = readiness_deadline(child.is_some(), ready_timeout);
+    let prepared =
+        wait_ready(&RealSystemProbe, &plan, child.as_mut(), timeout, progress).and_then(|()| {
+            for step in &plan.pre_steps {
+                progress.command(step);
+                run_checked(step, progress)?;
+            }
+            Ok(())
+        });
+    match prepared {
+        Ok(()) => {}
+        Err(LifecycleError::NotReady { pid, .. }) if mode == ServeMode::Detached => {
+            if plan.runtime != RuntimeKind::Ollama
+                && let Some(pid) = pid
+            {
+                register_detached(&plan, pid, log_path.clone());
+            }
+            return Err(LifecycleError::NotReady {
+                pid,
+                log_path,
+                plan: Box::new(plan),
+            });
+        }
+        Err(e) => {
+            if let Some(c) = child.as_mut() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            return Err(e);
+        }
+    }
+
+    // Ollama loads a model only on its first request and the daemon outlives
+    // us - warm it up now so "ready" means ready (and the model shows in
+    // /api/ps + the tray). Best-effort: a failure leaves a working endpoint
+    // that simply cold-starts on first use.
+    if plan.runtime == RuntimeKind::Ollama {
+        progress.note(&format!("loading {} into memory…", plan.model_ref));
+        if !paddock_core::serving::warm_up_ollama(&RealSystemProbe, &plan.model_ref) {
+            progress.note("warning: warm-up failed - the model will load on the first request");
+        }
+    }
+
+    let pid = child.as_ref().map(|c| c.id());
+    match mode {
+        ServeMode::Foreground => Ok(ServeOutcome {
+            plan,
+            pid,
+            log_path: None,
+            child,
+        }),
+        ServeMode::Detached => {
+            // Register WITHOUT the drop-guard so the child outlives us. A
+            // cold-started Ollama daemon is managed by ollama itself.
+            if let Some(pid) = pid
+                && plan.runtime != RuntimeKind::Ollama
+            {
+                register_detached(&plan, pid, log_path.clone());
+            }
+            Ok(ServeOutcome {
+                plan,
+                pid,
+                log_path,
+                child: None,
+            })
+        }
     }
 }
 
@@ -938,5 +1092,97 @@ mod tests {
         let e = LifecycleError::Other(anyhow::anyhow!("x").context("top"));
         let src = std::error::Error::source(&e).map(|s| s.to_string());
         assert_ne!(src.as_deref(), Some("top"));
+    }
+
+    #[test]
+    fn serve_refuse_policy_returns_no_runtime_before_spawning() {
+        let mut plan = spawned_plan();
+        plan.server_argv = Some(vec!["definitely-not-a-binary-xyz".into()]);
+        plan.install = Some(InstallPlan {
+            kind: RuntimeKind::LlamaCpp,
+            argv: vec!["brew".into(), "install".into(), "llama.cpp".into()],
+        });
+        let err = serve(
+            plan,
+            ServeMode::Detached,
+            InstallPolicy::Refuse,
+            Some(Duration::from_secs(1)),
+            &SilentProgress,
+        )
+        .unwrap_err();
+        match err {
+            LifecycleError::NoRuntime { install } => assert_eq!(install.argv[0], "brew"),
+            other => panic!("expected NoRuntime, got {other}"),
+        }
+    }
+
+    #[test]
+    fn serve_ask_policy_propagates_install_declined() {
+        let mut plan = spawned_plan();
+        plan.install = Some(InstallPlan {
+            kind: RuntimeKind::LlamaCpp,
+            argv: vec!["brew".into(), "install".into(), "llama.cpp".into()],
+        });
+        let decline = |i: &InstallPlan| {
+            Err(LifecycleError::InstallDeclined {
+                command: i.argv.join(" "),
+            })
+        };
+        let err = serve(
+            plan,
+            ServeMode::Detached,
+            InstallPolicy::Ask(&decline),
+            None,
+            &SilentProgress,
+        )
+        .unwrap_err();
+        assert!(matches!(err, LifecycleError::InstallDeclined { .. }));
+    }
+
+    /// Restores `PADDOCK_SERVING_DIR` to its previous value on drop, even when
+    /// the test panics.
+    struct ServingDirGuard(Option<std::ffi::OsString>);
+
+    impl Drop for ServingDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: only this test module touches PADDOCK_SERVING_DIR, and
+            // only from `serve_missing_binary_is_actionable`.
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("PADDOCK_SERVING_DIR", v),
+                    None => std::env::remove_var("PADDOCK_SERVING_DIR"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn serve_missing_binary_is_actionable() {
+        // Isolated serving dir so the history/registry writes never touch the
+        // real one.
+        let dir = tempfile::tempdir().unwrap();
+        let _restore = ServingDirGuard(std::env::var_os("PADDOCK_SERVING_DIR"));
+        // SAFETY: tests in this module that read PADDOCK_SERVING_DIR run in
+        // this process only; the var is scoped to this test's lifetime.
+        unsafe { std::env::set_var("PADDOCK_SERVING_DIR", dir.path()) };
+        let mut plan = spawned_plan();
+        plan.server_argv = Some(vec![
+            "definitely-not-a-binary-xyz".into(),
+            "--port".into(),
+            "8080".into(),
+        ]);
+        let err = serve(
+            plan,
+            ServeMode::Detached,
+            InstallPolicy::Refuse,
+            Some(Duration::from_secs(1)),
+            &SilentProgress,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to start definitely-not-a-binary-xyz"),
+            "got: {err}"
+        );
     }
 }
