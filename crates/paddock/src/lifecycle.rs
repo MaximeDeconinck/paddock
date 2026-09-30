@@ -400,6 +400,18 @@ pub(crate) fn spawn_detached(
 /// Run a pre-step to completion and fail on non-zero exit. Output streams to
 /// the tty unless `progress.quiet()` (MCP: stdout is the protocol channel).
 pub(crate) fn run_checked(argv: &[String], progress: &dyn Progress) -> Result<(), LifecycleError> {
+    run_checked_until(argv, progress, None).map(|_| ())
+}
+
+/// `run_checked` with an optional deadline. `None` waits for the command to
+/// finish (the CLI path). `Some(deadline)` polls it every 250 ms and returns
+/// `Ok(Some(pid))` if it is still running at the deadline; the command is
+/// left running (e.g. an `ollama pull` that keeps downloading).
+fn run_checked_until(
+    argv: &[String],
+    progress: &dyn Progress,
+    deadline: Option<Instant>,
+) -> Result<Option<u32>, LifecycleError> {
     use std::process::Stdio;
     let cmd = argv.join(" ");
     let stdio = || {
@@ -409,17 +421,38 @@ pub(crate) fn run_checked(argv: &[String], progress: &dyn Progress) -> Result<()
             Stdio::inherit()
         }
     };
-    let status = std::process::Command::new(&argv[0])
+    let mut command = std::process::Command::new(&argv[0]);
+    command
         .args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(stdio())
-        .stderr(stdio())
-        .status()
-        .map_err(|e| anyhow::anyhow!("running `{cmd}`: {e}"))?;
+        .stderr(stdio());
+    let spawn_err = |e: std::io::Error| anyhow::anyhow!("running `{cmd}`: {e}");
+    let status = match deadline {
+        None => command.status().map_err(spawn_err)?,
+        Some(deadline) => {
+            let mut child = command.spawn().map_err(spawn_err)?;
+            loop {
+                if let Some(status) = child.try_wait().map_err(spawn_err)? {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let pid = child.id();
+                    // Reap it when it finishes so a long MCP session does
+                    // not accumulate zombies.
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    return Ok(Some(pid));
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    };
     if !status.success() {
         return Err(anyhow::anyhow!("`{cmd}` failed ({status}); fix it and retry").into());
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Build a serving registry record for a running server.
@@ -559,22 +592,40 @@ pub fn serve(
     // Readiness + pre-steps; never leave an orphaned server behind on failure,
     // except the detached-timeout case, which is the whole point of `NotReady`.
     let timeout = readiness_deadline(child.is_some(), ready_timeout);
+    // Detached serves with a caller budget (MCP) bound the pre-steps too, so
+    // a multi-GB `ollama pull` cannot outlast `ready_timeout`. The CLI (None)
+    // and foreground serves wait for pre-steps to finish, as before.
+    let started = Instant::now();
+    let prestep_deadline = match (mode, ready_timeout) {
+        (ServeMode::Detached, Some(total)) => Some(started + total),
+        _ => None,
+    };
     let prepared =
         wait_ready(&RealSystemProbe, &plan, child.as_mut(), timeout, progress).and_then(|()| {
             for step in &plan.pre_steps {
                 progress.command(step);
-                run_checked(step, progress)?;
+                if let Some(pid) = run_checked_until(step, progress, prestep_deadline)? {
+                    return Err(LifecycleError::NotReady {
+                        pid: Some(pid),
+                        log_path: None,
+                        plan: Box::new(plan.clone()),
+                    });
+                }
             }
             Ok(())
         });
     match prepared {
         Ok(()) => {}
         Err(LifecycleError::NotReady { pid, .. }) if mode == ServeMode::Detached => {
+            // Register the spawned server (if any), left running. `pid` is
+            // either that server or a still-running pre-step.
+            let server_pid = child.as_ref().map(|c| c.id());
             if plan.runtime != RuntimeKind::Ollama
-                && let Some(pid) = pid
+                && let Some(server_pid) = server_pid
             {
-                register_detached(&plan, pid, log_path.clone());
+                register_detached(&plan, server_pid, log_path.clone());
             }
+            let log_path = if pid == server_pid { log_path } else { None };
             return Err(LifecycleError::NotReady {
                 pid,
                 log_path,
@@ -1119,6 +1170,38 @@ mod tests {
         run_checked(&["true".into()], &SilentProgress).unwrap();
         let err = run_checked(&["false".into()], &SilentProgress).unwrap_err();
         assert!(err.to_string().contains("`false` failed"));
+    }
+
+    #[test]
+    fn run_checked_until_returns_pid_of_step_still_running_at_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let pid = run_checked_until(
+            &["sleep".into(), "30".into()],
+            &SilentProgress,
+            Some(deadline),
+        )
+        .unwrap()
+        .expect("sleep 30 is still running at the deadline");
+        // Left running, not killed.
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(alive.success(), "pre-step {pid} should still be alive");
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+    }
+
+    #[test]
+    fn run_checked_until_with_deadline_reports_success_and_failure() {
+        let deadline = || Some(Instant::now() + Duration::from_secs(5));
+        assert_eq!(
+            run_checked_until(&["true".into()], &SilentProgress, deadline()).unwrap(),
+            None
+        );
+        let err = run_checked_until(&["false".into()], &SilentProgress, deadline()).unwrap_err();
+        assert!(err.to_string().contains("`false` failed"), "{err}");
     }
 
     #[test]

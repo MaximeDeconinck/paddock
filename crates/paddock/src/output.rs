@@ -324,7 +324,7 @@ pub fn uptime_label(started_at: i64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use paddock_core::catalog::{CatalogModel, CatalogVariant, RuntimeKind, Source};
     use paddock_core::estimate::{DEFAULT_CONTEXT, MemoryBudget, estimate_memory, estimate_speed};
@@ -401,7 +401,7 @@ mod tests {
         assert_eq!(age_label(Some(NOW + DAY), false, NOW), "0d"); // future clamps
     }
 
-    fn scored() -> ScoredModel {
+    pub(crate) fn scored() -> ScoredModel {
         let model = CatalogModel {
             id: 0,
             name: "fake-model".into(),

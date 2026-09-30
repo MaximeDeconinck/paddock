@@ -20,7 +20,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::app::App;
+use crate::app::{App, ScoredModel};
 use crate::lifecycle::{
     InstallPolicy, LifecycleError, ServeMode, SilentProgress, resolve_model, resolved_ctx,
 };
@@ -35,7 +35,11 @@ Workflow: paddock_scan (hardware) -> paddock_fit or paddock_recommend (ranked mo
 paddock_serve (start one, get an endpoint) -> paddock_ps / paddock_stop (manage).
 paddock_serve blocks until the server answers, up to timeout_secs (default 600); a first \
 run may download a multi-GB model. status \"starting\" means the timeout elapsed but the \
-server is still coming up: poll paddock_ps until it is listed, then use the endpoint.
+server is still coming up. With runtime \"ollama\" the model is still downloading: call \
+paddock_serve again later with the same arguments (it returns ready once the pull finished). \
+With llama.cpp / mlx the server is loading: poll paddock_ps until it is listed, then use the \
+endpoint; if it never appears the server may have exited, and log_path from the starting \
+result holds its log.
 openai_url speaks the OpenAI chat-completions protocol; put model_ref in the `model` field.
 An error with code \"no_runtime\" means a runtime (ollama, llama.cpp, mlx-lm) is not installed: \
 show install_command to the user and ask before anything is installed. paddock never installs \
@@ -165,6 +169,32 @@ pub(crate) fn error_body(e: &LifecycleError) -> Value {
     body
 }
 
+/// `paddock_fit` result: an object (MCP `structuredContent` must be one).
+pub(crate) fn fit_result(rows: &[ScoredModel]) -> Result<Value, LifecycleError> {
+    Ok(
+        json!({ "models": serde_json::to_value(output::fit_rows(rows)).map_err(anyhow::Error::from)? }),
+    )
+}
+
+/// `paddock_recommend` result: an object (MCP `structuredContent` must be one).
+pub(crate) fn recommend_result(rows: &[ScoredModel]) -> Result<Value, LifecycleError> {
+    Ok(json!({
+        "recommendations": serde_json::to_value(output::recommend_rows(rows)).map_err(anyhow::Error::from)?
+    }))
+}
+
+/// `paddock_stop` refuses `all` over MCP: stopping every server is a human
+/// decision. Returns the error result when `target` is rejected.
+pub(crate) fn reject_stop_target(target: &str) -> Option<CallToolResult> {
+    (target == "all").then(|| {
+        CallToolResult::structured_error(json!({
+            "code": "invalid_target",
+            "message": "`all` is not accepted over MCP",
+            "hint": "stop servers one at a time",
+        }))
+    })
+}
+
 /// The `paddock_serve` result for both `ready` and `starting`.
 pub(crate) fn serve_result(
     status: &str,
@@ -238,7 +268,7 @@ impl PaddockMcp {
 
     #[tool(
         name = "paddock_fit",
-        description = "Catalog models ranked for this machine: quant picked, memory estimate, generation tok/s estimate, fit verdict (fits / tune sysctl / ram only / no fit) and score. Empty array means the catalog is empty: the user must run `paddock sync`.",
+        description = "Catalog models ranked for this machine: quant picked, memory estimate, generation tok/s estimate, fit verdict (fits / tune sysctl / ram only / no fit) and score, as { \"models\": [...] }. An empty models array means nothing matched: limit was 0, nothing fits this machine (retry with include_unfit true to see why), or the catalog is empty (then call paddock_recommend: a catalog_empty error confirms it and the user must run `paddock sync`).",
         annotations(read_only_hint = true)
     )]
     async fn fit(&self, Parameters(input): Parameters<FitInput>) -> CallToolResult {
@@ -252,14 +282,14 @@ impl PaddockMcp {
             let mut rows =
                 app.scored_models(&db, use_case, input.include_unfit.unwrap_or(false))?;
             rows.truncate(input.limit.unwrap_or(10));
-            Ok(serde_json::to_value(output::fit_rows(&rows)).map_err(anyhow::Error::from)?)
+            fit_result(&rows)
         })
         .await
     }
 
     #[tool(
         name = "paddock_recommend",
-        description = "Top 5 models for this machine with a one-line justification each (fit headroom, speed tier, context). Use when you want a short answer instead of the full ranking.",
+        description = "Top 5 models for this machine with a one-line justification each (fit headroom, speed tier, context), as { \"recommendations\": [...] }. Use when you want a short answer instead of the full ranking.",
         annotations(read_only_hint = true)
     )]
     async fn recommend(&self, Parameters(input): Parameters<RecommendInput>) -> CallToolResult {
@@ -272,14 +302,14 @@ impl PaddockMcp {
                 .unwrap_or(UseCase::General);
             let mut rows = app.scored_models(&db, use_case, false)?;
             rows.truncate(5);
-            Ok(serde_json::to_value(output::recommend_rows(&rows)).map_err(anyhow::Error::from)?)
+            recommend_result(&rows)
         })
         .await
     }
 
     #[tool(
         name = "paddock_serve",
-        description = "Start serving a catalog model with the best available runtime and return an OpenAI-compatible endpoint. Picks the best fitting quant unless `quant` is given. Blocks until ready (up to timeout_secs, default 600; a first run may download the model). status \"starting\" means it is still loading: poll paddock_ps. Never installs a runtime: a no_runtime error carries the command for the user."
+        description = "Start serving a catalog model with the best available runtime and return an OpenAI-compatible endpoint. Picks the best fitting quant unless `quant` is given. Blocks until ready (up to timeout_secs, default 600; a first run may download the model). status \"starting\" means the timeout elapsed first: with runtime \"ollama\" the model is still downloading, so call paddock_serve again later with the same arguments (it returns ready once the pull finished); with llama.cpp / mlx the server is loading, so poll paddock_ps (log_path holds its log). Never installs a runtime: a no_runtime error carries the command for the user."
     )]
     async fn serve(&self, Parameters(input): Parameters<ServeInput>) -> CallToolResult {
         let app = self.app.clone();
@@ -342,12 +372,8 @@ impl PaddockMcp {
         annotations(destructive_hint = true)
     )]
     async fn stop(&self, Parameters(input): Parameters<StopInput>) -> CallToolResult {
-        if input.target == "all" {
-            return CallToolResult::structured_error(json!({
-                "code": "invalid_target",
-                "message": "`all` is not accepted over MCP",
-                "hint": "stop servers one at a time",
-            }));
+        if let Some(rejected) = reject_stop_target(&input.target) {
+            return rejected;
         }
         blocking(move || {
             let stopped = crate::lifecycle::stop(&input.target, &SilentProgress)?;
@@ -558,6 +584,41 @@ mod tests {
         assert_eq!(v["port"], 8081);
         assert_eq!(v["pid"], 42);
         assert_eq!(v["log_path"], "/tmp/42.log");
+    }
+
+    #[test]
+    fn fit_and_recommend_results_are_objects_wrapping_arrays() {
+        let rows = vec![crate::output::tests::scored()];
+        let v = fit_result(&rows).unwrap();
+        assert!(v.is_object());
+        assert_eq!(v["models"].as_array().unwrap().len(), 1);
+        assert_eq!(v["models"][0]["name"], "fake-model");
+        let v = recommend_result(&rows).unwrap();
+        assert!(v.is_object());
+        assert_eq!(v["recommendations"].as_array().unwrap().len(), 1);
+
+        assert_eq!(
+            fit_result(&[]).unwrap(),
+            serde_json::json!({ "models": [] })
+        );
+        assert_eq!(
+            recommend_result(&[]).unwrap(),
+            serde_json::json!({ "recommendations": [] })
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_all_is_rejected_with_invalid_target() {
+        let mcp = PaddockMcp::new(crate::app::App::load());
+        let r = mcp
+            .stop(Parameters(StopInput {
+                target: "all".into(),
+            }))
+            .await;
+        assert_eq!(r.is_error, Some(true));
+        let body = r.structured_content.expect("structured error body");
+        assert_eq!(body["code"], "invalid_target");
+        assert!(reject_stop_target("llama").is_none());
     }
 
     #[test]
