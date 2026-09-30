@@ -50,7 +50,7 @@ Press `Tab` to switch to the servers view: everything currently running shows th
 
 On the models tab, `enter` opens a model's detail popup, which lists every quantization it ships with their memory, tok/s and fit; use the arrow keys to pick a smaller quant for more speed and less memory, then `x` to run or `s` to serve the chosen one. Without opening the detail, `x`/`s` use the best quant that fits.
 
-Ten subcommands cover everything scriptable:
+Eleven subcommands cover everything scriptable:
 
 ### `paddock scan`: what is this machine?
 
@@ -217,6 +217,42 @@ Calibration is per machine and per model class: one factor for dense models, one
 
 Some Hugging Face repos ship their vision projector as a separate `mmproj-*.gguf` file (Unsloth's Qwen3.6 uploads, for example). Ollama cannot import those repos via `hf.co/…` ([ollama/ollama#15447](https://github.com/ollama/ollama/issues/15447)); it would download the full weights and then fail. paddock detects the `mmproj` file at sync time, marks every variant of the repo llama.cpp-only, and serves it with `llama-server` (or proposes `brew install llama.cpp`) even when Ollama is installed and running. Run `paddock sync` to refresh these compatibility flags.
 
+### `paddock mcp`: let coding agents provision models
+
+`paddock mcp` exposes paddock over the [Model Context Protocol](https://modelcontextprotocol.io) on stdio, so an agent (Claude Code, Claude Desktop, Cursor, anything that can spawn a process) can ask "what can this machine run?", start a model, and get an OpenAI-compatible endpoint back, without parsing tables or driving a terminal.
+
+```text
+$ claude mcp add paddock -- paddock mcp
+```
+
+Claude Desktop (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "paddock": { "command": "paddock", "args": ["mcp"] }
+  }
+}
+```
+
+Six tools, provisioning only:
+
+| Tool | Does | Returns |
+|---|---|---|
+| `paddock_scan` | hardware profile | same JSON as `paddock scan --json` |
+| `paddock_fit` | ranked models (`use_case`, `limit`, `include_unfit`) | `{ models: [...] }`, same rows as `paddock fit --json` |
+| `paddock_recommend` | top 5 with justifications (`use_case`) | `{ recommendations: [...] }`, same rows as `paddock recommend --json` |
+| `paddock_serve` | start a model (`model`, `quant?`, `ctx?`, `port?`, `timeout_secs?`) | `{ status, endpoint, openai_url, model_ref, runtime, ctx, port, pid, log_path }` |
+| `paddock_ps` | running + available servers | `{ running, available }`, same as `paddock ps --json` |
+| `paddock_stop` | stop one server by name or pid | `{ stopped: [{ model_ref, pid }] }` |
+
+Two contracts the agent is told about at connect time:
+
+- `paddock_serve` blocks until the server answers, up to `timeout_secs` (default 600, because a first run may download a multi-GB model). If the timeout elapses first, the tool returns `status: "starting"`. With llama.cpp / mlx the server keeps running detached and is still loading: the agent polls `paddock_ps` until it is listed (if it never appears the server may have exited, and `log_path` holds its log). With Ollama the model is still downloading: the agent calls `paddock_serve` again later with the same arguments and gets `ready` once the pull finished.
+- paddock never installs a runtime on an agent's request. A missing runtime is an error with `code: "no_runtime"` and the `install_command`, for the agent to show you.
+
+Other errors carry a `code` too: `model_not_found`, `ambiguous` (with `candidates`), `no_fit`, `unknown_quant` (with `available`), `server_exited` (with `argv` and `log_path`), `ollama_unreachable`, `no_server_match` (with `running`), `ambiguous_server` (with `candidates`), `catalog_empty`, `invalid_target`, `internal`. `paddock_stop` refuses `all` over MCP (`invalid_target`): one server at a time. `sync`, `logs` and `run` are not exposed (slow and networked, or interactive).
+
 ### `paddock tray`: menu bar (macOS)
 
 ```sh
@@ -341,7 +377,7 @@ Geometric, because on a capable machine fit/speed/context all saturate near 100 
 
 - **Tauri desktop app** on top of `paddock-core`
 - **`paddock bench` v2**: bench from the TUI, prefill (prompt-speed) calibration, offload-penalty modeling
-- **MCP server**: let coding agents ask "what can this machine run?"
+- **MCP v2**: `paddock_chat` (relay a completion to a served endpoint), `paddock_run_agent` (spawn a local agent runner against it and return its diff), HTTP transport, `paddock://hardware` and `paddock://catalog` resources
 - **Linux / Windows**: same idea, different memory model (discrete VRAM, CUDA/ROCm)
 
 ## License
