@@ -18,7 +18,7 @@ use paddock_core::serving::Registry;
 use crate::app::App;
 use crate::cli::{Cli, Command};
 use crate::lifecycle::{
-    LifecycleError, RegistryGuard, StderrProgress, resolve_model, resolved_ctx, run_checked,
+    LifecycleError, RegistryGuard, StderrProgress, resolve_model, resolved_ctx,
 };
 
 fn main() -> Result<()> {
@@ -277,35 +277,9 @@ pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
 }
 
 fn stop_servers(target: &str, yes: bool) -> Result<()> {
-    use paddock_core::catalog::RuntimeKind;
-    use paddock_core::serving::{RecordMatch, match_records, terminate};
+    use crate::lifecycle::{resolve_servers, stop_records};
 
-    let registry = Registry::open_default();
-    let records = registry.list_live(&RealSystemProbe);
-    let chosen = match match_records(&records, target) {
-        RecordMatch::Matched(v) => v,
-        RecordMatch::Ambiguous(cands) => {
-            eprintln!("`{target}` matches several servers - be specific:");
-            for r in cands {
-                eprintln!("  {} (pid {})", r.model_ref, r.pid);
-            }
-            std::process::exit(1);
-        }
-        RecordMatch::NotFound => {
-            eprintln!("no running server matches `{target}`");
-            if !records.is_empty() {
-                eprintln!(
-                    "running: {}",
-                    records
-                        .iter()
-                        .map(|r| r.model_ref.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            std::process::exit(1);
-        }
-    };
+    let chosen = resolve_servers(target).map_err(cli_fail)?;
 
     if target == "all" && !yes {
         eprintln!("about to stop {} server(s):", chosen.len());
@@ -322,17 +296,8 @@ fn stop_servers(target: &str, yes: bool) -> Result<()> {
         }
     }
 
-    for r in chosen {
-        if r.runtime == RuntimeKind::Ollama {
-            let _ = run_checked(
-                &["ollama".into(), "stop".into(), r.model_ref.clone()],
-                &StderrProgress,
-            );
-        } else {
-            terminate(r.pid);
-        }
-        let _ = registry.unregister(r.pid);
-        println!("stopped {} (pid {})", r.model_ref, r.pid);
+    for s in stop_records(chosen, &StderrProgress) {
+        println!("stopped {} (pid {})", s.model_ref, s.pid);
     }
     Ok(())
 }

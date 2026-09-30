@@ -104,13 +104,11 @@ pub enum LifecycleError {
     #[error("ollama daemon not reachable on 11434 - is it running?")]
     OllamaUnreachable,
     #[error("no running server matches `{target}`{}", if running.is_empty() { String::new() } else { format!("\nrunning: {}", running.join(", ")) })]
-    #[allow(dead_code)] // constructed when stop moves here (Task 4)
     NoServerMatch {
         target: String,
         running: Vec<String>,
     },
     #[error("`{target}` matches several servers - be specific:{}", candidates.iter().map(|(m, p)| format!("\n  {m} (pid {p})")).collect::<String>())]
-    #[allow(dead_code)] // constructed when stop moves here (Task 4)
     AmbiguousServer {
         target: String,
         candidates: Vec<(String, u32)>,
@@ -159,7 +157,6 @@ pub struct ServeOutcome {
     pub child: Option<std::process::Child>,
 }
 
-#[allow(dead_code)] // wired up when serve/stop move here (later tasks)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stopped {
     pub model_ref: String,
@@ -633,6 +630,58 @@ pub fn serve(
     }
 }
 
+/// Resolve a stop target (model name substring, pid, or `all`) against the
+/// live registry. `all` on an empty registry is `NoServerMatch`.
+pub fn resolve_servers(target: &str) -> Result<Vec<ServingRecord>, LifecycleError> {
+    use paddock_core::serving::{RecordMatch, match_records};
+
+    let records = Registry::open_default().list_live(&RealSystemProbe);
+    match match_records(&records, target) {
+        RecordMatch::Matched(v) => Ok(v.into_iter().cloned().collect()),
+        RecordMatch::Ambiguous(cands) => Err(LifecycleError::AmbiguousServer {
+            target: target.to_string(),
+            candidates: cands.iter().map(|r| (r.model_ref.clone(), r.pid)).collect(),
+        }),
+        RecordMatch::NotFound => Err(LifecycleError::NoServerMatch {
+            target: target.to_string(),
+            running: records.iter().map(|r| r.model_ref.clone()).collect(),
+        }),
+    }
+}
+
+/// Stop every record: `ollama stop` for Ollama-served models, SIGTERM for
+/// paddock-spawned servers; unregister each. Best-effort per record.
+pub fn stop_records(records: Vec<ServingRecord>, progress: &dyn Progress) -> Vec<Stopped> {
+    use paddock_core::serving::terminate;
+
+    let registry = Registry::open_default();
+    let mut stopped = Vec::with_capacity(records.len());
+    for r in records {
+        if r.runtime == RuntimeKind::Ollama {
+            let _ = run_checked(
+                &["ollama".into(), "stop".into(), r.model_ref.clone()],
+                progress,
+            );
+        } else {
+            terminate(r.pid);
+        }
+        let _ = registry.unregister(r.pid);
+        stopped.push(Stopped {
+            model_ref: r.model_ref,
+            pid: r.pid,
+        });
+    }
+    stopped
+}
+
+/// `resolve_servers` + `stop_records`, for callers that need no confirmation
+/// step in between (MCP rejects `all` before calling this).
+#[allow(dead_code)] // used by the MCP adapter (later task)
+pub fn stop(target: &str, progress: &dyn Progress) -> Result<Vec<Stopped>, LifecycleError> {
+    let records = resolve_servers(target)?;
+    Ok(stop_records(records, progress))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1096,6 +1145,8 @@ mod tests {
 
     #[test]
     fn serve_refuse_policy_returns_no_runtime_before_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ServingDirGuard::isolate(dir.path());
         let mut plan = spawned_plan();
         plan.server_argv = Some(vec!["definitely-not-a-binary-xyz".into()]);
         plan.install = Some(InstallPlan {
@@ -1118,7 +1169,10 @@ mod tests {
 
     #[test]
     fn serve_ask_policy_propagates_install_declined() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ServingDirGuard::isolate(dir.path());
         let mut plan = spawned_plan();
+        plan.server_argv = Some(vec!["definitely-not-a-binary-xyz".into()]);
         plan.install = Some(InstallPlan {
             kind: RuntimeKind::LlamaCpp,
             argv: vec!["brew".into(), "install".into(), "llama.cpp".into()],
@@ -1139,16 +1193,34 @@ mod tests {
         assert!(matches!(err, LifecycleError::InstallDeclined { .. }));
     }
 
-    /// Restores `PADDOCK_SERVING_DIR` to its previous value on drop, even when
-    /// the test panics.
-    struct ServingDirGuard(Option<std::ffi::OsString>);
+    /// Serializes every test that touches `PADDOCK_SERVING_DIR`: cargo runs
+    /// tests on parallel threads and the env is process-wide.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points `PADDOCK_SERVING_DIR` at an isolated dir while holding
+    /// `ENV_LOCK`; restores the previous value on drop (even on panic), then
+    /// releases the lock.
+    struct ServingDirGuard {
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ServingDirGuard {
+        fn isolate(dir: &Path) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let prev = std::env::var_os("PADDOCK_SERVING_DIR");
+            // SAFETY: every writer of PADDOCK_SERVING_DIR in this process goes
+            // through this guard and holds ENV_LOCK.
+            unsafe { std::env::set_var("PADDOCK_SERVING_DIR", dir) };
+            Self { prev, _lock: lock }
+        }
+    }
 
     impl Drop for ServingDirGuard {
         fn drop(&mut self) {
-            // SAFETY: only this test module touches PADDOCK_SERVING_DIR, and
-            // only from `serve_missing_binary_is_actionable`.
+            // SAFETY: ENV_LOCK is still held (fields drop after this body).
             unsafe {
-                match self.0.take() {
+                match self.prev.take() {
                     Some(v) => std::env::set_var("PADDOCK_SERVING_DIR", v),
                     None => std::env::remove_var("PADDOCK_SERVING_DIR"),
                 }
@@ -1156,15 +1228,22 @@ mod tests {
         }
     }
 
+    /// True while `pid` exists (signal 0 probe).
+    fn pid_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
     #[test]
     fn serve_missing_binary_is_actionable() {
         // Isolated serving dir so the history/registry writes never touch the
         // real one.
         let dir = tempfile::tempdir().unwrap();
-        let _restore = ServingDirGuard(std::env::var_os("PADDOCK_SERVING_DIR"));
-        // SAFETY: tests in this module that read PADDOCK_SERVING_DIR run in
-        // this process only; the var is scoped to this test's lifetime.
-        unsafe { std::env::set_var("PADDOCK_SERVING_DIR", dir.path()) };
+        let _env = ServingDirGuard::isolate(dir.path());
         let mut plan = spawned_plan();
         plan.server_argv = Some(vec![
             "definitely-not-a-binary-xyz".into(),
@@ -1184,5 +1263,97 @@ mod tests {
                 .contains("failed to start definitely-not-a-binary-xyz"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn serve_detached_timeout_leaves_child_running_and_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ServingDirGuard::isolate(dir.path());
+        let mut plan = spawned_plan();
+        plan.server_argv = Some(vec!["sleep".into(), "30".into()]);
+        let err = serve(
+            plan,
+            ServeMode::Detached,
+            InstallPolicy::Refuse,
+            Some(Duration::from_secs(1)),
+            &SilentProgress,
+        )
+        .unwrap_err();
+        let pid = match err {
+            LifecycleError::NotReady { pid: Some(pid), .. } => pid,
+            other => panic!("expected NotReady with a pid, got {other}"),
+        };
+        let alive = pid_alive(pid);
+        let registered = dir.path().join(format!("{pid}.json")).exists();
+        paddock_core::serving::terminate(pid);
+        assert!(alive, "detached child must keep running after NotReady");
+        assert!(registered, "detached child must be registered on NotReady");
+    }
+
+    #[test]
+    fn serve_foreground_timeout_kills_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ServingDirGuard::isolate(dir.path());
+        let mut plan = spawned_plan();
+        plan.server_argv = Some(vec!["sleep".into(), "30".into()]);
+        let err = serve(
+            plan,
+            ServeMode::Foreground,
+            InstallPolicy::Refuse,
+            Some(Duration::from_secs(1)),
+            &SilentProgress,
+        )
+        .unwrap_err();
+        let pid = match err {
+            LifecycleError::NotReady { pid: Some(pid), .. } => pid,
+            other => panic!("expected NotReady with a pid, got {other}"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pid_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let alive = pid_alive(pid);
+        if alive {
+            paddock_core::serving::terminate(pid);
+        }
+        assert!(!alive, "foreground child must be killed on NotReady");
+    }
+
+    #[test]
+    fn resolve_servers_unknown_target_lists_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ServingDirGuard::isolate(dir.path());
+        match resolve_servers("nope").unwrap_err() {
+            LifecycleError::NoServerMatch { target, running } => {
+                assert_eq!(target, "nope");
+                assert!(running.is_empty());
+            }
+            other => panic!("expected NoServerMatch, got {other}"),
+        }
+    }
+
+    #[test]
+    fn stop_records_terminates_and_unregisters() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ServingDirGuard::isolate(dir.path());
+        let mut child = sleeping_child();
+        let pid = child.id();
+        let record = build_record(&spawned_plan(), pid, None);
+        Registry::open_default().register(&record).unwrap();
+        let json = dir.path().join(format!("{pid}.json"));
+        assert!(json.exists());
+
+        let stopped = stop_records(vec![record], &SilentProgress);
+        assert_eq!(
+            stopped,
+            vec![Stopped {
+                model_ref: "x".into(),
+                pid
+            }]
+        );
+        assert!(!json.exists(), "record must be unregistered");
+        // SIGTERM delivered: the child exits (reaped so the pid is not reused).
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "child must die from SIGTERM");
     }
 }
