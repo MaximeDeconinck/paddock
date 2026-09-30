@@ -222,15 +222,17 @@ Some Hugging Face repos ship their vision projector as a separate `mmproj-*.gguf
 `paddock mcp` exposes paddock over the [Model Context Protocol](https://modelcontextprotocol.io) on stdio, so an agent (Claude Code, Claude Desktop, Cursor, anything that can spawn a process) can ask "what can this machine run?", start a model, and get an OpenAI-compatible endpoint back, without parsing tables or driving a terminal.
 
 ```text
-$ claude mcp add paddock -- paddock mcp
+$ claude mcp add -s user paddock -- paddock mcp
 ```
 
-Claude Desktop (`claude_desktop_config.json`):
+`-s user` makes it available in every project; omit it to add it to the current project only.
+
+Claude Desktop (`claude_desktop_config.json`). Claude Desktop does not inherit your shell's `PATH`, so give the absolute path; use the output of `which paddock` if yours differs:
 
 ```json
 {
   "mcpServers": {
-    "paddock": { "command": "paddock", "args": ["mcp"] }
+    "paddock": { "command": "/opt/homebrew/bin/paddock", "args": ["mcp"] }
   }
 }
 ```
