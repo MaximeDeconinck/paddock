@@ -1,6 +1,8 @@
 mod app;
 mod cli;
 mod clipboard;
+mod lifecycle;
+mod mcp;
 mod output;
 mod tray;
 mod tui;
@@ -9,19 +11,22 @@ use std::io::Write;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use paddock_core::PaddockError;
-use paddock_core::catalog::CatalogModel;
-use paddock_core::estimate::ModelVariant;
-use paddock_core::hardware::{RealSystemProbe, SystemProbe};
+use paddock_core::hardware::RealSystemProbe;
 use paddock_core::runtime::{InstallPlan, RunPlan, ServePlan, plan_run, plan_serve};
-use paddock_core::score::{UseCase, best_variant};
-use paddock_core::serving::{Registry, ServingRecord};
+use paddock_core::score::UseCase;
+use paddock_core::serving::Registry;
 
 use crate::app::App;
 use crate::cli::{Cli, Command};
+use crate::lifecycle::{
+    LifecycleError, RegistryGuard, StderrProgress, resolve_model, resolved_ctx,
+};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Some(Command::Mcp)) {
+        mcp::prepare_env();
+    }
     let app = App::load();
 
     match cli.command {
@@ -119,6 +124,7 @@ fn main() -> Result<()> {
             }
         }
         Some(Command::Tray) => tray::run()?,
+        Some(Command::Mcp) => mcp::run(app)?,
         None => {
             if cli.cli || cli.json {
                 fit(&app, false, UseCase::General, 20, cli.json)?;
@@ -128,6 +134,22 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// CLI rendering of lifecycle errors. The interactive-disambiguation cases
+/// print exactly today's multi-line message and exit 1; everything else
+/// propagates through anyhow (Rust prints `Error: <Display>`, as `bail!` did).
+fn cli_fail(e: LifecycleError) -> anyhow::Error {
+    match e {
+        LifecycleError::Ambiguous { .. }
+        | LifecycleError::AmbiguousServer { .. }
+        | LifecycleError::NoServerMatch { .. }
+        | LifecycleError::InstallDeclined { .. } => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        other => other.into(),
+    }
 }
 
 /// Default listing shared by `paddock fit` and bare `paddock --cli/--json`.
@@ -146,80 +168,6 @@ fn fit(app: &App, all: bool, use_case: UseCase, limit: usize, json: bool) -> Res
     Ok(())
 }
 
-/// Catalog lookup + best-fitting variant pick, shared by `run` and `serve`.
-/// Returns the model and the index into `model.variants` of the chosen quant.
-/// Exits the process on an ambiguous name (interactive disambiguation UX).
-fn resolve_model(app: &App, query: &str, quant: Option<&str>) -> Result<(CatalogModel, usize)> {
-    let db = app.open_db()?;
-    let models = db.list_models().context("reading catalog")?;
-    let model = match find_model(&models, query) {
-        Lookup::Found(m) => m.clone(),
-        Lookup::Ambiguous(names) => {
-            eprintln!("model name `{query}` is ambiguous - candidates:");
-            for n in names {
-                eprintln!("  {n}");
-            }
-            std::process::exit(1);
-        }
-        Lookup::NotFound => return Err(PaddockError::ModelNotFound(query.to_string()).into()),
-    };
-
-    let mvs: Vec<_> = model
-        .variants
-        .iter()
-        .map(|v| model.to_model_variant(v))
-        .collect();
-
-    // Explicit --quant launches that variant even if it does not fit; the
-    // verdict is informational (consistent with the TUI quant picker).
-    if let Some(label) = quant {
-        let idx = resolve_quant(&mvs, label)?;
-        return Ok((model, idx));
-    }
-
-    let Some(best) = best_variant(&mvs, &app.budget) else {
-        bail!(
-            "no quantization of `{}` fits this machine ({} RAM); try a smaller model from `paddock fit`",
-            model.name,
-            output::gib(app.budget.ram_total_bytes)
-        );
-    };
-    // Pointer identity, not quant-label equality: two variants can share the
-    // same quant string, and `best` borrows from `mvs` (same order as
-    // `model.variants`).
-    let best_idx = mvs
-        .iter()
-        .position(|v| std::ptr::eq(v, best))
-        .expect("best_variant borrows from mvs");
-    Ok((model, best_idx))
-}
-
-/// Index into `variants` of the variant whose quant label equals `label`
-/// (case-insensitive). On a label shared by several variants, returns the
-/// best-quality one (first in `variants_by_quality` order). Errors listing the
-/// available quants when nothing matches. Backs `--quant` on `run`/`serve`.
-fn resolve_quant(variants: &[ModelVariant], label: &str) -> Result<usize> {
-    let order = paddock_core::score::variants_by_quality(variants);
-    if let Some(&idx) = order
-        .iter()
-        .find(|&&i| variants[i].quant.eq_ignore_ascii_case(label))
-    {
-        return Ok(idx);
-    }
-    let available: Vec<&str> = order.iter().map(|&i| variants[i].quant.as_str()).collect();
-    bail!(
-        "no quant `{label}` for this model; available: {}",
-        available.join(", ")
-    );
-}
-
-/// Resolve the launch context for a chosen model variant: explicit `--ctx`
-/// wins, otherwise auto-size against this machine's memory budget.
-fn resolved_ctx(app: &App, model: &CatalogModel, idx: usize, ctx: Option<u32>) -> u32 {
-    let mv = model.to_model_variant(&model.variants[idx]);
-    paddock_core::estimate::resolve_ctx(ctx, &mv, &app.budget, model.context_max)
-}
-
 fn run_model(
     app: &App,
     query: &str,
@@ -227,7 +175,7 @@ fn run_model(
     quant: Option<String>,
     json: bool,
 ) -> Result<()> {
-    let (model, idx) = resolve_model(app, query, quant.as_deref())?;
+    let (model, idx) = resolve_model(app, query, quant.as_deref()).map_err(cli_fail)?;
 
     // API delta vs the original plan: plan_run is fallible (repo-less HF/MLX
     // models, non-GGUF quants). Surface the actionable error and exit non-zero.
@@ -253,7 +201,7 @@ fn serve_model(
     quant: Option<String>,
     json: bool,
 ) -> Result<()> {
-    let (model, idx) = resolve_model(app, query, quant.as_deref())?;
+    let (model, idx) = resolve_model(app, query, quant.as_deref()).map_err(cli_fail)?;
     let ctx = Some(resolved_ctx(app, &model, idx, ctx));
     let plan = plan_serve(
         &model,
@@ -272,102 +220,36 @@ fn serve_model(
     serve_with_plan(plan, foreground)
 }
 
-/// Full serve lifecycle: confirm install, spawn the server child when needed,
-/// wait for readiness, run pre-steps (e.g. `ollama pull`), print the endpoint
-/// block, then wait on the child. Shared with the TUI (Task 3).
-pub(crate) fn serve_with_plan(mut plan: ServePlan, foreground: bool) -> Result<()> {
-    if plan.port_ignored {
-        eprintln!("warning: --port is ignored for the Ollama daemon (fixed 11434)");
-    }
-    if let Some(install) = &plan.install {
-        confirm_and_install(install)?;
-    }
+/// CLI/TUI adapter over `lifecycle::serve`: same terminal output as before
+/// (endpoint block on stdout, progress on stderr), install confirmed on the
+/// tty, no readiness timeout. Shared with the TUI `s` key.
+pub(crate) fn serve_with_plan(plan: ServePlan, foreground: bool) -> Result<()> {
+    use crate::lifecycle::{InstallPolicy, ServeMode, serve};
+    use paddock_core::catalog::RuntimeKind;
 
-    // Spawned servers (llama.cpp/mlx) default to 8080; pick a free port so
-    // concurrent servers don't collide (and so the readiness probe can't be
-    // answered by a different process already on the port). The Ollama daemon
-    // has a fixed port and no server_argv, so it's untouched.
-    if plan.server_argv.is_some()
-        && let Some(requested) = plan.port
-        && let Some(free) = paddock_core::serving::free_port(requested)
-        && free != requested
-    {
-        eprintln!("port {requested} is busy - serving on {free} instead");
-        plan = plan.with_port(free);
-    }
-
-    // Remember spawned (llama.cpp/mlx) serves so the TUI can offer one-key
-    // relaunch. Best-effort; Ollama is covered by /api/tags, not recorded.
-    if plan.server_argv.is_some() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        paddock_core::serving::History::open_default().record(&plan, now);
-    }
-
-    let log_dir = paddock_core::serving::default_serving_dir().join("logs");
-
-    let mut detached_log: Option<std::path::PathBuf> = None;
-    let mut child = match &plan.server_argv {
-        Some(argv) => {
-            eprintln!("$ {}", argv.join(" "));
-            if foreground {
-                Some(spawn_checked(argv)?)
-            } else {
-                // Detached: spawn to a per-invocation placeholder (our own pid
-                // makes it unique across concurrent `serve`s), then rename to
-                // <child-pid>.log once the child pid is known.
-                let tmp_log = log_dir.join(format!("pending-{}.log", std::process::id()));
-                let c = spawn_detached(argv, &tmp_log)?;
-                let final_log = log_dir.join(format!("{}.log", c.id()));
-                let actual = match std::fs::rename(&tmp_log, &final_log) {
-                    Ok(()) => final_log,
-                    Err(_) => tmp_log, // rename failed → the data is still at the pending path
-                };
-                detached_log = Some(actual);
-                Some(c)
-            }
-        }
-        None => None,
+    let mode = if foreground {
+        ServeMode::Foreground
+    } else {
+        ServeMode::Detached
     };
-
-    // Readiness + pre-steps; never leave an orphaned server behind on failure.
-    let prepared = wait_ready(&plan, child.as_mut()).and_then(|()| {
-        for step in &plan.pre_steps {
-            eprintln!("$ {}", step.join(" "));
-            run_checked(step)?;
-        }
-        Ok(())
-    });
-    if let Err(e) = prepared {
-        if let Some(c) = child.as_mut() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-        return Err(e);
-    }
-
-    // Ollama loads a model only on its first request and the daemon outlives
-    // us - warm it up now so "ready" means ready (and the model shows in
-    // /api/ps + the tray). Best-effort: a failure leaves a working endpoint
-    // that simply cold-starts on first use.
-    if plan.runtime == paddock_core::catalog::RuntimeKind::Ollama {
-        eprintln!("loading {} into memory…", plan.model_ref);
-        if !paddock_core::serving::warm_up_ollama(&RealSystemProbe, &plan.model_ref) {
-            eprintln!("warning: warm-up failed - the model will load on the first request");
-        }
-    }
-
+    let outcome = serve(
+        plan,
+        mode,
+        InstallPolicy::Ask(&confirm_and_install),
+        None,
+        &StderrProgress,
+    )
+    .map_err(cli_fail)?;
+    let plan = outcome.plan;
     output::print_endpoint(&plan);
 
-    match child {
-        Some(mut c) if foreground => {
+    match outcome.child {
+        Some(mut c) => {
             // Best-effort registry entry for tray/UIs; the guard unregisters
             // on every exit path including `?`. SIGINT kills paddock and the
             // child together (default tty behavior) without running Drop -
             // the stale file is reaped by the next `list_live`.
-            let _guard = (plan.runtime != paddock_core::catalog::RuntimeKind::Ollama)
+            let _guard = (plan.runtime != RuntimeKind::Ollama)
                 .then(|| RegistryGuard::register(&plan, c.id(), None));
             eprintln!("serving - press Ctrl-C to stop");
             let status = c.wait()?;
@@ -376,214 +258,33 @@ pub(crate) fn serve_with_plan(mut plan: ServePlan, foreground: bool) -> Result<(
             }
             Ok(())
         }
-        // Detached child: register WITHOUT the drop-guard so it outlives us.
-        Some(c) => {
-            if plan.runtime == paddock_core::catalog::RuntimeKind::Ollama {
+        None => {
+            match outcome.pid {
                 // Cold-started the Ollama daemon; it serves in the background on
                 // its fixed port. ollama ps / ollama stop manage it, not paddock.
-                eprintln!("ollama daemon started in the background");
-            } else {
-                let log_path = detached_log.take();
-                register_detached(&plan, c.id(), log_path);
-                eprintln!(
-                    "serving in background · pid {} · paddock logs {}",
-                    c.id(),
-                    plan.model_ref
-                );
+                Some(_) if plan.runtime == RuntimeKind::Ollama => {
+                    eprintln!("ollama daemon started in the background");
+                }
+                Some(pid) => {
+                    eprintln!(
+                        "serving in background · pid {pid} · paddock logs {}",
+                        plan.model_ref
+                    );
+                }
+                // Already-running Ollama daemon: nothing was spawned, so nothing
+                // to detach or track - the daemon owns the model and `ollama ps`
+                // lists it. paddock's ps/stop/logs cover llama.cpp/mlx only.
+                None => {}
             }
             Ok(())
         }
-        // Already-running Ollama daemon: nothing was spawned, so nothing to
-        // detach or track - the daemon owns the model and `ollama ps` lists it.
-        // paddock's ps/stop/logs cover the spawned (llama.cpp/mlx) servers only.
-        None => Ok(()),
     }
-}
-
-/// Build a serving registry record for a running server.
-fn build_record(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>) -> ServingRecord {
-    let started_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    ServingRecord {
-        pid,
-        runtime: plan.runtime,
-        endpoint: plan.endpoint.clone(),
-        openai_url: plan.openai_url.clone(),
-        model_ref: plan.model_ref.clone(),
-        ready_path: plan.ready_path.clone(),
-        started_at,
-        ctx: plan.ctx,
-        log_path,
-        port: plan.port,
-    }
-}
-
-/// Register a detached child server. Unlike `RegistryGuard`, this does NOT
-/// unregister on drop - the server must survive this process exiting.
-fn register_detached(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>) {
-    let record = build_record(plan, pid, log_path);
-    if let Err(e) = Registry::open_default().register(&record) {
-        eprintln!("warning: could not record serving state: {e}");
-    }
-}
-
-/// RAII wrapper around the serving registry: best-effort register on
-/// creation, unregister on drop (normal return and `?` early-returns alike).
-struct RegistryGuard {
-    registry: Registry,
-    pid: u32,
-}
-
-impl RegistryGuard {
-    fn register(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>) -> Self {
-        let registry = Registry::open_default();
-        let record = build_record(plan, pid, log_path);
-        if let Err(e) = registry.register(&record) {
-            eprintln!("warning: could not record serving state: {e}");
-        }
-        Self { registry, pid }
-    }
-}
-
-impl Drop for RegistryGuard {
-    fn drop(&mut self) {
-        let _ = self.registry.unregister(self.pid);
-    }
-}
-
-/// How long to wait for readiness. A spawned child gets no deadline at all:
-/// runtimes like `llama-server -hf` and mlx_lm.server may be DOWNLOADING a
-/// multi-GB model on first run (tens of minutes on slow links), and any fixed
-/// cap conflates "still downloading" with "hung". Liveness is covered by
-/// `try_wait` instead. Without a child the Ollama daemon is expected up
-/// already, so refusal should be near-instant.
-fn readiness_deadline(child_spawned: bool) -> Option<std::time::Duration> {
-    if child_spawned {
-        None
-    } else {
-        Some(std::time::Duration::from_secs(3))
-    }
-}
-
-/// Poll `{endpoint}{ready_path}` until it answers 2xx. With a spawned child
-/// this loops indefinitely - the child exiting is the only failure mode; a
-/// notice after 5 s and a heartbeat every 60 s keep the user informed. Each
-/// iteration blocks at most ~800 ms (300 ms connect + 500 ms read in
-/// `http_get_local`, plus a 250 ms sleep), so Ctrl-C - which kills paddock and
-/// the child together via default tty behavior - feels instant.
-fn wait_ready(plan: &ServePlan, mut child: Option<&mut std::process::Child>) -> Result<()> {
-    use std::time::{Duration, Instant};
-
-    let url = format!("{}{}", plan.endpoint, plan.ready_path);
-    let deadline = readiness_deadline(child.is_some());
-    let start = Instant::now();
-    let mut notified = false;
-    let mut next_heartbeat = Duration::from_secs(60);
-    loop {
-        if RealSystemProbe.http_get_local(&url).is_some() {
-            return Ok(());
-        }
-        if let Some(c) = child.as_deref_mut()
-            && let Some(status) = c.try_wait()?
-        {
-            let argv = plan.server_argv.as_deref().unwrap_or_default().join(" ");
-            bail!(
-                "server exited with {status} before becoming ready - \
-                     run `{argv}` manually to see the error"
-            );
-        }
-        if let Some(deadline) = deadline
-            && start.elapsed() >= deadline
-        {
-            bail!("ollama daemon not reachable on 11434 - is it running?");
-        }
-        if !notified && start.elapsed() >= Duration::from_secs(5) {
-            eprintln!("downloading/loading model - this can take a while");
-            notified = true;
-        }
-        if start.elapsed() >= next_heartbeat {
-            eprintln!("still waiting for {} - Ctrl-C to stop", plan.endpoint);
-            next_heartbeat += Duration::from_secs(60);
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-}
-
-/// Spawn a server child, with an actionable error when the binary is missing.
-fn spawn_checked(argv: &[String]) -> Result<std::process::Child> {
-    std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to start {}: {e}. Is it in PATH?", argv[0]))
-}
-
-// libc-free, matching serving.rs style: detach into a new session.
-unsafe extern "C" {
-    #[link_name = "setsid"]
-    fn libc_setsid() -> i32;
-}
-
-/// Spawn a server child detached from the controlling terminal, with stdout +
-/// stderr captured to `log_path`. Returns the child handle (its PID is the
-/// session leader). Dropping the handle does NOT kill the process.
-fn spawn_detached(argv: &[String], log_path: &std::path::Path) -> Result<std::process::Child> {
-    use std::os::unix::process::CommandExt;
-
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("cannot create log dir {parent:?}: {e}"))?;
-    }
-    let log = std::fs::File::create(log_path)
-        .map_err(|e| anyhow::anyhow!("cannot create log file {log_path:?}: {e}"))?;
-    let log_err = log.try_clone().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut cmd = std::process::Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .stdin(std::process::Stdio::null())
-        .stdout(log)
-        .stderr(log_err);
-    // SAFETY: setsid only creates a new session; async-signal-safe, no allocation.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc_setsid();
-            Ok(())
-        });
-    }
-    cmd.spawn()
-        .map_err(|e| anyhow::anyhow!("failed to start {}: {e}. Is it in PATH?", argv[0]))
 }
 
 fn stop_servers(target: &str, yes: bool) -> Result<()> {
-    use paddock_core::catalog::RuntimeKind;
-    use paddock_core::serving::{RecordMatch, match_records, terminate};
+    use crate::lifecycle::{resolve_servers, stop_records};
 
-    let registry = Registry::open_default();
-    let records = registry.list_live(&RealSystemProbe);
-    let chosen = match match_records(&records, target) {
-        RecordMatch::Matched(v) => v,
-        RecordMatch::Ambiguous(cands) => {
-            eprintln!("`{target}` matches several servers - be specific:");
-            for r in cands {
-                eprintln!("  {} (pid {})", r.model_ref, r.pid);
-            }
-            std::process::exit(1);
-        }
-        RecordMatch::NotFound => {
-            eprintln!("no running server matches `{target}`");
-            if !records.is_empty() {
-                eprintln!(
-                    "running: {}",
-                    records
-                        .iter()
-                        .map(|r| r.model_ref.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            std::process::exit(1);
-        }
-    };
+    let chosen = resolve_servers(target).map_err(cli_fail)?;
 
     if target == "all" && !yes {
         eprintln!("about to stop {} server(s):", chosen.len());
@@ -600,14 +301,8 @@ fn stop_servers(target: &str, yes: bool) -> Result<()> {
         }
     }
 
-    for r in chosen {
-        if r.runtime == RuntimeKind::Ollama {
-            let _ = run_checked(&["ollama".into(), "stop".into(), r.model_ref.clone()]);
-        } else {
-            terminate(r.pid);
-        }
-        let _ = registry.unregister(r.pid);
-        println!("stopped {} (pid {})", r.model_ref, r.pid);
+    for s in stop_records(chosen, &StderrProgress) {
+        println!("stopped {} (pid {})", s.model_ref, s.pid);
     }
     Ok(())
 }
@@ -804,31 +499,17 @@ fn bench_server(app: &App, target: Option<&str>, tokens: u32, json: bool) -> Res
     Ok(())
 }
 
-/// Run a pre-step to completion (stdout/stderr inherited - progress streams
-/// to the tty) and fail on non-zero exit.
-fn run_checked(argv: &[String]) -> Result<()> {
-    let cmd = argv.join(" ");
-    let status = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .status()
-        .with_context(|| format!("running `{cmd}`"))?;
-    if !status.success() {
-        bail!("`{cmd}` failed ({status}); fix it and retry");
-    }
-    Ok(())
-}
-
 /// Shared launch path for `paddock run` and the TUI: confirm any required
 /// runtime install (never auto-install), then replace this process with the
 /// run command. Keeping confirmation here keeps the guarantee in one place.
 pub(crate) fn launch(plan: RunPlan) -> Result<()> {
     if let Some(install) = &plan.install {
-        confirm_and_install(install)?;
+        confirm_and_install(install).map_err(cli_fail)?;
     }
     exec(&plan.argv)
 }
 
-fn confirm_and_install(install: &InstallPlan) -> Result<()> {
+pub(crate) fn confirm_and_install(install: &InstallPlan) -> Result<(), LifecycleError> {
     use std::io::IsTerminal;
 
     let cmd = install
@@ -845,13 +526,14 @@ fn confirm_and_install(install: &InstallPlan) -> Result<()> {
         std::process::exit(1);
     }
     eprint!("required runtime is not installed. install with `{cmd}`? [y/N] ");
-    std::io::stderr().flush()?;
+    std::io::stderr().flush().map_err(anyhow::Error::from)?;
     let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(anyhow::Error::from)?;
     let answer = answer.trim().to_ascii_lowercase();
     if answer != "y" && answer != "yes" {
-        eprintln!("install declined - nothing launched. Run `{cmd}` yourself, then retry.");
-        std::process::exit(1);
+        return Err(LifecycleError::InstallDeclined { command: cmd });
     }
     // Check the installer binary exists before running it (avoid exec-ENOENT).
     let installer = &install.argv[0];
@@ -864,7 +546,7 @@ fn confirm_and_install(install: &InstallPlan) -> Result<()> {
         .status()
         .with_context(|| format!("running `{cmd}`"))?;
     if !status.success() {
-        bail!("`{cmd}` failed ({status}); fix the install and retry");
+        return Err(anyhow::anyhow!("`{cmd}` failed ({status}); fix the install and retry").into());
     }
     Ok(())
 }
@@ -887,33 +569,6 @@ fn find_in_path(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-enum Lookup<'a> {
-    Found(&'a CatalogModel),
-    Ambiguous(Vec<&'a str>),
-    NotFound,
-}
-
-/// Exact name match first, then case-insensitive exact, then
-/// case-insensitive contains.
-fn find_model<'a>(models: &'a [CatalogModel], query: &str) -> Lookup<'a> {
-    if let Some(m) = models.iter().find(|m| m.name == query) {
-        return Lookup::Found(m);
-    }
-    let q = query.to_lowercase();
-    if let Some(m) = models.iter().find(|m| m.name.to_lowercase() == q) {
-        return Lookup::Found(m);
-    }
-    let matches: Vec<&CatalogModel> = models
-        .iter()
-        .filter(|m| m.name.to_lowercase().contains(&q))
-        .collect();
-    match matches.as_slice() {
-        [] => Lookup::NotFound,
-        [one] => Lookup::Found(one),
-        many => Lookup::Ambiguous(many.iter().map(|m| m.name.as_str()).collect()),
-    }
-}
-
 /// Replace this process with the run command. Shared with the TUI (Task 7).
 pub(crate) fn exec(argv: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt;
@@ -922,131 +577,4 @@ pub(crate) fn exec(argv: &[String]) -> Result<()> {
         "failed to launch {}: {err}. Is it in PATH?",
         argv[0]
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn model(name: &str) -> CatalogModel {
-        CatalogModel {
-            id: 0,
-            name: name.to_string(),
-            family: None,
-            source: paddock_core::catalog::Source::HuggingFace,
-            repo: None,
-            params_total: 8_000_000_000,
-            params_active: 8_000_000_000,
-            architecture: None,
-            context_max: 8192,
-            released_at: None,
-            released_approx: false,
-            variants: vec![],
-        }
-    }
-
-    #[test]
-    fn exact_match_wins_over_contains() {
-        let models = vec![model("Llama3"), model("Llama3-70B")];
-        match find_model(&models, "Llama3") {
-            Lookup::Found(m) => assert_eq!(m.name, "Llama3"),
-            _ => panic!("expected exact match"),
-        }
-    }
-
-    #[test]
-    fn case_insensitive_exact_match_beats_ambiguous_contains() {
-        let models = vec![model("Llama3"), model("Llama3-70B")];
-        match find_model(&models, "llama3") {
-            Lookup::Found(m) => assert_eq!(m.name, "Llama3"),
-            other => panic!(
-                "expected case-insensitive exact match, got {}",
-                match other {
-                    Lookup::Ambiguous(_) => "Ambiguous",
-                    Lookup::NotFound => "NotFound",
-                    Lookup::Found(_) => unreachable!(),
-                }
-            ),
-        }
-    }
-
-    #[test]
-    fn contains_still_resolves_unique_substring() {
-        let models = vec![model("Llama3-70B"), model("Qwen2.5-Coder")];
-        match find_model(&models, "qwen") {
-            Lookup::Found(m) => assert_eq!(m.name, "Qwen2.5-Coder"),
-            _ => panic!("expected contains match"),
-        }
-    }
-
-    #[test]
-    fn ambiguous_when_no_exact_and_multiple_contains() {
-        let models = vec![model("Llama3-8B"), model("Llama3-70B")];
-        match find_model(&models, "llama3") {
-            Lookup::Ambiguous(names) => assert_eq!(names.len(), 2),
-            _ => panic!("expected ambiguous"),
-        }
-    }
-
-    #[test]
-    fn not_found_when_nothing_matches() {
-        let models = vec![model("Llama3")];
-        assert!(matches!(find_model(&models, "mistral"), Lookup::NotFound));
-    }
-
-    /// Minimal valid `ModelVariant` for resolve_quant tests. `bpw` is the only
-    /// field `variants_by_quality` uses (after the quant ladder), so collisions
-    /// are made deterministic by giving the better variant a higher `bpw`.
-    fn mv(quant: &str, bpw: f64) -> ModelVariant {
-        ModelVariant {
-            model_name: "test".into(),
-            quant: quant.into(),
-            bpw,
-            params_total: 8_000_000_000,
-            params_active: 8_000_000_000,
-            layers: 32,
-            kv_heads: 8,
-            head_dim: 128,
-            embedding_dim: 4096,
-            context_max: 8192,
-        }
-    }
-
-    #[test]
-    fn resolve_quant_exact_and_case_insensitive() {
-        let vs = vec![mv("Q8_0", 8.5), mv("Q4_K_M", 4.83), mv("Q2_K", 3.35)];
-        assert_eq!(resolve_quant(&vs, "Q4_K_M").unwrap(), 1);
-        assert_eq!(resolve_quant(&vs, "q4_k_m").unwrap(), 1);
-    }
-
-    #[test]
-    fn resolve_quant_collision_picks_best_quality() {
-        // Same quant label, different bpw: variants_by_quality orders higher bpw
-        // first, so the index 1 variant (higher bpw) must win.
-        let vs = vec![mv("Q4_K_M", 4.5), mv("Q4_K_M", 5.0)];
-        assert_eq!(resolve_quant(&vs, "Q4_K_M").unwrap(), 1);
-    }
-
-    #[test]
-    fn resolve_quant_no_match_lists_available() {
-        let vs = vec![mv("Q8_0", 8.5), mv("Q4_K_M", 4.83)];
-        let err = resolve_quant(&vs, "Q3_K_M").unwrap_err().to_string();
-        assert!(err.contains("Q8_0"));
-        assert!(err.contains("Q4_K_M"));
-    }
-
-    #[test]
-    fn spawned_child_waits_without_deadline() {
-        // First-run model downloads can take tens of minutes; any fixed cap
-        // would kill a healthy child mid-download.
-        assert_eq!(readiness_deadline(true), None);
-    }
-
-    #[test]
-    fn daemon_probe_keeps_short_deadline() {
-        assert_eq!(
-            readiness_deadline(false),
-            Some(std::time::Duration::from_secs(3))
-        );
-    }
 }

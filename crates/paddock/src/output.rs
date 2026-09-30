@@ -129,20 +129,20 @@ pub fn print_fit_table(rows: &[ScoredModel]) {
     }
 }
 
+/// One row of `fit --json` and of the MCP `paddock_fit` result.
 #[derive(serde::Serialize)]
-struct FitRow<'a> {
-    name: &'a str,
-    released_at: Option<i64>,
-    released_approx: bool,
-    quant: &'a str,
-    memory: &'a paddock_core::estimate::MemoryEstimate,
-    speed: &'a paddock_core::estimate::SpeedEstimate,
-    score: &'a paddock_core::score::Score,
+pub struct FitRow<'a> {
+    pub name: &'a str,
+    pub released_at: Option<i64>,
+    pub released_approx: bool,
+    pub quant: &'a str,
+    pub memory: &'a paddock_core::estimate::MemoryEstimate,
+    pub speed: &'a paddock_core::estimate::SpeedEstimate,
+    pub score: &'a paddock_core::score::Score,
 }
 
-pub fn print_fit_json(rows: &[ScoredModel]) -> anyhow::Result<()> {
-    let out: Vec<FitRow> = rows
-        .iter()
+pub fn fit_rows(rows: &[ScoredModel]) -> Vec<FitRow<'_>> {
+    rows.iter()
         .map(|r| FitRow {
             name: &r.model.name,
             released_at: r.model.released_at,
@@ -152,8 +152,11 @@ pub fn print_fit_json(rows: &[ScoredModel]) -> anyhow::Result<()> {
             speed: &r.speed,
             score: &r.score,
         })
-        .collect();
-    println!("{}", serde_json::to_string_pretty(&out)?);
+        .collect()
+}
+
+pub fn print_fit_json(rows: &[ScoredModel]) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(&fit_rows(rows))?);
     Ok(())
 }
 
@@ -201,25 +204,28 @@ pub fn print_recommendations(rows: &[ScoredModel]) {
     }
 }
 
+/// One row of `recommend --json` and of the MCP `paddock_recommend` result.
 #[derive(serde::Serialize)]
-struct RecommendRow<'a> {
-    model: &'a str,
-    quant: &'a str,
-    score: f64,
-    justification: String,
+pub struct RecommendRow<'a> {
+    pub model: &'a str,
+    pub quant: &'a str,
+    pub score: f64,
+    pub justification: String,
 }
 
-pub fn print_recommendations_json(rows: &[ScoredModel]) -> anyhow::Result<()> {
-    let out: Vec<RecommendRow> = rows
-        .iter()
+pub fn recommend_rows(rows: &[ScoredModel]) -> Vec<RecommendRow<'_>> {
+    rows.iter()
         .map(|r| RecommendRow {
             model: &r.model.name,
             quant: &r.model.variants[r.variant_idx].quant,
             score: r.score.total,
             justification: justification(r),
         })
-        .collect();
-    println!("{}", serde_json::to_string_pretty(&out)?);
+        .collect()
+}
+
+pub fn print_recommendations_json(rows: &[ScoredModel]) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(&recommend_rows(rows))?);
     Ok(())
 }
 
@@ -318,10 +324,12 @@ pub fn uptime_label(started_at: i64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use paddock_core::catalog::RuntimeKind;
+    use paddock_core::catalog::{CatalogModel, CatalogVariant, RuntimeKind, Source};
+    use paddock_core::estimate::{DEFAULT_CONTEXT, MemoryBudget, estimate_memory, estimate_speed};
     use paddock_core::runtime::ServePlan;
+    use paddock_core::score::{UseCase, score_variant};
 
     fn ollama_plan(name: &str) -> ServePlan {
         ServePlan {
@@ -391,6 +399,68 @@ mod tests {
         assert_eq!(age_label(Some(NOW - 440 * DAY), false, NOW), "1.2y");
         assert_eq!(age_label(Some(NOW - 440 * DAY), true, NOW), "~1.2y");
         assert_eq!(age_label(Some(NOW + DAY), false, NOW), "0d"); // future clamps
+    }
+
+    pub(crate) fn scored() -> ScoredModel {
+        let model = CatalogModel {
+            id: 0,
+            name: "fake-model".into(),
+            family: Some("llama".into()),
+            source: Source::Ollama,
+            repo: None,
+            params_total: 1_000_000_000,
+            params_active: 1_000_000_000,
+            architecture: Some("llama".into()),
+            context_max: 8192,
+            released_at: None,
+            released_approx: false,
+            variants: vec![CatalogVariant {
+                quant: "Q4_K_M".into(),
+                bpw: 4.83,
+                file_size_bytes: None,
+                layers: 16,
+                kv_heads: 8,
+                head_dim: 64,
+                embedding_dim: 2048,
+                runtime_compat: vec![RuntimeKind::Ollama],
+                source_tag: None,
+            }],
+        };
+        let budget = MemoryBudget {
+            gpu_effective_bytes: 16 << 30,
+            ram_total_bytes: 16 << 30,
+        };
+        let mv = model.to_model_variant(&model.variants[0]);
+        let memory = estimate_memory(&mv, DEFAULT_CONTEXT, &budget);
+        let speed = estimate_speed(&mv, 400.0, memory.kv_cache_bytes);
+        let score = score_variant(&mv, &memory, &speed, UseCase::General, None);
+        ScoredModel {
+            model,
+            variant_idx: 0,
+            memory,
+            speed,
+            score,
+        }
+    }
+
+    #[test]
+    fn fit_rows_serialize_with_fit_json_keys() {
+        let rows = vec![scored()];
+        let v = serde_json::to_value(fit_rows(&rows)).unwrap();
+        let first = &v[0];
+        assert_eq!(first["name"], "fake-model");
+        assert_eq!(first["quant"], "Q4_K_M");
+        assert!(first["memory"]["total_bytes"].is_u64());
+        assert!(first["speed"]["generation_tps"].is_number());
+        assert!(first["score"]["total"].is_number());
+    }
+
+    #[test]
+    fn recommend_rows_carry_justification() {
+        let rows = vec![scored()];
+        let v = serde_json::to_value(recommend_rows(&rows)).unwrap();
+        assert_eq!(v[0]["model"], "fake-model");
+        assert!(v[0]["justification"].as_str().unwrap().contains("tok/s"));
     }
 }
 
