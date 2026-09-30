@@ -4,16 +4,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-/// How long a session may take to answer every request before the test fails.
-const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a session may take to answer every request before the test
+/// fails. It only guards against hangs: sessions run in parallel and share
+/// slow host probes, so keep it generous.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Returns the command plus the tempdir guard that owns the isolated catalog
 /// DB, serving registry and calibration file.
@@ -73,25 +75,48 @@ fn call(id: u64, tool: &str, args: Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":tool,"arguments":args}})
 }
 
+/// Kills (and reaps) the server on drop, so no panic path can leave a
+/// `paddock mcp` process running.
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Parse one stdout line and require it to be a JSON-RPC 2.0 message: stdout
+/// is the protocol channel, anything else there is pollution.
+fn parse_jsonrpc(line: &str) -> Value {
+    let v: Value = serde_json::from_str(line)
+        .unwrap_or_else(|e| panic!("stdout line is not JSON ({e}): {line}"));
+    assert_eq!(
+        v["jsonrpc"], "2.0",
+        "stdout line is not JSON-RPC 2.0: {line}"
+    );
+    v
+}
+
 /// Run one session: `initialize` + `initialized` + `requests`. Stdin stays
 /// open until every request id has a response (so no reply can be lost to an
 /// early EOF), then it is closed and the server must exit cleanly. Every
-/// stdout line must be JSON: stdout is the protocol channel. Returns
-/// responses keyed by id.
+/// stdout line must be JSON-RPC. Returns responses keyed by id.
 fn session(cmd: &mut Command, requests: Vec<Value>) -> HashMap<u64, Value> {
     let mut messages = initialize();
     messages.extend(requests);
     let mut pending: HashSet<u64> = messages.iter().filter_map(|m| m["id"].as_u64()).collect();
 
-    let mut child = cmd
-        .arg("mcp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn paddock mcp");
+    let mut child = ChildGuard(
+        cmd.arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn paddock mcp"),
+    );
 
-    let stdout = child.stdout.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel::<String>();
     let out_reader = thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
@@ -101,14 +126,14 @@ fn session(cmd: &mut Command, requests: Vec<Value>) -> HashMap<u64, Value> {
             }
         }
     });
-    let mut stderr = child.stderr.take().unwrap();
+    let mut stderr = child.0.stderr.take().unwrap();
     let err_reader = thread::spawn(move || {
         let mut s = String::new();
         let _ = stderr.read_to_string(&mut s);
         s
     });
 
-    let mut stdin = child.stdin.take().unwrap();
+    let mut stdin = child.0.stdin.take().unwrap();
     for m in &messages {
         writeln!(stdin, "{m}").expect("write to paddock mcp stdin");
     }
@@ -124,20 +149,27 @@ fn session(cmd: &mut Command, requests: Vec<Value>) -> HashMap<u64, Value> {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let v: Value = serde_json::from_str(&line)
-                    .unwrap_or_else(|e| panic!("stdout line is not JSON-RPC ({e}): {line}"));
+                let v = parse_jsonrpc(&line);
                 received.push(line);
                 if let Some(id) = v["id"].as_u64() {
                     pending.remove(&id);
                     by_id.insert(id, v);
                 }
             }
-            Err(_) => {
-                let _ = child.kill();
+            Err(e) => {
+                let what = match e {
+                    RecvTimeoutError::Timeout => {
+                        format!("no response for ids {pending:?} within {SESSION_TIMEOUT:?}")
+                    }
+                    RecvTimeoutError::Disconnected => {
+                        format!("server closed stdout before answering ids {pending:?}")
+                    }
+                };
                 drop(stdin);
+                drop(child);
                 let stderr = err_reader.join().unwrap_or_default();
                 panic!(
-                    "no response for ids {pending:?} within {SESSION_TIMEOUT:?}\nreceived:\n{}\nstderr:\n{stderr}",
+                    "{what}\nreceived:\n{}\nstderr:\n{stderr}",
                     received.join("\n")
                 );
             }
@@ -145,12 +177,11 @@ fn session(cmd: &mut Command, requests: Vec<Value>) -> HashMap<u64, Value> {
     }
 
     drop(stdin);
-    let status = child.wait().expect("wait for paddock mcp");
+    let status = child.0.wait().expect("wait for paddock mcp");
     out_reader.join().unwrap();
     // Anything printed after the last response must still be JSON-RPC.
     for line in rx.try_iter().filter(|l| !l.trim().is_empty()) {
-        serde_json::from_str::<Value>(&line)
-            .unwrap_or_else(|e| panic!("stdout line is not JSON-RPC ({e}): {line}"));
+        parse_jsonrpc(&line);
     }
     let stderr = err_reader.join().unwrap();
     assert!(
@@ -348,15 +379,13 @@ fn unknown_tool_does_not_kill_session() {
             call(4, "paddock_ps", json!({})),
         ],
     );
-    assert!(
-        r[&2].get("error").is_some() || r[&2]["result"]["isError"] == true,
-        "{}",
-        r[&2]
-    );
-    assert!(
-        r[&3].get("error").is_some() || r[&3]["result"]["isError"] == true,
-        "{}",
-        r[&3]
-    );
+    // Unknown tool name: rmcp answers with a JSON-RPC invalid-params error.
+    assert_eq!(r[&2]["error"]["code"], -32602, "{}", r[&2]);
+    assert_eq!(r[&2]["error"]["message"], "tool not found", "{}", r[&2]);
+    // Missing required argument: a tool-level error result, not a protocol error.
+    assert!(r[&3].get("error").is_none(), "{}", r[&3]);
+    assert_eq!(r[&3]["result"]["isError"], true, "{}", r[&3]);
+    let text = r[&3]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing field `target`"), "{text}");
     assert_eq!(structured(&r[&4])["running"], json!([]));
 }
