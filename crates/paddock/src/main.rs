@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod clipboard;
+mod lifecycle;
 mod output;
 mod tray;
 mod tui;
@@ -9,16 +10,14 @@ use std::io::Write;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use paddock_core::PaddockError;
-use paddock_core::catalog::CatalogModel;
-use paddock_core::estimate::ModelVariant;
 use paddock_core::hardware::{RealSystemProbe, SystemProbe};
 use paddock_core::runtime::{InstallPlan, RunPlan, ServePlan, plan_run, plan_serve};
-use paddock_core::score::{UseCase, best_variant};
+use paddock_core::score::UseCase;
 use paddock_core::serving::{Registry, ServingRecord};
 
 use crate::app::App;
 use crate::cli::{Cli, Command};
+use crate::lifecycle::{LifecycleError, resolve_model, resolved_ctx};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -130,6 +129,22 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// CLI rendering of lifecycle errors. The interactive-disambiguation cases
+/// print exactly today's multi-line message and exit 1; everything else
+/// propagates through anyhow (Rust prints `Error: <Display>`, as `bail!` did).
+fn cli_fail(e: LifecycleError) -> anyhow::Error {
+    match e {
+        LifecycleError::Ambiguous { .. }
+        | LifecycleError::AmbiguousServer { .. }
+        | LifecycleError::NoServerMatch { .. }
+        | LifecycleError::InstallDeclined { .. } => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        other => other.into(),
+    }
+}
+
 /// Default listing shared by `paddock fit` and bare `paddock --cli/--json`.
 fn fit(app: &App, all: bool, use_case: UseCase, limit: usize, json: bool) -> Result<()> {
     let db = app.open_db()?;
@@ -146,80 +161,6 @@ fn fit(app: &App, all: bool, use_case: UseCase, limit: usize, json: bool) -> Res
     Ok(())
 }
 
-/// Catalog lookup + best-fitting variant pick, shared by `run` and `serve`.
-/// Returns the model and the index into `model.variants` of the chosen quant.
-/// Exits the process on an ambiguous name (interactive disambiguation UX).
-fn resolve_model(app: &App, query: &str, quant: Option<&str>) -> Result<(CatalogModel, usize)> {
-    let db = app.open_db()?;
-    let models = db.list_models().context("reading catalog")?;
-    let model = match find_model(&models, query) {
-        Lookup::Found(m) => m.clone(),
-        Lookup::Ambiguous(names) => {
-            eprintln!("model name `{query}` is ambiguous - candidates:");
-            for n in names {
-                eprintln!("  {n}");
-            }
-            std::process::exit(1);
-        }
-        Lookup::NotFound => return Err(PaddockError::ModelNotFound(query.to_string()).into()),
-    };
-
-    let mvs: Vec<_> = model
-        .variants
-        .iter()
-        .map(|v| model.to_model_variant(v))
-        .collect();
-
-    // Explicit --quant launches that variant even if it does not fit; the
-    // verdict is informational (consistent with the TUI quant picker).
-    if let Some(label) = quant {
-        let idx = resolve_quant(&mvs, label)?;
-        return Ok((model, idx));
-    }
-
-    let Some(best) = best_variant(&mvs, &app.budget) else {
-        bail!(
-            "no quantization of `{}` fits this machine ({} RAM); try a smaller model from `paddock fit`",
-            model.name,
-            output::gib(app.budget.ram_total_bytes)
-        );
-    };
-    // Pointer identity, not quant-label equality: two variants can share the
-    // same quant string, and `best` borrows from `mvs` (same order as
-    // `model.variants`).
-    let best_idx = mvs
-        .iter()
-        .position(|v| std::ptr::eq(v, best))
-        .expect("best_variant borrows from mvs");
-    Ok((model, best_idx))
-}
-
-/// Index into `variants` of the variant whose quant label equals `label`
-/// (case-insensitive). On a label shared by several variants, returns the
-/// best-quality one (first in `variants_by_quality` order). Errors listing the
-/// available quants when nothing matches. Backs `--quant` on `run`/`serve`.
-fn resolve_quant(variants: &[ModelVariant], label: &str) -> Result<usize> {
-    let order = paddock_core::score::variants_by_quality(variants);
-    if let Some(&idx) = order
-        .iter()
-        .find(|&&i| variants[i].quant.eq_ignore_ascii_case(label))
-    {
-        return Ok(idx);
-    }
-    let available: Vec<&str> = order.iter().map(|&i| variants[i].quant.as_str()).collect();
-    bail!(
-        "no quant `{label}` for this model; available: {}",
-        available.join(", ")
-    );
-}
-
-/// Resolve the launch context for a chosen model variant: explicit `--ctx`
-/// wins, otherwise auto-size against this machine's memory budget.
-fn resolved_ctx(app: &App, model: &CatalogModel, idx: usize, ctx: Option<u32>) -> u32 {
-    let mv = model.to_model_variant(&model.variants[idx]);
-    paddock_core::estimate::resolve_ctx(ctx, &mv, &app.budget, model.context_max)
-}
-
 fn run_model(
     app: &App,
     query: &str,
@@ -227,7 +168,7 @@ fn run_model(
     quant: Option<String>,
     json: bool,
 ) -> Result<()> {
-    let (model, idx) = resolve_model(app, query, quant.as_deref())?;
+    let (model, idx) = resolve_model(app, query, quant.as_deref()).map_err(cli_fail)?;
 
     // API delta vs the original plan: plan_run is fallible (repo-less HF/MLX
     // models, non-GGUF quants). Surface the actionable error and exit non-zero.
@@ -253,7 +194,7 @@ fn serve_model(
     quant: Option<String>,
     json: bool,
 ) -> Result<()> {
-    let (model, idx) = resolve_model(app, query, quant.as_deref())?;
+    let (model, idx) = resolve_model(app, query, quant.as_deref()).map_err(cli_fail)?;
     let ctx = Some(resolved_ctx(app, &model, idx, ctx));
     let plan = plan_serve(
         &model,
@@ -887,33 +828,6 @@ fn find_in_path(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-enum Lookup<'a> {
-    Found(&'a CatalogModel),
-    Ambiguous(Vec<&'a str>),
-    NotFound,
-}
-
-/// Exact name match first, then case-insensitive exact, then
-/// case-insensitive contains.
-fn find_model<'a>(models: &'a [CatalogModel], query: &str) -> Lookup<'a> {
-    if let Some(m) = models.iter().find(|m| m.name == query) {
-        return Lookup::Found(m);
-    }
-    let q = query.to_lowercase();
-    if let Some(m) = models.iter().find(|m| m.name.to_lowercase() == q) {
-        return Lookup::Found(m);
-    }
-    let matches: Vec<&CatalogModel> = models
-        .iter()
-        .filter(|m| m.name.to_lowercase().contains(&q))
-        .collect();
-    match matches.as_slice() {
-        [] => Lookup::NotFound,
-        [one] => Lookup::Found(one),
-        many => Lookup::Ambiguous(many.iter().map(|m| m.name.as_str()).collect()),
-    }
-}
-
 /// Replace this process with the run command. Shared with the TUI (Task 7).
 pub(crate) fn exec(argv: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt;
@@ -927,113 +841,6 @@ pub(crate) fn exec(argv: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn model(name: &str) -> CatalogModel {
-        CatalogModel {
-            id: 0,
-            name: name.to_string(),
-            family: None,
-            source: paddock_core::catalog::Source::HuggingFace,
-            repo: None,
-            params_total: 8_000_000_000,
-            params_active: 8_000_000_000,
-            architecture: None,
-            context_max: 8192,
-            released_at: None,
-            released_approx: false,
-            variants: vec![],
-        }
-    }
-
-    #[test]
-    fn exact_match_wins_over_contains() {
-        let models = vec![model("Llama3"), model("Llama3-70B")];
-        match find_model(&models, "Llama3") {
-            Lookup::Found(m) => assert_eq!(m.name, "Llama3"),
-            _ => panic!("expected exact match"),
-        }
-    }
-
-    #[test]
-    fn case_insensitive_exact_match_beats_ambiguous_contains() {
-        let models = vec![model("Llama3"), model("Llama3-70B")];
-        match find_model(&models, "llama3") {
-            Lookup::Found(m) => assert_eq!(m.name, "Llama3"),
-            other => panic!(
-                "expected case-insensitive exact match, got {}",
-                match other {
-                    Lookup::Ambiguous(_) => "Ambiguous",
-                    Lookup::NotFound => "NotFound",
-                    Lookup::Found(_) => unreachable!(),
-                }
-            ),
-        }
-    }
-
-    #[test]
-    fn contains_still_resolves_unique_substring() {
-        let models = vec![model("Llama3-70B"), model("Qwen2.5-Coder")];
-        match find_model(&models, "qwen") {
-            Lookup::Found(m) => assert_eq!(m.name, "Qwen2.5-Coder"),
-            _ => panic!("expected contains match"),
-        }
-    }
-
-    #[test]
-    fn ambiguous_when_no_exact_and_multiple_contains() {
-        let models = vec![model("Llama3-8B"), model("Llama3-70B")];
-        match find_model(&models, "llama3") {
-            Lookup::Ambiguous(names) => assert_eq!(names.len(), 2),
-            _ => panic!("expected ambiguous"),
-        }
-    }
-
-    #[test]
-    fn not_found_when_nothing_matches() {
-        let models = vec![model("Llama3")];
-        assert!(matches!(find_model(&models, "mistral"), Lookup::NotFound));
-    }
-
-    /// Minimal valid `ModelVariant` for resolve_quant tests. `bpw` is the only
-    /// field `variants_by_quality` uses (after the quant ladder), so collisions
-    /// are made deterministic by giving the better variant a higher `bpw`.
-    fn mv(quant: &str, bpw: f64) -> ModelVariant {
-        ModelVariant {
-            model_name: "test".into(),
-            quant: quant.into(),
-            bpw,
-            params_total: 8_000_000_000,
-            params_active: 8_000_000_000,
-            layers: 32,
-            kv_heads: 8,
-            head_dim: 128,
-            embedding_dim: 4096,
-            context_max: 8192,
-        }
-    }
-
-    #[test]
-    fn resolve_quant_exact_and_case_insensitive() {
-        let vs = vec![mv("Q8_0", 8.5), mv("Q4_K_M", 4.83), mv("Q2_K", 3.35)];
-        assert_eq!(resolve_quant(&vs, "Q4_K_M").unwrap(), 1);
-        assert_eq!(resolve_quant(&vs, "q4_k_m").unwrap(), 1);
-    }
-
-    #[test]
-    fn resolve_quant_collision_picks_best_quality() {
-        // Same quant label, different bpw: variants_by_quality orders higher bpw
-        // first, so the index 1 variant (higher bpw) must win.
-        let vs = vec![mv("Q4_K_M", 4.5), mv("Q4_K_M", 5.0)];
-        assert_eq!(resolve_quant(&vs, "Q4_K_M").unwrap(), 1);
-    }
-
-    #[test]
-    fn resolve_quant_no_match_lists_available() {
-        let vs = vec![mv("Q8_0", 8.5), mv("Q4_K_M", 4.83)];
-        let err = resolve_quant(&vs, "Q3_K_M").unwrap_err().to_string();
-        assert!(err.contains("Q8_0"));
-        assert!(err.contains("Q4_K_M"));
-    }
 
     #[test]
     fn spawned_child_waits_without_deadline() {
