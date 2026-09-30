@@ -35,16 +35,15 @@ paddock knows which LLMs fit this Apple Silicon Mac, how fast they run, and how 
 Workflow: paddock_scan (hardware) -> paddock_fit or paddock_recommend (ranked models) -> \
 paddock_serve (start one, get an endpoint) -> paddock_ps / paddock_stop (manage).
 paddock_serve blocks until the model is loaded, up to timeout_secs (default 600); a first \
-run may download a multi-GB model. status \"ready\" means the model is loaded, for every \
-runtime. status \"starting\" means the timeout elapsed first and the server is still coming \
-up. With runtime \"ollama\" the model is still downloading or loading: call paddock_serve \
-again later with the same arguments (it returns ready once done); pid is the `ollama pull` \
-process while downloading, null while loading, and log_path is null. With runtime \
-\"llama_cpp\" the server is loading: poll paddock_ps until it is listed, then use the \
-endpoint; if it never appears the server may have exited, and log_path from the starting \
-result holds its log. With runtime \"mlx_lm\" the model is still downloading/loading: the \
-server is already listed in paddock_ps (it answers HTTP early), and a request to openai_url \
-blocks until the load finishes; log_path holds its log.
+run may download a multi-GB model. status \"ready\" means the model is loaded, unless the \
+warm-up request failed, in which case it loads on the first request. status \"starting\" \
+means the timeout elapsed first and the server is still coming up. With runtime \
+\"llama_cpp\" or \"mlx_lm\" the server is registered and already listed in paddock_ps \
+(listed means running, not necessarily loaded); a request to openai_url waits until the \
+model has loaded. If it disappears from paddock_ps it exited: read log_path from the \
+starting result. With runtime \"ollama\" call paddock_serve again later with the same \
+arguments (it returns ready once done); pid and log_path are those of the process paddock \
+started (the `ollama pull`, or the `ollama serve` daemon on a cold start), otherwise null.
 Calling paddock_serve again for a llama.cpp / mlx model that is already running starts another \
 instance on the next free port: check paddock_ps first and reuse a listed endpoint.
 openai_url speaks the OpenAI chat-completions protocol; put model_ref in the `model` field.
@@ -400,7 +399,7 @@ impl PaddockMcp {
 
     #[tool(
         name = "paddock_serve",
-        description = "Start serving a catalog model with the best available runtime and return an OpenAI-compatible endpoint. Picks the best fitting quant unless `quant` is given. Blocks until the model is loaded (up to timeout_secs, default 600; a first run may download the model): status \"ready\" means loaded, for every runtime. status \"starting\" means the timeout elapsed first: with runtime \"ollama\" the model is still downloading or loading, so call paddock_serve again later with the same arguments (it returns ready once done; pid is the `ollama pull` process while downloading, null while loading; log_path is null); with \"llama_cpp\" the server is loading, so poll paddock_ps (log_path holds its log); with \"mlx_lm\" the model is still downloading/loading, the server is already listed in paddock_ps (it answers HTTP early) and a request to openai_url blocks until the load finishes. Calling it again for a llama.cpp / mlx model that is already running starts another instance on the next free port, so check paddock_ps first. Never installs a runtime: a no_runtime error carries the command for the user."
+        description = "Start serving a catalog model with the best available runtime and return an OpenAI-compatible endpoint. Picks the best fitting quant unless `quant` is given. Blocks until the model is loaded (up to timeout_secs, default 600; a first run may download the model): status \"ready\" means loaded, unless the warm-up request failed (then the model loads on the first request). status \"starting\" means the timeout elapsed first: with runtime \"llama_cpp\" or \"mlx_lm\" the server is registered and already listed in paddock_ps (listed = running, not necessarily loaded) and a request to openai_url waits until the model has loaded; if it disappears from paddock_ps it exited, read log_path. With \"ollama\" call paddock_serve again later with the same arguments; pid and log_path are those of the process paddock started (the `ollama pull`, or the `ollama serve` daemon on a cold start), otherwise null. Calling it again for a llama.cpp / mlx model that is already running starts another instance on the next free port, so check paddock_ps first. Never installs a runtime: a no_runtime error carries the command for the user."
     )]
     async fn serve(&self, Parameters(input): Parameters<ServeInput>) -> CallToolResult {
         let app = self.app.clone();
@@ -506,11 +505,13 @@ const STANDARD_DIRS: &[&str] = &[
 
 /// `current` with every standard runtime dir it lacks appended, in order.
 /// Existing entries stay first and untouched; nothing is duplicated; with no
-/// `home`, the home-relative dirs are skipped.
+/// `home` (or an empty / relative one), the home-relative dirs are skipped.
 pub(crate) fn augmented_path(
     current: Option<&std::ffi::OsStr>,
     home: Option<&std::path::Path>,
 ) -> std::ffi::OsString {
+    // An empty or relative HOME would add cwd-relative entries: skip it.
+    let home = home.filter(|h| h.is_absolute());
     let mut dirs: Vec<PathBuf> = match current {
         Some(p) if !p.is_empty() => std::env::split_paths(p).collect(),
         _ => Vec::new(),
@@ -819,6 +820,22 @@ mod tests {
     }
 
     #[test]
+    fn augmented_path_ignores_empty_or_relative_home() {
+        // No cwd-relative PATH entries: an empty or relative HOME is treated
+        // as no HOME.
+        let want = vec![
+            "/usr/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/Applications/Ollama.app/Contents/Resources",
+        ];
+        for home in ["", "relative/home", "."] {
+            let p = augmented_path(Some("/usr/bin".as_ref()), Some(std::path::Path::new(home)));
+            assert_eq!(split(&p), want, "HOME={home:?}");
+        }
+    }
+
+    #[test]
     fn augmented_path_without_home_skips_home_relative_dirs() {
         let p = augmented_path(Some("/usr/bin".as_ref()), None);
         assert_eq!(
@@ -834,9 +851,16 @@ mod tests {
 
     #[test]
     fn instructions_explain_ready_and_mlx_starting() {
-        assert!(INSTRUCTIONS.contains("\"ready\" means the model is loaded, for every"));
-        assert!(INSTRUCTIONS.contains("\"mlx_lm\" the model is still downloading/loading"));
-        assert!(INSTRUCTIONS.contains("blocks until the load finishes"));
+        assert!(INSTRUCTIONS.contains(
+            "unless the \
+warm-up request failed"
+        ));
+        assert!(INSTRUCTIONS.contains("listed means running, not necessarily loaded"));
+        assert!(INSTRUCTIONS.contains(
+            "waits until the \
+model has loaded"
+        ));
+        assert!(!INSTRUCTIONS.contains("answers HTTP early"));
         assert!(!INSTRUCTIONS.contains('\u{2014}'));
     }
 

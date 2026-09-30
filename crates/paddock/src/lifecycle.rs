@@ -1615,9 +1615,26 @@ mod tests {
 
     /// A stand-in for `mlx_lm.server` (python3 stdlib, no model): answers
     /// every GET 200 at once (readiness), and the POST warm-up either at once
-    /// (`fast`) or after 60 s (`hang`, a model still loading).
-    fn fake_mlx_argv(post: &str) -> Vec<String> {
-        const SCRIPT: &str = r#"
+    /// (`fast`) or after 60 s (`hang`, a model still loading). Its argv
+    /// carries a unique marker; dropping the guard kills every process with
+    /// that marker, so no failure path (unexpected variant, failed assert,
+    /// panic) leaks the server.
+    struct FakeMlx {
+        marker: String,
+    }
+
+    static FAKE_MLX_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    impl FakeMlx {
+        fn new() -> Self {
+            let n = FAKE_MLX_SEQ.fetch_add(1, Ordering::Relaxed);
+            Self {
+                marker: format!("paddock-fake-mlx-{}-{n}", std::process::id()),
+            }
+        }
+
+        fn argv(&self, post: &str) -> Vec<String> {
+            const SCRIPT: &str = r#"
 import sys, time, http.server
 mode = sys.argv[3]
 class H(http.server.BaseHTTPRequestHandler):
@@ -1636,35 +1653,46 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 http.server.HTTPServer(("127.0.0.1", int(sys.argv[2])), H).serve_forever()
 "#;
-        vec![
-            "python3".into(),
-            "-c".into(),
-            SCRIPT.into(),
-            "--port".into(),
-            "8080".into(),
-            post.into(),
-        ]
+            vec![
+                "python3".into(),
+                "-c".into(),
+                SCRIPT.into(),
+                "--port".into(),
+                "8080".into(),
+                post.into(),
+                self.marker.clone(),
+            ]
+        }
+
+        fn plan(&self, post: &str) -> ServePlan {
+            // Start the free-port search on an ephemeral port so parallel
+            // test runs do not race for 8080.
+            let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let mut plan = mlx_plan();
+            plan.server_argv = Some(self.argv(post));
+            plan.with_port(port)
+        }
     }
 
-    fn fake_mlx_plan(post: &str) -> ServePlan {
-        // Start the free-port search on an ephemeral port so parallel test
-        // runs do not race for 8080.
-        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut plan = mlx_plan();
-        plan.server_argv = Some(fake_mlx_argv(post));
-        plan.with_port(port)
+    impl Drop for FakeMlx {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", &self.marker])
+                .status();
+        }
     }
 
     #[test]
     fn serve_detached_mlx_waits_for_warm_up_then_is_ready() {
         let dir = tempfile::tempdir().unwrap();
         let _env = ServingDirGuard::isolate(dir.path());
+        let fake = FakeMlx::new();
         let outcome = serve(
-            fake_mlx_plan("fast"),
+            fake.plan("fast"),
             ServeMode::Detached,
             InstallPolicy::Refuse,
             Some(Duration::from_secs(20)),
@@ -1673,7 +1701,6 @@ http.server.HTTPServer(("127.0.0.1", int(sys.argv[2])), H).serve_forever()
         .expect("fake mlx server answers readiness and warm-up");
         let pid = outcome.pid.expect("spawned child");
         let registered = dir.path().join(format!("{pid}.json")).exists();
-        paddock_core::serving::terminate(pid);
         assert!(registered, "ready mlx server must be registered");
     }
 
@@ -1681,44 +1708,36 @@ http.server.HTTPServer(("127.0.0.1", int(sys.argv[2])), H).serve_forever()
     fn serve_detached_mlx_warm_up_past_timeout_is_not_ready_and_registered() {
         let dir = tempfile::tempdir().unwrap();
         let _env = ServingDirGuard::isolate(dir.path());
+        let fake = FakeMlx::new();
         let t0 = Instant::now();
         let result = serve(
-            fake_mlx_plan("hang"),
+            fake.plan("hang"),
             ServeMode::Detached,
             InstallPolicy::Refuse,
             Some(Duration::from_secs(4)),
             &SilentProgress,
         );
-        let err = match result {
-            Err(e) => e,
-            Ok(outcome) => {
-                // Never leak the fake server when the assertion fails.
-                if let Some(pid) = outcome.pid {
-                    paddock_core::serving::terminate(pid);
-                }
-                panic!("expected NotReady, got ready (warm-up not awaited)");
-            }
-        };
         let elapsed = t0.elapsed();
-        let (pid, log_path) = match err {
-            LifecycleError::NotReady {
+        let (pid, log_path) = match result {
+            Err(LifecycleError::NotReady {
                 pid: Some(pid),
                 log_path,
                 ..
-            } => (pid, log_path),
-            other => panic!("expected NotReady with the server pid, got {other}"),
+            }) => (pid, log_path),
+            Ok(_) => panic!("expected NotReady, got ready (warm-up not awaited)"),
+            Err(other) => panic!("expected NotReady with the server pid, got {other}"),
         };
-        let alive = pid_alive(pid);
-        let registered = dir.path().join(format!("{pid}.json")).exists();
-        paddock_core::serving::terminate(pid);
+        assert!(
+            pid_alive(pid),
+            "server must keep running after a warm-up timeout"
+        );
+        assert!(
+            dir.path().join(format!("{pid}.json")).exists(),
+            "server must be registered after a warm-up timeout"
+        );
         assert!(
             elapsed < Duration::from_secs(8),
             "warm-up must be bounded by timeout, took {elapsed:?}"
-        );
-        assert!(alive, "server must keep running after a warm-up timeout");
-        assert!(
-            registered,
-            "server must be registered after a warm-up timeout"
         );
         let log_path = log_path.expect("server log path");
         assert!(log_path.ends_with(format!("{pid}.log")), "{log_path:?}");
