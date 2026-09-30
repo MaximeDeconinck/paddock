@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use paddock_core::catalog::RuntimeKind;
 use paddock_core::hardware::RealSystemProbe;
 use paddock_core::runtime::{ServePlan, plan_serve};
 use paddock_core::score::UseCase;
@@ -40,6 +41,10 @@ paddock_serve again later with the same arguments (it returns ready once the pul
 With llama.cpp / mlx the server is loading: poll paddock_ps until it is listed, then use the \
 endpoint; if it never appears the server may have exited, and log_path from the starting \
 result holds its log.
+For runtime \"ollama\" a starting result's pid is the `ollama pull` process (not a server) and \
+log_path is null.
+Calling paddock_serve again for a llama.cpp / mlx model that is already running starts another \
+instance on the next free port: check paddock_ps first and reuse a listed endpoint.
 openai_url speaks the OpenAI chat-completions protocol; put model_ref in the `model` field.
 An error with code \"no_runtime\" means a runtime (ollama, llama.cpp, mlx-lm) is not installed: \
 show install_command to the user and ask before anything is installed. paddock never installs \
@@ -195,6 +200,77 @@ pub(crate) fn reject_stop_target(target: &str) -> Option<CallToolResult> {
     })
 }
 
+/// Outcome of matching a stop target against the Ollama-loaded model names.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OllamaMatch {
+    One(String),
+    Several(Vec<String>),
+    None,
+}
+
+/// Case-insensitive substring match of `target` against loaded Ollama model
+/// names. Pure, so it is testable without a daemon.
+pub(crate) fn match_ollama_loaded(names: &[String], target: &str) -> OllamaMatch {
+    let needle = target.to_lowercase();
+    let mut hits: Vec<String> = names
+        .iter()
+        .filter(|n| n.to_lowercase().contains(&needle))
+        .cloned()
+        .collect();
+    match hits.len() {
+        0 => OllamaMatch::None,
+        1 => OllamaMatch::One(hits.remove(0)),
+        _ => OllamaMatch::Several(hits),
+    }
+}
+
+/// `ambiguous_server` body for several Ollama-loaded matches (no pid: the
+/// daemon owns them).
+pub(crate) fn ollama_ambiguous_body(target: &str, names: &[String]) -> Value {
+    json!({
+        "code": "ambiguous_server",
+        "message": format!(
+            "`{target}` matches several servers - be specific:{}",
+            names.iter().map(|n| format!("\n  {n} (ollama)")).collect::<String>()
+        ),
+        "candidates": names
+            .iter()
+            .map(|n| json!({ "model_ref": n, "pid": null }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// `paddock_stop` fallback when no paddock-spawned server matched: the model
+/// may be loaded in the Ollama daemon (paddock_ps lists those too). MCP-only;
+/// the CLI `paddock stop` is unchanged. Ollama unreachable counts as no match.
+fn stop_ollama_fallback(target: String, mut running: Vec<String>) -> CallToolResult {
+    let names: Vec<String> = paddock_core::serving::ollama_loaded_models(&RealSystemProbe)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
+    match match_ollama_loaded(&names, &target) {
+        OllamaMatch::One(name) => {
+            match crate::lifecycle::run_checked(
+                &["ollama".into(), "stop".into(), name.clone()],
+                &SilentProgress,
+            ) {
+                Ok(()) => ok(json!({
+                    "stopped": [{ "model_ref": name, "pid": null, "runtime": RuntimeKind::Ollama }]
+                })),
+                Err(e) => fail(&e),
+            }
+        }
+        OllamaMatch::Several(names) => {
+            CallToolResult::structured_error(ollama_ambiguous_body(&target, &names))
+        }
+        OllamaMatch::None => {
+            running.extend(names);
+            fail(&LifecycleError::NoServerMatch { target, running })
+        }
+    }
+}
+
 /// The `paddock_serve` result for both `ready` and `starting`.
 pub(crate) fn serve_result(
     status: &str,
@@ -230,9 +306,20 @@ async fn blocking<F>(f: F) -> CallToolResult
 where
     F: FnOnce() -> Result<Value, LifecycleError> + Send + 'static,
 {
+    blocking_result(move || match f() {
+        Ok(v) => ok(v),
+        Err(e) => fail(&e),
+    })
+    .await
+}
+
+/// `blocking` for closures that build the whole `CallToolResult` themselves.
+async fn blocking_result<F>(f: F) -> CallToolResult
+where
+    F: FnOnce() -> CallToolResult + Send + 'static,
+{
     match tokio::task::spawn_blocking(f).await {
-        Ok(Ok(v)) => ok(v),
-        Ok(Err(e)) => fail(&e),
+        Ok(r) => r,
         Err(join) => fail(&LifecycleError::Other(anyhow::anyhow!(
             "tool panicked: {join}"
         ))),
@@ -309,7 +396,7 @@ impl PaddockMcp {
 
     #[tool(
         name = "paddock_serve",
-        description = "Start serving a catalog model with the best available runtime and return an OpenAI-compatible endpoint. Picks the best fitting quant unless `quant` is given. Blocks until ready (up to timeout_secs, default 600; a first run may download the model). status \"starting\" means the timeout elapsed first: with runtime \"ollama\" the model is still downloading, so call paddock_serve again later with the same arguments (it returns ready once the pull finished); with llama.cpp / mlx the server is loading, so poll paddock_ps (log_path holds its log). Never installs a runtime: a no_runtime error carries the command for the user."
+        description = "Start serving a catalog model with the best available runtime and return an OpenAI-compatible endpoint. Picks the best fitting quant unless `quant` is given. Blocks until ready (up to timeout_secs, default 600; a first run may download the model). status \"starting\" means the timeout elapsed first: with runtime \"ollama\" the model is still downloading, so call paddock_serve again later with the same arguments (it returns ready once the pull finished); with llama.cpp / mlx the server is loading, so poll paddock_ps (log_path holds its log). For ollama a starting pid is the `ollama pull` process and log_path is null. Calling it again for a llama.cpp / mlx model that is already running starts another instance on the next free port, so check paddock_ps first. Never installs a runtime: a no_runtime error carries the command for the user."
     )]
     async fn serve(&self, Parameters(input): Parameters<ServeInput>) -> CallToolResult {
         let app = self.app.clone();
@@ -368,21 +455,27 @@ impl PaddockMcp {
 
     #[tool(
         name = "paddock_stop",
-        description = "Stop one running server by model name substring or pid. Ollama-loaded models are unloaded from the daemon; paddock-spawned servers are terminated. \"all\" is rejected: stop servers one at a time.",
+        description = "Stop one running server by model name substring or pid, as listed by paddock_ps. paddock-spawned servers (llama.cpp / mlx) are terminated; a model loaded in the Ollama daemon (matched by case-insensitive name substring when no paddock-spawned server matches) is unloaded with `ollama stop` and reported with pid null. Returns { stopped: [{ model_ref, pid, runtime }] }. \"all\" is rejected: stop servers one at a time.",
         annotations(destructive_hint = true)
     )]
     async fn stop(&self, Parameters(input): Parameters<StopInput>) -> CallToolResult {
         if let Some(rejected) = reject_stop_target(&input.target) {
             return rejected;
         }
-        blocking(move || {
-            let stopped = crate::lifecycle::stop(&input.target, &SilentProgress)?;
-            Ok(json!({
+        blocking_result(move || match crate::lifecycle::stop(&input.target, &SilentProgress) {
+            Ok(stopped) => ok(json!({
                 "stopped": stopped
                     .iter()
-                    .map(|s| json!({ "model_ref": s.model_ref, "pid": s.pid }))
+                    .map(|s| json!({ "model_ref": s.model_ref, "pid": s.pid, "runtime": s.runtime }))
                     .collect::<Vec<_>>()
-            }))
+            })),
+            // No paddock-spawned server matched a name: try the Ollama daemon.
+            Err(LifecycleError::NoServerMatch { target, running })
+                if !target.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                stop_ollama_fallback(target, running)
+            }
+            Err(e) => fail(&e),
         })
         .await
     }
@@ -605,6 +698,39 @@ mod tests {
             recommend_result(&[]).unwrap(),
             serde_json::json!({ "recommendations": [] })
         );
+    }
+
+    #[test]
+    fn match_ollama_loaded_one_several_none_case_insensitive() {
+        let names: Vec<String> = vec!["qwen3:8b".into(), "qwen3:4b".into(), "Llama3.2:3b".into()];
+        assert_eq!(
+            match_ollama_loaded(&names, "LLAMA"),
+            OllamaMatch::One("Llama3.2:3b".into())
+        );
+        assert_eq!(
+            match_ollama_loaded(&names, "qwen3:8"),
+            OllamaMatch::One("qwen3:8b".into())
+        );
+        assert_eq!(
+            match_ollama_loaded(&names, "QWEN"),
+            OllamaMatch::Several(vec!["qwen3:8b".into(), "qwen3:4b".into()])
+        );
+        assert_eq!(match_ollama_loaded(&names, "mistral"), OllamaMatch::None);
+        assert_eq!(match_ollama_loaded(&[], "qwen"), OllamaMatch::None);
+    }
+
+    #[test]
+    fn ollama_ambiguous_body_has_null_pids() {
+        let v = ollama_ambiguous_body("qwen", &["qwen3:8b".into(), "qwen3:4b".into()]);
+        assert_eq!(v["code"], "ambiguous_server");
+        assert_eq!(
+            v["candidates"],
+            serde_json::json!([
+                { "model_ref": "qwen3:8b", "pid": null },
+                { "model_ref": "qwen3:4b", "pid": null }
+            ])
+        );
+        assert!(v["message"].as_str().unwrap().contains("qwen3:4b"));
     }
 
     #[tokio::test]

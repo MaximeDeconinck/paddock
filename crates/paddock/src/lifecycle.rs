@@ -158,6 +158,7 @@ pub struct ServeOutcome {
 pub struct Stopped {
     pub model_ref: String,
     pub pid: u32,
+    pub runtime: RuntimeKind,
 }
 
 pub(crate) enum Lookup<'a> {
@@ -397,6 +398,23 @@ pub(crate) fn spawn_detached(
         .map_err(|e| anyhow::anyhow!("failed to start {}: {e}. Is it in PATH?", argv[0]).into())
 }
 
+/// `started + budget`, or `None` (unbounded) when the sum overflows `Instant`
+/// (e.g. an MCP `timeout_secs` of u64::MAX). Never panics.
+pub(crate) fn deadline_after(started: Instant, budget: Duration) -> Option<Instant> {
+    started.checked_add(budget)
+}
+
+/// Process-wide sequence for pending log names: MCP dispatches tool calls
+/// concurrently in one process, so the pid alone is not unique.
+static PENDING_LOG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A fresh `pending-<pid>-<n>.log` name, unique across concurrent serves in
+/// this process and across processes.
+pub(crate) fn pending_log_name() -> String {
+    let n = PENDING_LOG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("pending-{}-{n}.log", std::process::id())
+}
+
 /// Run a pre-step to completion and fail on non-zero exit. Output streams to
 /// the tty unless `progress.quiet()` (MCP: stdout is the protocol channel).
 pub(crate) fn run_checked(argv: &[String], progress: &dyn Progress) -> Result<(), LifecycleError> {
@@ -571,10 +589,11 @@ pub fn serve(
             match mode {
                 ServeMode::Foreground => Some(spawn_checked(argv)?),
                 ServeMode::Detached => {
-                    // Spawn to a per-invocation placeholder (our own pid makes
-                    // it unique across concurrent serves), then rename to
-                    // <child-pid>.log once the child pid is known.
-                    let tmp_log = log_dir.join(format!("pending-{}.log", std::process::id()));
+                    // Spawn to a per-invocation placeholder (our pid plus a
+                    // process-wide counter makes it unique across concurrent
+                    // serves, including concurrent MCP tool calls), then
+                    // rename to <child-pid>.log once the child pid is known.
+                    let tmp_log = log_dir.join(pending_log_name());
                     let c = spawn_detached(argv, &tmp_log)?;
                     let final_log = log_dir.join(format!("{}.log", c.id()));
                     let actual = match std::fs::rename(&tmp_log, &final_log) {
@@ -597,7 +616,7 @@ pub fn serve(
     // and foreground serves wait for pre-steps to finish, as before.
     let started = Instant::now();
     let prestep_deadline = match (mode, ready_timeout) {
-        (ServeMode::Detached, Some(total)) => Some(started + total),
+        (ServeMode::Detached, Some(total)) => deadline_after(started, total),
         _ => None,
     };
     let prepared =
@@ -637,7 +656,19 @@ pub fn serve(
                 let _ = c.kill();
                 let _ = c.wait();
             }
-            return Err(e);
+            // `wait_ready` has no log path; point the caller at the detached log.
+            return Err(match e {
+                LifecycleError::ServerExited {
+                    status,
+                    argv,
+                    log_path: None,
+                } if log_path.is_some() => LifecycleError::ServerExited {
+                    status,
+                    argv,
+                    log_path,
+                },
+                e => e,
+            });
         }
     }
 
@@ -717,6 +748,7 @@ pub fn stop_records(records: Vec<ServingRecord>, progress: &dyn Progress) -> Vec
         stopped.push(Stopped {
             model_ref: r.model_ref,
             pid: r.pid,
+            runtime: r.runtime,
         });
     }
     stopped
@@ -1370,6 +1402,49 @@ mod tests {
     }
 
     #[test]
+    fn serve_detached_early_exit_reports_log_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = ServingDirGuard::isolate(dir.path());
+        let mut plan = spawned_plan();
+        plan.server_argv = Some(vec!["sh".into(), "-c".into(), "exit 1".into()]);
+        let err = serve(
+            plan,
+            ServeMode::Detached,
+            InstallPolicy::Refuse,
+            Some(Duration::from_secs(5)),
+            &SilentProgress,
+        )
+        .unwrap_err();
+        match err {
+            LifecycleError::ServerExited {
+                log_path: Some(p), ..
+            } => assert!(p.exists(), "log {p:?} must exist"),
+            other => panic!("expected ServerExited with a log_path, got {other}"),
+        }
+    }
+
+    #[test]
+    fn pending_log_names_are_unique_per_call() {
+        let a = pending_log_name();
+        let b = pending_log_name();
+        assert_ne!(a, b);
+        assert!(a.starts_with(&format!("pending-{}-", std::process::id())));
+    }
+
+    #[test]
+    fn overflowing_deadline_is_unbounded_and_does_not_panic() {
+        let now = Instant::now();
+        assert_eq!(deadline_after(now, Duration::from_secs(u64::MAX)), None);
+        assert!(deadline_after(now, Duration::from_secs(1)).is_some());
+        let argv = vec!["true".to_string()];
+        let deadline = deadline_after(now, Duration::from_secs(u64::MAX));
+        assert_eq!(
+            run_checked_until(&argv, &SilentProgress, deadline).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn serve_foreground_timeout_kills_child() {
         let dir = tempfile::tempdir().unwrap();
         let _env = ServingDirGuard::isolate(dir.path());
@@ -1427,7 +1502,8 @@ mod tests {
             stopped,
             vec![Stopped {
                 model_ref: "x".into(),
-                pid
+                pid,
+                runtime: spawned_plan().runtime,
             }]
         );
         assert!(!json.exists(), "record must be unregistered");
