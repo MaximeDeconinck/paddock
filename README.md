@@ -237,6 +237,8 @@ Claude Desktop (`claude_desktop_config.json`). Claude Desktop does not inherit y
 }
 ```
 
+paddock then finds ollama, llama-server and mlx_lm.server in their standard install locations (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.cargo/bin`, the Ollama app bundle) even under Claude Desktop's minimal `PATH`.
+
 Six tools, provisioning only:
 
 | Tool | Does | Returns |

@@ -24,6 +24,9 @@ use crate::lifecycle::{
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Some(Command::Mcp)) {
+        mcp::prepare_env();
+    }
     let app = App::load();
 
     match cli.command {

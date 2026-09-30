@@ -492,6 +492,58 @@ impl ServerHandler for PaddockMcp {
     }
 }
 
+/// Standard install locations of paddock's runtimes, appended to `PATH`
+/// when missing. Home-relative entries are joined onto `$HOME`.
+const STANDARD_DIRS: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "~/.local/bin",
+    "~/.cargo/bin",
+    "/Applications/Ollama.app/Contents/Resources",
+];
+
+/// `current` with every standard runtime dir it lacks appended, in order.
+/// Existing entries stay first and untouched; nothing is duplicated; with no
+/// `home`, the home-relative dirs are skipped.
+pub(crate) fn augmented_path(
+    current: Option<&std::ffi::OsStr>,
+    home: Option<&std::path::Path>,
+) -> std::ffi::OsString {
+    let mut dirs: Vec<PathBuf> = match current {
+        Some(p) if !p.is_empty() => std::env::split_paths(p).collect(),
+        _ => Vec::new(),
+    };
+    for dir in STANDARD_DIRS {
+        let dir = match dir.strip_prefix("~/") {
+            Some(rel) => match home {
+                Some(h) => h.join(rel),
+                None => continue,
+            },
+            None => PathBuf::from(dir),
+        };
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    // join_paths only fails on an entry containing ':'; keep PATH as it was.
+    std::env::join_paths(&dirs)
+        .unwrap_or_else(|_| current.map(|p| p.to_os_string()).unwrap_or_default())
+}
+
+/// `paddock mcp` startup, before `App::load()` probes for runtimes: Claude
+/// Desktop spawns MCP servers from launchd with a minimal `PATH`
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`), which hides ollama, llama-server and
+/// mlx_lm.server. Append their standard install locations. Other subcommands
+/// keep the user's `PATH` untouched.
+pub fn prepare_env() {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path = augmented_path(std::env::var_os("PATH").as_deref(), home.as_deref());
+    // SAFETY: called from `main` right after argument parsing, single-threaded
+    // at startup, before `App::load()`, the tokio runtime or any other thread
+    // exists, so nothing can read the environment concurrently.
+    unsafe { std::env::set_var("PATH", path) };
+}
+
 /// Block on a stdio MCP session until the client closes stdin.
 pub fn run(app: App) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -703,6 +755,72 @@ mod tests {
             assert!(v["ctx"].is_null(), "{runtime:?}: ctx must be null, got {}", v["ctx"]);
             assert!(v.as_object().unwrap().contains_key("ctx"));
         }
+    }
+
+    fn split(p: &std::ffi::OsStr) -> Vec<String> {
+        std::env::split_paths(p)
+            .map(|d| d.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    const ALL_STANDARD: [&str; 5] = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/Users/u/.local/bin",
+        "/Users/u/.cargo/bin",
+        "/Applications/Ollama.app/Contents/Resources",
+    ];
+
+    #[test]
+    fn augmented_path_appends_standard_dirs_after_existing_in_order() {
+        let home = std::path::Path::new("/Users/u");
+        let p = augmented_path(Some("/usr/bin:/bin:/usr/sbin:/sbin".as_ref()), Some(home));
+        let mut want = vec!["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+        want.extend(ALL_STANDARD);
+        assert_eq!(split(&p), want);
+    }
+
+    #[test]
+    fn augmented_path_skips_dirs_already_present() {
+        let home = std::path::Path::new("/Users/u");
+        let p = augmented_path(
+            Some("/usr/local/bin:/usr/bin:/Users/u/.cargo/bin".as_ref()),
+            Some(home),
+        );
+        assert_eq!(
+            split(&p),
+            vec![
+                "/usr/local/bin",
+                "/usr/bin",
+                "/Users/u/.cargo/bin",
+                "/opt/homebrew/bin",
+                "/Users/u/.local/bin",
+                "/Applications/Ollama.app/Contents/Resources",
+            ]
+        );
+        // Idempotent: a second pass adds nothing.
+        assert_eq!(augmented_path(Some(&p), Some(home)), p);
+    }
+
+    #[test]
+    fn augmented_path_with_no_or_empty_path() {
+        let home = std::path::Path::new("/Users/u");
+        assert_eq!(split(&augmented_path(None, Some(home))), ALL_STANDARD);
+        assert_eq!(split(&augmented_path(Some("".as_ref()), Some(home))), ALL_STANDARD);
+    }
+
+    #[test]
+    fn augmented_path_without_home_skips_home_relative_dirs() {
+        let p = augmented_path(Some("/usr/bin".as_ref()), None);
+        assert_eq!(
+            split(&p),
+            vec![
+                "/usr/bin",
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                "/Applications/Ollama.app/Contents/Resources",
+            ]
+        );
     }
 
     #[test]
