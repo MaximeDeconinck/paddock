@@ -268,7 +268,7 @@ impl PaddockMcp {
 
     #[tool(
         name = "paddock_fit",
-        description = "Catalog models ranked for this machine: quant picked, memory estimate, generation tok/s estimate, fit verdict (fits / tune sysctl / ram only / no fit) and score, as { \"models\": [...] }. An empty models array means nothing matched: limit was 0, nothing fits this machine (retry with include_unfit true to see why), or the catalog is empty (then call paddock_recommend: a catalog_empty error confirms it and the user must run `paddock sync`).",
+        description = "Catalog models ranked for this machine: quant picked, memory estimate, generation tok/s estimate, fit verdict (fits / tune sysctl / ram only / no fit) and score, as { \"models\": [...] }. An empty models array means nothing matched: limit was 0, nothing fits this machine (retry with include_unfit true to see why), or the catalog is empty (the user must run `paddock sync`).",
         annotations(read_only_hint = true)
     )]
     async fn fit(&self, Parameters(input): Parameters<FitInput>) -> CallToolResult {
