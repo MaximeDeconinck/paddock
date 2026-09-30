@@ -2,12 +2,15 @@
 //! Everything here returns values: no printing, no stdin, no process::exit.
 //! Adapters render `LifecycleError` and report `Progress` their own way.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use paddock_core::catalog::CatalogModel;
 use paddock_core::estimate::{MemoryBudget, ModelVariant};
+use paddock_core::hardware::SystemProbe;
 use paddock_core::runtime::{InstallPlan, ServePlan};
 use paddock_core::score::best_variant;
+use paddock_core::serving::{Registry, ServingRecord};
 
 use crate::app::App;
 
@@ -28,7 +31,6 @@ pub trait Progress {
     }
 }
 
-#[allow(dead_code)] // wired up when serve/stop move here (later tasks)
 pub struct StderrProgress;
 
 impl Progress for StderrProgress {
@@ -113,7 +115,7 @@ pub enum LifecycleError {
     },
     #[error("catalog is empty - run `paddock sync` first")]
     CatalogEmpty,
-    #[error("{0}")]
+    #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
 
@@ -278,6 +280,203 @@ pub fn resolve_model(
 pub fn resolved_ctx(app: &App, model: &CatalogModel, idx: usize, ctx: Option<u32>) -> u32 {
     let mv = model.to_model_variant(&model.variants[idx]);
     paddock_core::estimate::resolve_ctx(ctx, &mv, &app.budget, model.context_max)
+}
+
+/// How long to wait for readiness. A spawned child gets whatever the caller
+/// asked for (the CLI asks for None: runtimes like `llama-server -hf` may be
+/// downloading a multi-GB model on first run, and any fixed cap conflates
+/// "still downloading" with "hung"). Without a child the Ollama daemon is
+/// expected up already, so refusal should be near-instant.
+pub(crate) fn readiness_deadline(
+    child_spawned: bool,
+    requested: Option<Duration>,
+) -> Option<Duration> {
+    if child_spawned {
+        requested
+    } else {
+        Some(Duration::from_secs(3))
+    }
+}
+
+/// Poll `{endpoint}{ready_path}` until it answers 2xx. Each iteration blocks
+/// at most ~800 ms (300 ms connect + 500 ms read in `http_get_local`, plus a
+/// 250 ms sleep), so Ctrl-C feels instant. A notice after 5 s and a heartbeat
+/// every 60 s go through `progress`. On `timeout`: with a child, `NotReady`
+/// (the child is NOT killed here, the caller decides); without, the daemon
+/// case, `OllamaUnreachable`.
+pub(crate) fn wait_ready(
+    probe: &dyn SystemProbe,
+    plan: &ServePlan,
+    mut child: Option<&mut std::process::Child>,
+    timeout: Option<Duration>,
+    progress: &dyn Progress,
+) -> Result<(), LifecycleError> {
+    let url = format!("{}{}", plan.endpoint, plan.ready_path);
+    let start = Instant::now();
+    let mut notified = false;
+    let mut next_heartbeat = Duration::from_secs(60);
+    loop {
+        if probe.http_get_local(&url).is_some() {
+            return Ok(());
+        }
+        if let Some(c) = child.as_deref_mut()
+            && let Some(status) = c.try_wait().map_err(anyhow::Error::from)?
+        {
+            return Err(LifecycleError::ServerExited {
+                status: status.to_string(),
+                argv: plan.server_argv.clone().unwrap_or_default(),
+                log_path: None,
+            });
+        }
+        if let Some(deadline) = timeout
+            && start.elapsed() >= deadline
+        {
+            return Err(match child.as_deref() {
+                Some(c) => LifecycleError::NotReady {
+                    pid: Some(c.id()),
+                    log_path: None,
+                    plan: Box::new(plan.clone()),
+                },
+                None => LifecycleError::OllamaUnreachable,
+            });
+        }
+        if !notified && start.elapsed() >= Duration::from_secs(5) {
+            progress.note("downloading/loading model - this can take a while");
+            notified = true;
+        }
+        if start.elapsed() >= next_heartbeat {
+            progress.note(&format!(
+                "still waiting for {} - Ctrl-C to stop",
+                plan.endpoint
+            ));
+            next_heartbeat += Duration::from_secs(60);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Spawn a server child on the tty, with an actionable error when the binary
+/// is missing.
+pub(crate) fn spawn_checked(argv: &[String]) -> Result<std::process::Child, LifecycleError> {
+    std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to start {}: {e}. Is it in PATH?", argv[0]).into())
+}
+
+// libc-free, matching serving.rs style: detach into a new session.
+unsafe extern "C" {
+    #[link_name = "setsid"]
+    fn libc_setsid() -> i32;
+}
+
+/// Spawn a server child detached from the controlling terminal, with stdout +
+/// stderr captured to `log_path`. Dropping the handle does NOT kill it.
+pub(crate) fn spawn_detached(
+    argv: &[String],
+    log_path: &Path,
+) -> Result<std::process::Child, LifecycleError> {
+    use std::os::unix::process::CommandExt;
+
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("cannot create log dir {parent:?}: {e}"))?;
+    }
+    let log = std::fs::File::create(log_path)
+        .map_err(|e| anyhow::anyhow!("cannot create log file {log_path:?}: {e}"))?;
+    let log_err = log.try_clone().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(log)
+        .stderr(log_err);
+    // SAFETY: setsid only creates a new session; async-signal-safe, no allocation.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc_setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn()
+        .map_err(|e| anyhow::anyhow!("failed to start {}: {e}. Is it in PATH?", argv[0]).into())
+}
+
+/// Run a pre-step to completion and fail on non-zero exit. Output streams to
+/// the tty unless `progress.quiet()` (MCP: stdout is the protocol channel).
+pub(crate) fn run_checked(argv: &[String], progress: &dyn Progress) -> Result<(), LifecycleError> {
+    use std::process::Stdio;
+    let cmd = argv.join(" ");
+    let stdio = || {
+        if progress.quiet() {
+            Stdio::null()
+        } else {
+            Stdio::inherit()
+        }
+    };
+    let status = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(stdio())
+        .stderr(stdio())
+        .status()
+        .map_err(|e| anyhow::anyhow!("running `{cmd}`: {e}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("`{cmd}` failed ({status}); fix it and retry").into());
+    }
+    Ok(())
+}
+
+/// Build a serving registry record for a running server.
+pub(crate) fn build_record(plan: &ServePlan, pid: u32, log_path: Option<PathBuf>) -> ServingRecord {
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    ServingRecord {
+        pid,
+        runtime: plan.runtime,
+        endpoint: plan.endpoint.clone(),
+        openai_url: plan.openai_url.clone(),
+        model_ref: plan.model_ref.clone(),
+        ready_path: plan.ready_path.clone(),
+        started_at,
+        ctx: plan.ctx,
+        log_path,
+        port: plan.port,
+    }
+}
+
+/// Register a detached child server. Unlike `RegistryGuard`, this does NOT
+/// unregister on drop - the server must survive this process exiting.
+pub(crate) fn register_detached(plan: &ServePlan, pid: u32, log_path: Option<PathBuf>) {
+    let record = build_record(plan, pid, log_path);
+    if let Err(e) = Registry::open_default().register(&record) {
+        eprintln!("warning: could not record serving state: {e}");
+    }
+}
+
+/// RAII wrapper around the serving registry for foreground children:
+/// best-effort register on creation, unregister on drop.
+pub struct RegistryGuard {
+    registry: Registry,
+    pid: u32,
+}
+
+impl RegistryGuard {
+    pub fn register(plan: &ServePlan, pid: u32, log_path: Option<PathBuf>) -> Self {
+        let registry = Registry::open_default();
+        let record = build_record(plan, pid, log_path);
+        if let Err(e) = registry.register(&record) {
+            eprintln!("warning: could not record serving state: {e}");
+        }
+        Self { registry, pid }
+    }
+}
+
+impl Drop for RegistryGuard {
+    fn drop(&mut self) {
+        let _ = self.registry.unregister(self.pid);
+    }
 }
 
 #[cfg(test)]
@@ -549,5 +748,195 @@ mod tests {
             e.to_string(),
             "install declined - nothing launched. Run `brew install llama.cpp` yourself, then retry."
         );
+    }
+
+    use paddock_core::hardware::{MockProbe, SystemProbe};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Probe that answers the readiness GET only from the Nth call on.
+    struct CountingProbe {
+        calls: AtomicUsize,
+        answer_from: usize,
+    }
+
+    impl SystemProbe for CountingProbe {
+        fn sysctl_string(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn sysctl_u64(&self, _: &str) -> Option<u64> {
+            None
+        }
+        fn gpu_recommended_working_set(&self) -> Option<u64> {
+            None
+        }
+        fn which(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn run_command(&self, _: &str, _: &[&str]) -> Option<String> {
+            None
+        }
+        fn http_get_local(&self, _: &str) -> Option<String> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            (n >= self.answer_from).then(|| "ok".to_string())
+        }
+        fn http_post_local(&self, _: &str, _: &str) -> Option<String> {
+            None
+        }
+    }
+
+    fn sleeping_child() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("sleep is available")
+    }
+
+    fn spawned_plan() -> ServePlan {
+        ServePlan {
+            server_argv: Some(vec!["llama-server".into(), "--port".into(), "8080".into()]),
+            pre_steps: vec![],
+            endpoint: "http://127.0.0.1:8080".into(),
+            openai_url: "http://127.0.0.1:8080/v1/chat/completions".into(),
+            model_ref: "x".into(),
+            ready_path: "/health".into(),
+            install: None,
+            port_ignored: false,
+            runtime: RuntimeKind::LlamaCpp,
+            ctx: 4096,
+            port: Some(8080),
+        }
+    }
+
+    #[test]
+    fn spawned_child_waits_without_deadline_by_default() {
+        // First-run model downloads can take tens of minutes; the CLI passes
+        // None and any fixed cap would kill a healthy child mid-download.
+        assert_eq!(readiness_deadline(true, None), None);
+        assert_eq!(
+            readiness_deadline(true, Some(Duration::from_secs(600))),
+            Some(Duration::from_secs(600))
+        );
+    }
+
+    #[test]
+    fn daemon_probe_keeps_short_deadline() {
+        assert_eq!(
+            readiness_deadline(false, None),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            readiness_deadline(false, Some(Duration::from_secs(600))),
+            Some(Duration::from_secs(3))
+        );
+    }
+
+    #[test]
+    fn wait_ready_timeout_leaves_child_alive() {
+        let probe = MockProbe::default(); // never answers
+        let mut child = sleeping_child();
+        let pid = child.id();
+        let err = wait_ready(
+            &probe,
+            &spawned_plan(),
+            Some(&mut child),
+            Some(Duration::from_millis(300)),
+            &SilentProgress,
+        )
+        .unwrap_err();
+        match err {
+            LifecycleError::NotReady {
+                pid: Some(p),
+                log_path: None,
+                ..
+            } => assert_eq!(p, pid),
+            other => panic!("expected NotReady, got {other}"),
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child must still be running"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn wait_ready_returns_once_probe_answers() {
+        let probe = CountingProbe {
+            calls: AtomicUsize::new(0),
+            answer_from: 3,
+        };
+        let mut child = sleeping_child();
+        wait_ready(
+            &probe,
+            &spawned_plan(),
+            Some(&mut child),
+            Some(Duration::from_secs(10)),
+            &SilentProgress,
+        )
+        .unwrap();
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 3);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn wait_ready_daemon_timeout_is_ollama_unreachable() {
+        let probe = MockProbe::default();
+        let err = wait_ready(
+            &probe,
+            &spawned_plan(),
+            None,
+            Some(Duration::ZERO),
+            &SilentProgress,
+        )
+        .unwrap_err();
+        assert!(matches!(err, LifecycleError::OllamaUnreachable));
+    }
+
+    #[test]
+    fn wait_ready_child_exit_is_server_exited() {
+        let probe = MockProbe::default();
+        let mut child = std::process::Command::new("false").spawn().unwrap();
+        let err = wait_ready(
+            &probe,
+            &spawned_plan(),
+            Some(&mut child),
+            Some(Duration::from_secs(5)),
+            &SilentProgress,
+        )
+        .unwrap_err();
+        match err {
+            LifecycleError::ServerExited { argv, .. } => {
+                assert_eq!(argv[0], "llama-server");
+            }
+            other => panic!("expected ServerExited, got {other}"),
+        }
+    }
+
+    #[test]
+    fn run_checked_quiet_does_not_fail_on_success() {
+        run_checked(&["true".into()], &SilentProgress).unwrap();
+        let err = run_checked(&["false".into()], &SilentProgress).unwrap_err();
+        assert!(err.to_string().contains("`false` failed"));
+    }
+
+    #[test]
+    fn other_error_source_does_not_duplicate_top_line() {
+        // `#[error(transparent)]`: Display and source() both delegate to the
+        // inner anyhow error, so the top line is not printed twice in a
+        // `Caused by:` chain.
+        let e = LifecycleError::Other(anyhow::anyhow!("x").context("top"));
+        assert_eq!(e.to_string(), "top");
+        let chain: Vec<String> = anyhow::Error::from(e)
+            .chain()
+            .map(|c| c.to_string())
+            .collect();
+        assert_eq!(chain, vec!["top".to_string(), "x".to_string()]);
+
+        let e = LifecycleError::Other(anyhow::anyhow!("x").context("top"));
+        let src = std::error::Error::source(&e).map(|s| s.to_string());
+        assert_ne!(src.as_deref(), Some("top"));
     }
 }

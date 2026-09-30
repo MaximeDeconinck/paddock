@@ -10,14 +10,17 @@ use std::io::Write;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use paddock_core::hardware::{RealSystemProbe, SystemProbe};
+use paddock_core::hardware::RealSystemProbe;
 use paddock_core::runtime::{InstallPlan, RunPlan, ServePlan, plan_run, plan_serve};
 use paddock_core::score::UseCase;
-use paddock_core::serving::{Registry, ServingRecord};
+use paddock_core::serving::Registry;
 
 use crate::app::App;
 use crate::cli::{Cli, Command};
-use crate::lifecycle::{LifecycleError, resolve_model, resolved_ctx};
+use crate::lifecycle::{
+    LifecycleError, RegistryGuard, StderrProgress, register_detached, resolve_model, resolved_ctx,
+    run_checked, spawn_checked, spawn_detached, wait_ready,
+};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -274,10 +277,21 @@ pub(crate) fn serve_with_plan(mut plan: ServePlan, foreground: bool) -> Result<(
     };
 
     // Readiness + pre-steps; never leave an orphaned server behind on failure.
-    let prepared = wait_ready(&plan, child.as_mut()).and_then(|()| {
+    let readiness_deadline_for =
+        |spawned: bool| crate::lifecycle::readiness_deadline(spawned, None);
+    let deadline = readiness_deadline_for(child.is_some());
+    let prepared = wait_ready(
+        &RealSystemProbe,
+        &plan,
+        child.as_mut(),
+        deadline,
+        &StderrProgress,
+    )
+    .map_err(anyhow::Error::from)
+    .and_then(|()| {
         for step in &plan.pre_steps {
             eprintln!("$ {}", step.join(" "));
-            run_checked(step)?;
+            run_checked(step, &StderrProgress)?;
         }
         Ok(())
     });
@@ -341,160 +355,6 @@ pub(crate) fn serve_with_plan(mut plan: ServePlan, foreground: bool) -> Result<(
     }
 }
 
-/// Build a serving registry record for a running server.
-fn build_record(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>) -> ServingRecord {
-    let started_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    ServingRecord {
-        pid,
-        runtime: plan.runtime,
-        endpoint: plan.endpoint.clone(),
-        openai_url: plan.openai_url.clone(),
-        model_ref: plan.model_ref.clone(),
-        ready_path: plan.ready_path.clone(),
-        started_at,
-        ctx: plan.ctx,
-        log_path,
-        port: plan.port,
-    }
-}
-
-/// Register a detached child server. Unlike `RegistryGuard`, this does NOT
-/// unregister on drop - the server must survive this process exiting.
-fn register_detached(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>) {
-    let record = build_record(plan, pid, log_path);
-    if let Err(e) = Registry::open_default().register(&record) {
-        eprintln!("warning: could not record serving state: {e}");
-    }
-}
-
-/// RAII wrapper around the serving registry: best-effort register on
-/// creation, unregister on drop (normal return and `?` early-returns alike).
-struct RegistryGuard {
-    registry: Registry,
-    pid: u32,
-}
-
-impl RegistryGuard {
-    fn register(plan: &ServePlan, pid: u32, log_path: Option<std::path::PathBuf>) -> Self {
-        let registry = Registry::open_default();
-        let record = build_record(plan, pid, log_path);
-        if let Err(e) = registry.register(&record) {
-            eprintln!("warning: could not record serving state: {e}");
-        }
-        Self { registry, pid }
-    }
-}
-
-impl Drop for RegistryGuard {
-    fn drop(&mut self) {
-        let _ = self.registry.unregister(self.pid);
-    }
-}
-
-/// How long to wait for readiness. A spawned child gets no deadline at all:
-/// runtimes like `llama-server -hf` and mlx_lm.server may be DOWNLOADING a
-/// multi-GB model on first run (tens of minutes on slow links), and any fixed
-/// cap conflates "still downloading" with "hung". Liveness is covered by
-/// `try_wait` instead. Without a child the Ollama daemon is expected up
-/// already, so refusal should be near-instant.
-fn readiness_deadline(child_spawned: bool) -> Option<std::time::Duration> {
-    if child_spawned {
-        None
-    } else {
-        Some(std::time::Duration::from_secs(3))
-    }
-}
-
-/// Poll `{endpoint}{ready_path}` until it answers 2xx. With a spawned child
-/// this loops indefinitely - the child exiting is the only failure mode; a
-/// notice after 5 s and a heartbeat every 60 s keep the user informed. Each
-/// iteration blocks at most ~800 ms (300 ms connect + 500 ms read in
-/// `http_get_local`, plus a 250 ms sleep), so Ctrl-C - which kills paddock and
-/// the child together via default tty behavior - feels instant.
-fn wait_ready(plan: &ServePlan, mut child: Option<&mut std::process::Child>) -> Result<()> {
-    use std::time::{Duration, Instant};
-
-    let url = format!("{}{}", plan.endpoint, plan.ready_path);
-    let deadline = readiness_deadline(child.is_some());
-    let start = Instant::now();
-    let mut notified = false;
-    let mut next_heartbeat = Duration::from_secs(60);
-    loop {
-        if RealSystemProbe.http_get_local(&url).is_some() {
-            return Ok(());
-        }
-        if let Some(c) = child.as_deref_mut()
-            && let Some(status) = c.try_wait()?
-        {
-            let argv = plan.server_argv.as_deref().unwrap_or_default().join(" ");
-            bail!(
-                "server exited with {status} before becoming ready - \
-                     run `{argv}` manually to see the error"
-            );
-        }
-        if let Some(deadline) = deadline
-            && start.elapsed() >= deadline
-        {
-            bail!("ollama daemon not reachable on 11434 - is it running?");
-        }
-        if !notified && start.elapsed() >= Duration::from_secs(5) {
-            eprintln!("downloading/loading model - this can take a while");
-            notified = true;
-        }
-        if start.elapsed() >= next_heartbeat {
-            eprintln!("still waiting for {} - Ctrl-C to stop", plan.endpoint);
-            next_heartbeat += Duration::from_secs(60);
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-}
-
-/// Spawn a server child, with an actionable error when the binary is missing.
-fn spawn_checked(argv: &[String]) -> Result<std::process::Child> {
-    std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to start {}: {e}. Is it in PATH?", argv[0]))
-}
-
-// libc-free, matching serving.rs style: detach into a new session.
-unsafe extern "C" {
-    #[link_name = "setsid"]
-    fn libc_setsid() -> i32;
-}
-
-/// Spawn a server child detached from the controlling terminal, with stdout +
-/// stderr captured to `log_path`. Returns the child handle (its PID is the
-/// session leader). Dropping the handle does NOT kill the process.
-fn spawn_detached(argv: &[String], log_path: &std::path::Path) -> Result<std::process::Child> {
-    use std::os::unix::process::CommandExt;
-
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("cannot create log dir {parent:?}: {e}"))?;
-    }
-    let log = std::fs::File::create(log_path)
-        .map_err(|e| anyhow::anyhow!("cannot create log file {log_path:?}: {e}"))?;
-    let log_err = log.try_clone().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut cmd = std::process::Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .stdin(std::process::Stdio::null())
-        .stdout(log)
-        .stderr(log_err);
-    // SAFETY: setsid only creates a new session; async-signal-safe, no allocation.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc_setsid();
-            Ok(())
-        });
-    }
-    cmd.spawn()
-        .map_err(|e| anyhow::anyhow!("failed to start {}: {e}. Is it in PATH?", argv[0]))
-}
-
 fn stop_servers(target: &str, yes: bool) -> Result<()> {
     use paddock_core::catalog::RuntimeKind;
     use paddock_core::serving::{RecordMatch, match_records, terminate};
@@ -543,7 +403,10 @@ fn stop_servers(target: &str, yes: bool) -> Result<()> {
 
     for r in chosen {
         if r.runtime == RuntimeKind::Ollama {
-            let _ = run_checked(&["ollama".into(), "stop".into(), r.model_ref.clone()]);
+            let _ = run_checked(
+                &["ollama".into(), "stop".into(), r.model_ref.clone()],
+                &StderrProgress,
+            );
         } else {
             terminate(r.pid);
         }
@@ -745,20 +608,6 @@ fn bench_server(app: &App, target: Option<&str>, tokens: u32, json: bool) -> Res
     Ok(())
 }
 
-/// Run a pre-step to completion (stdout/stderr inherited - progress streams
-/// to the tty) and fail on non-zero exit.
-fn run_checked(argv: &[String]) -> Result<()> {
-    let cmd = argv.join(" ");
-    let status = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .status()
-        .with_context(|| format!("running `{cmd}`"))?;
-    if !status.success() {
-        bail!("`{cmd}` failed ({status}); fix it and retry");
-    }
-    Ok(())
-}
-
 /// Shared launch path for `paddock run` and the TUI: confirm any required
 /// runtime install (never auto-install), then replace this process with the
 /// run command. Keeping confirmation here keeps the guarantee in one place.
@@ -836,24 +685,4 @@ pub(crate) fn exec(argv: &[String]) -> Result<()> {
         "failed to launch {}: {err}. Is it in PATH?",
         argv[0]
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spawned_child_waits_without_deadline() {
-        // First-run model downloads can take tens of minutes; any fixed cap
-        // would kill a healthy child mid-download.
-        assert_eq!(readiness_deadline(true), None);
-    }
-
-    #[test]
-    fn daemon_probe_keeps_short_deadline() {
-        assert_eq!(
-            readiness_deadline(false),
-            Some(std::time::Duration::from_secs(3))
-        );
-    }
 }
