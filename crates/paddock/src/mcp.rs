@@ -271,7 +271,9 @@ fn stop_ollama_fallback(target: String, mut running: Vec<String>) -> CallToolRes
     }
 }
 
-/// The `paddock_serve` result for both `ready` and `starting`.
+/// The `paddock_serve` result for both `ready` and `starting`. `ctx` is the
+/// window passed as `-c` for llama.cpp, `null` for Ollama (the daemon manages
+/// its own context) and mlx (no context flag).
 pub(crate) fn serve_result(
     status: &str,
     plan: &ServePlan,
@@ -284,7 +286,7 @@ pub(crate) fn serve_result(
         "openai_url": plan.openai_url,
         "model_ref": plan.model_ref,
         "runtime": plan.runtime,
-        "ctx": plan.ctx,
+        "ctx": (plan.runtime == RuntimeKind::LlamaCpp).then_some(plan.ctx),
         "port": plan.port,
         "pid": pid,
         "log_path": log_path,
@@ -677,6 +679,30 @@ mod tests {
         assert_eq!(v["port"], 8081);
         assert_eq!(v["pid"], 42);
         assert_eq!(v["log_path"], "/tmp/42.log");
+    }
+
+    #[test]
+    fn serve_result_ctx_is_null_for_ollama_and_mlx() {
+        // Ollama manages its own context window and mlx_lm.server takes no
+        // -c: only llama.cpp applies the resolved ctx.
+        for (runtime, ctx) in [(RuntimeKind::Ollama, 131072), (RuntimeKind::MlxLm, 0)] {
+            let plan = paddock_core::runtime::ServePlan {
+                server_argv: None,
+                pre_steps: vec![],
+                endpoint: "http://127.0.0.1:11434".into(),
+                openai_url: "http://127.0.0.1:11434/v1/chat/completions".into(),
+                model_ref: "qwen3:8b".into(),
+                ready_path: "/api/tags".into(),
+                install: None,
+                port_ignored: false,
+                runtime,
+                ctx,
+                port: None,
+            };
+            let v = serve_result("ready", &plan, None, None);
+            assert!(v["ctx"].is_null(), "{runtime:?}: ctx must be null, got {}", v["ctx"]);
+            assert!(v.as_object().unwrap().contains_key("ctx"));
+        }
     }
 
     #[test]

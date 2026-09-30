@@ -244,7 +244,7 @@ Six tools, provisioning only:
 | `paddock_scan` | hardware profile | same JSON as `paddock scan --json` |
 | `paddock_fit` | ranked models (`use_case`, `limit`, `include_unfit`) | `{ models: [...] }`, same rows as `paddock fit --json` |
 | `paddock_recommend` | top 5 with justifications (`use_case`) | `{ recommendations: [...] }`, same rows as `paddock recommend --json` |
-| `paddock_serve` | start a model (`model`, `quant?`, `ctx?`, `port?`, `timeout_secs?`) | `{ status, endpoint, openai_url, model_ref, runtime, ctx, port, pid, log_path }` |
+| `paddock_serve` | start a model (`model`, `quant?`, `ctx?`, `port?`, `timeout_secs?`) | `{ status, endpoint, openai_url, model_ref, runtime, ctx, port, pid, log_path }` (`ctx` is the llama.cpp context window, null for Ollama / mlx, which manage their own) |
 | `paddock_ps` | running + available servers | `{ running, available }`, same as `paddock ps --json` |
 | `paddock_stop` | stop one server by name or pid: terminates a paddock-spawned llama.cpp / mlx server, or unloads a model from the Ollama daemon (`ollama stop`, case-insensitive name substring) when no paddock-spawned server matches | `{ stopped: [{ model_ref, pid, runtime }] }` (`pid` is null for Ollama) |
 
