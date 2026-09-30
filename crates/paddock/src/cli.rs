@@ -116,6 +116,8 @@ pub enum Command {
     },
     /// Menu bar status item showing active serve endpoints (macOS)
     Tray,
+    /// Serve paddock's provisioning tools over MCP on stdio (for coding agents)
+    Mcp,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]

@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod clipboard;
 mod lifecycle;
+mod mcp;
 mod output;
 mod tray;
 mod tui;
@@ -120,6 +121,7 @@ fn main() -> Result<()> {
             }
         }
         Some(Command::Tray) => tray::run()?,
+        Some(Command::Mcp) => mcp::run(app)?,
         None => {
             if cli.cli || cli.json {
                 fit(&app, false, UseCase::General, 20, cli.json)?;

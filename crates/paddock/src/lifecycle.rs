@@ -43,7 +43,6 @@ impl Progress for StderrProgress {
     }
 }
 
-#[allow(dead_code)] // used by the MCP adapter (later task)
 pub struct SilentProgress;
 
 impl Progress for SilentProgress {
@@ -131,7 +130,6 @@ pub enum InstallPolicy<'a> {
     /// `InstallDeclined`.
     Ask(&'a dyn Fn(&InstallPlan) -> Result<(), LifecycleError>),
     /// Never install (MCP): return `NoRuntime` before touching anything.
-    #[allow(dead_code)] // used by the MCP adapter (later task)
     Refuse,
 }
 
@@ -151,7 +149,6 @@ pub struct ServeOutcome {
     /// Spawned child pid; None when the already-running Ollama daemon serves.
     pub pid: Option<u32>,
     /// Detached log file, when a child was spawned detached.
-    #[allow(dead_code)] // read by the MCP adapter (later task)
     pub log_path: Option<PathBuf>,
     /// Foreground only: the child handle for the caller to wait on.
     pub child: Option<std::process::Child>,
@@ -676,7 +673,6 @@ pub fn stop_records(records: Vec<ServingRecord>, progress: &dyn Progress) -> Vec
 
 /// `resolve_servers` + `stop_records`, for callers that need no confirmation
 /// step in between (MCP rejects `all` before calling this).
-#[allow(dead_code)] // used by the MCP adapter (later task)
 pub fn stop(target: &str, progress: &dyn Progress) -> Result<Vec<Stopped>, LifecycleError> {
     let records = resolve_servers(target)?;
     Ok(stop_records(records, progress))
