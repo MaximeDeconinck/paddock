@@ -2,7 +2,7 @@
   "language": "french",
   "enabledPlugins": {},
   "permissions": {
-    "allow": ["mcp__paddock", "Glob"],
+    "allow": ["mcp__paddock"],
     "deny": [
       "Read(./data/**)",
       "Grep",
