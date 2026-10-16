@@ -177,13 +177,14 @@ $ paddock ps
 RUNNING
 MODEL          RUNTIME    ENDPOINT                CTX   UPTIME   PID
 qwen3-8b       llama.cpp  http://127.0.0.1:8080  32768     2m    51234
+gemma-3-12b    llama.cpp  http://127.0.0.1:8081  16384  starting  51301
 
 AVAILABLE
 MODEL          RUNTIME
 llama3.2:3b    ollama
 ```
 
-`--json` emits the same data machine-readable for scripts, as `{ "running": [...], "available": [...] }`.
+A server still loading its model shows `starting` instead of its uptime; `stop` and `logs` reach it too. `--json` emits the same data machine-readable for scripts, as `{ "running": [...], "available": [...] }`, each running row with a `status` of `ready` or `starting`.
 
 `paddock stop <target>` stops a server by model name, pid, or `all`:
 
@@ -219,7 +220,7 @@ Some Hugging Face repos ship their vision projector as a separate `mmproj-*.gguf
 
 ### `paddock mcp`: let coding agents provision models
 
-`paddock mcp` exposes paddock over the [Model Context Protocol](https://modelcontextprotocol.io) on stdio, so an agent (Claude Code, Claude Desktop, Cursor, anything that can spawn a process) can ask "what can this machine run?", start a model, and get an OpenAI-compatible endpoint back, without parsing tables or driving a terminal.
+`paddock mcp` exposes paddock over the [Model Context Protocol](https://modelcontextprotocol.io) on stdio, so an agent (Claude Code, Claude Desktop, Cursor, anything that can spawn a process) can ask "what can this machine run?", start a model, get an OpenAI-compatible endpoint back, and hand sub-tasks to that local model the way it hands them to its own subagents, without parsing tables or driving a terminal.
 
 ```text
 $ claude mcp add -s user paddock -- paddock mcp
@@ -239,23 +240,25 @@ Claude Desktop (`claude_desktop_config.json`). Claude Desktop does not inherit y
 
 paddock then finds ollama, llama-server and mlx_lm.server in their standard install locations (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.cargo/bin`, the Ollama app bundle) even under Claude Desktop's minimal `PATH`.
 
-Six tools, provisioning only:
+Seven tools: provisioning, plus delegation with `paddock_chat`:
 
 | Tool | Does | Returns |
 |---|---|---|
 | `paddock_scan` | hardware profile | same JSON as `paddock scan --json` |
 | `paddock_fit` | ranked models (`use_case`, `limit`, `include_unfit`) | `{ models: [...] }`, same rows as `paddock fit --json` |
 | `paddock_recommend` | top 5 with justifications (`use_case`) | `{ recommendations: [...] }`, same rows as `paddock recommend --json` |
-| `paddock_serve` | start a model (`model`, `quant?`, `ctx?`, `port?`, `timeout_secs?`) | `{ status, endpoint, openai_url, model_ref, runtime, ctx, port, pid, log_path }` (`ctx` is the llama.cpp context window, null for Ollama / mlx, which manage their own) |
+| `paddock_serve` | start a model (`model`, `quant?`, `ctx?`, `port?`, `timeout_secs?`) | `{ status, reused, endpoint, openai_url, model_ref, runtime, ctx, port, pid, log_path }` (`ctx` is the llama.cpp context window, null for Ollama / mlx, which manage their own) |
+| `paddock_chat` | send a task to a served model (`model`, `prompt`, `files?`, `system?`, `max_tokens?`, `temperature?`); paddock reads `files` locally | `{ text, finish_reason, model_ref, runtime, usage, elapsed_ms, tok_per_s }` |
 | `paddock_ps` | running + available servers | `{ running, available }`, same as `paddock ps --json` |
 | `paddock_stop` | stop one server by name or pid: terminates a paddock-spawned llama.cpp / mlx server, or unloads a model from the Ollama daemon (`ollama stop`, case-insensitive name substring) when no paddock-spawned server matches | `{ stopped: [{ model_ref, pid, runtime }] }` (`pid` is null for Ollama) |
 
 Two contracts the agent is told about at connect time:
 
-- `paddock_serve` blocks until the model is loaded, up to `timeout_secs` (default 600, because a first run may download a multi-GB model): `status: "ready"` means loaded, unless the warm-up request failed, in which case the model loads on the first request. If the timeout elapses first, the tool returns `status: "starting"`. With llama.cpp / mlx the server keeps running detached, is registered and already listed in `paddock_ps` (listed means running, not necessarily loaded), and a request to `openai_url` waits until the model has loaded; if it disappears from `paddock_ps` it exited, and `log_path` holds its log. With Ollama the agent calls `paddock_serve` again later with the same arguments and gets `ready` once done; in that `starting` result `pid` and `log_path` are those of the process paddock started (the `ollama pull`, or the `ollama serve` daemon on a cold start), otherwise null. Calling `paddock_serve` again for a llama.cpp / mlx model that is already running starts another instance on the next free port, so the agent checks `paddock_ps` first.
+- `paddock_serve` blocks until the model is loaded, up to `timeout_secs` (default 600, because a first run may download a multi-GB model): `status: "ready"` means loaded, unless the warm-up request failed, in which case the model loads on the first request. If the timeout elapses first, the tool returns `status: "starting"`. With llama.cpp / mlx the server keeps running detached, is registered and already listed in `paddock_ps` (listed means running, not necessarily loaded), and a request to `openai_url` waits until the model has loaded; if it disappears from `paddock_ps` it exited, and `log_path` holds its log. With Ollama the agent calls `paddock_serve` again later with the same arguments and gets `ready` once done; in that `starting` result `pid` and `log_path` are those of the process paddock started (the `ollama pull`, or the `ollama serve` daemon on a cold start), otherwise null. Calling `paddock_serve` again for a llama.cpp / mlx model that is already running returns that server with `reused: true` (its ctx and port win; stop it first to change them).
+- `paddock_chat` keeps data local: the files it is given are read by paddock and sent only to the local model, and the result carries only the model's answer, never the file contents. The agent asks for the aggregate it needs and can issue several calls in parallel to fan work out; the server queues them. Point it at a ready server (`paddock_ps` lists a loading one as `starting`).
 - paddock never installs a runtime on an agent's request. A missing runtime is an error with `code: "no_runtime"` and the `install_command`, for the agent to show you.
 
-Other errors carry a `code` too: `model_not_found`, `ambiguous` (with `candidates`), `no_fit`, `unknown_quant` (with `available`), `server_exited` (with `argv` and `log_path`), `ollama_unreachable`, `no_server_match` (with `running`), `ambiguous_server` (with `candidates`), `catalog_empty`, `invalid_target`, `internal`. `paddock_stop` refuses `all` over MCP (`invalid_target`): one server at a time. `sync`, `logs` and `run` are not exposed (slow and networked, or interactive).
+Other errors carry a `code` too: `model_not_found`, `ambiguous` (with `candidates`), `no_fit`, `unknown_quant` (with `available`), `server_exited` (with `argv` and `log_path`), `ollama_unreachable`, `no_server_match` (with `running`), `ambiguous_server` (with `candidates`), `catalog_empty`, `invalid_target`, `internal`; for `paddock_chat`: `not_serving` (with `running`), `not_ready`, `file_error` (with `path`), `context_overflow` (with `estimated_tokens` and `limit`), `chat_failed` (with `http_status`). `paddock_stop` refuses `all` over MCP (`invalid_target`): one server at a time. `sync`, `logs` and `run` are not exposed (slow and networked, or interactive).
 
 ### `paddock tray`: menu bar (macOS)
 
@@ -381,7 +384,7 @@ Geometric, because on a capable machine fit/speed/context all saturate near 100 
 
 - **Tauri desktop app** on top of `paddock-core`
 - **`paddock bench` v2**: bench from the TUI, prefill (prompt-speed) calibration, offload-penalty modeling
-- **MCP v2**: `paddock_chat` (relay a completion to a served endpoint), `paddock_run_agent` (spawn a local agent runner against it and return its diff), HTTP transport, `paddock://hardware` and `paddock://catalog` resources
+- **MCP v2**: `paddock_run_agent` (spawn a local agent runner against it and return its diff), HTTP transport, `paddock://hardware` and `paddock://catalog` resources
 - **Linux / Windows**: same idea, different memory model (discrete VRAM, CUDA/ROCm)
 
 ## License
