@@ -84,13 +84,10 @@ pub(crate) fn resolve_target(rows: &[ServerRow], target: &str) -> Result<ServerR
         .iter()
         .cloned()
         .partition(|r| r.status == ServerStatus::Ready);
-    match match_server_rows(&ready, Some(target)) {
+    match find(&ready, target) {
         ServerRowMatch::Matched(r) => Ok(r.clone()),
         ServerRowMatch::NotFound
-            if !matches!(
-                match_server_rows(&starting, Some(target)),
-                ServerRowMatch::NotFound
-            ) =>
+            if !matches!(find(&starting, target), ServerRowMatch::NotFound) =>
         {
             Err(ChatError::NotReady {
                 model: target.to_string(),
@@ -104,6 +101,22 @@ pub(crate) fn resolve_target(rows: &[ServerRow], target: &str) -> Result<ServerR
             target: target.to_string(),
             running: rows.iter().map(|r| r.model.clone()).collect(),
         }),
+    }
+}
+
+/// `match_server_rows`, except that an all-digits target matching no pid is
+/// retried as a name substring (model names carry numbers: "2507", "8b").
+fn find<'a>(rows: &'a [ServerRow], target: &str) -> ServerRowMatch<'a> {
+    match match_server_rows(rows, Some(target)) {
+        ServerRowMatch::NotFound if target.parse::<u32>().is_ok() => {
+            let hits: Vec<&ServerRow> = rows.iter().filter(|r| r.model.contains(target)).collect();
+            match hits.as_slice() {
+                [] => ServerRowMatch::NotFound,
+                [one] => ServerRowMatch::Matched(one),
+                _ => ServerRowMatch::Ambiguous(hits),
+            }
+        }
+        m => m,
     }
 }
 
@@ -331,6 +344,17 @@ mod tests {
             resolve_target(&rows, "gemma"),
             Err(ChatError::NotReady { .. })
         ));
+        // A number that is no pid is a name substring.
+        let dated = vec![row(
+            "Qwen3-30B-A3B-Instruct-2507",
+            RuntimeKind::Ollama,
+            None,
+            ServerStatus::Ready,
+        )];
+        assert_eq!(
+            resolve_target(&dated, "2507").unwrap().model,
+            "Qwen3-30B-A3B-Instruct-2507"
+        );
         // A loading namesake does not make the ready server ambiguous.
         let mut both = rows.clone();
         both.push(row(
