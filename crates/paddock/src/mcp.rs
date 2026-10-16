@@ -484,7 +484,7 @@ impl PaddockMcp {
 
     #[tool(
         name = "paddock_chat",
-        description = "Delegate a task to a local model already served (see paddock_ps / paddock_serve): sends `prompt`, plus the `files` paddock reads locally, and returns { text, model_ref, runtime, usage, elapsed_ms, tok_per_s }. Privacy: file contents never appear in the result; only `text`, written by the local model, comes back. Ask the model for the aggregate you need, not for the raw rows. Issue several paddock_chat calls in parallel to fan work out like subagents; the server queues them. Errors: not_serving (start a model first), not_ready (still loading), file_error, context_overflow (split the files), chat_failed."
+        description = "Delegate a task to a local model already served (see paddock_ps / paddock_serve): sends `prompt`, plus the `files` paddock reads locally, and returns { text, finish_reason, model_ref, runtime, usage, elapsed_ms, tok_per_s } (finish_reason \"length\" = cut at max_tokens). Privacy: file contents never appear in the result; only `text`, written by the local model, comes back. Ask the model for the aggregate you need, not for the raw rows. Issue several paddock_chat calls in parallel to fan work out like subagents; the server queues them. Errors: not_serving (start a model first), not_ready (still loading), file_error, context_overflow (split the files), chat_failed."
     )]
     async fn chat(&self, Parameters(input): Parameters<ChatInput>) -> CallToolResult {
         match Self::chat_inner(input).await {

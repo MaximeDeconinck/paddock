@@ -207,6 +207,7 @@ pub(crate) fn chat_result(server: &ServerRow, answer: &Value, elapsed: Duration)
     let text = answer["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or_default();
+    let finish_reason = answer["choices"][0]["finish_reason"].as_str();
     let prompt_tokens = answer["usage"]["prompt_tokens"].as_u64();
     let completion_tokens = answer["usage"]["completion_tokens"].as_u64();
     let secs = elapsed.as_secs_f64();
@@ -214,7 +215,8 @@ pub(crate) fn chat_result(server: &ServerRow, answer: &Value, elapsed: Duration)
         .filter(|_| secs > 0.0)
         .map(|n| ((n as f64 / secs) * 10.0).round() / 10.0);
     json!({
-        "text": strip_think(text),
+        "text": strip_think(text).trim().to_string(),
+        "finish_reason": finish_reason,
         "model_ref": server.model,
         "runtime": server.runtime,
         "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens },
@@ -253,7 +255,19 @@ pub(crate) async fn send(server: &ServerRow, req: &ChatRequest) -> Result<Value,
             "answer has no choices[0].message.content".into(),
         ));
     }
-    Ok(chat_result(server, &body, started.elapsed()))
+    let result = chat_result(server, &body, started.elapsed());
+    if result["text"] == "" && result["finish_reason"] == "length" {
+        // Reasoning models can spend the whole budget thinking (Ollama puts
+        // it in a separate `reasoning` field) and never answer.
+        return Err(failed(
+            Some(status.as_u16()),
+            format!(
+                "the model used all {} max_tokens before answering (likely reasoning): raise max_tokens or use a non-reasoning model",
+                req.max_tokens
+            ),
+        ));
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -396,6 +410,7 @@ mod tests {
         });
         let v = chat_result(&server, &answer, Duration::from_millis(2000));
         assert_eq!(v["text"], "Total: 42 €");
+        assert!(v["finish_reason"].is_null());
         assert_eq!(v["usage"]["prompt_tokens"], 900);
         assert_eq!(v["tok_per_s"], 25.0);
         assert_eq!(v["elapsed_ms"], 2000);
@@ -446,6 +461,23 @@ mod tests {
         let v = send(&server, &req()).await.unwrap();
         assert_eq!(v["text"], "bonjour");
         assert_eq!(v["usage"]["completion_tokens"], 1);
+    }
+
+    #[tokio::test]
+    async fn send_flags_budget_spent_before_answering() {
+        let body = r#"{"choices":[{"message":{"content":"","reasoning":"..."},"finish_reason":"length"}],"usage":{"prompt_tokens":3,"completion_tokens":16}}"#;
+        let reply: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let mut server = row("m", RuntimeKind::Ollama, None, ServerStatus::Ready);
+        server.openai_url = fake_server(reply).await;
+        let err = send(&server, &req()).await.unwrap_err();
+        assert_eq!(err.body()["code"], "chat_failed");
+        assert!(err.to_string().contains("raise max_tokens"));
     }
 
     #[tokio::test]
