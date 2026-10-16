@@ -196,7 +196,7 @@ impl History {
 /// `kill(pid, 0)` liveness probe (signal 0 = existence check, no signal sent).
 /// kill→-1/EPERM (alive process owned by another user) reads as dead here -
 /// acceptable, we only track our own children.
-fn pid_alive(pid: u32) -> bool {
+pub fn pid_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }

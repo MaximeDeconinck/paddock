@@ -44,8 +44,8 @@ model has loaded. If it disappears from paddock_ps it exited: read log_path from
 starting result. With runtime \"ollama\" call paddock_serve again later with the same \
 arguments (it returns ready once done); pid and log_path are those of the process paddock \
 started (the `ollama pull`, or the `ollama serve` daemon on a cold start), otherwise null.
-Calling paddock_serve again for a llama.cpp / mlx model that is already running starts another \
-instance on the next free port: check paddock_ps first and reuse a listed endpoint.
+Calling paddock_serve again for a llama.cpp / mlx model that is already running returns that \
+server (\"reused\": true) with its actual ctx and port; stop it first to change them.
 openai_url speaks the OpenAI chat-completions protocol; put model_ref in the `model` field.
 An error with code \"no_runtime\" means a runtime (ollama, llama.cpp, mlx-lm) is not installed: \
 show install_command to the user and ask before anything is installed. paddock never installs \
@@ -280,9 +280,11 @@ pub(crate) fn serve_result(
     plan: &ServePlan,
     pid: Option<u32>,
     log_path: Option<PathBuf>,
+    reused: bool,
 ) -> Value {
     json!({
         "status": status,
+        "reused": reused,
         "endpoint": plan.endpoint,
         "openai_url": plan.openai_url,
         "model_ref": plan.model_ref,
@@ -399,7 +401,7 @@ impl PaddockMcp {
 
     #[tool(
         name = "paddock_serve",
-        description = "Start serving a catalog model with the best available runtime and return an OpenAI-compatible endpoint. Picks the best fitting quant unless `quant` is given. Blocks until the model is loaded (up to timeout_secs, default 600; a first run may download the model): status \"ready\" means loaded, unless the warm-up request failed (then the model loads on the first request). status \"starting\" means the timeout elapsed first: with runtime \"llama_cpp\" or \"mlx_lm\" the server is registered and already listed in paddock_ps (listed = running, not necessarily loaded) and a request to openai_url waits until the model has loaded; if it disappears from paddock_ps it exited, read log_path. With \"ollama\" call paddock_serve again later with the same arguments; pid and log_path are those of the process paddock started (the `ollama pull`, or the `ollama serve` daemon on a cold start), otherwise null. Calling it again for a llama.cpp / mlx model that is already running starts another instance on the next free port, so check paddock_ps first. Never installs a runtime: a no_runtime error carries the command for the user."
+        description = "Start serving a catalog model with the best available runtime and return an OpenAI-compatible endpoint. Picks the best fitting quant unless `quant` is given. Blocks until the model is loaded (up to timeout_secs, default 600; a first run may download the model): status \"ready\" means loaded, unless the warm-up request failed (then the model loads on the first request). status \"starting\" means the timeout elapsed first: with runtime \"llama_cpp\" or \"mlx_lm\" the server is registered and already listed in paddock_ps (listed = running, not necessarily loaded) and a request to openai_url waits until the model has loaded; if it disappears from paddock_ps it exited, read log_path. With \"ollama\" call paddock_serve again later with the same arguments; pid and log_path are those of the process paddock started (the `ollama pull`, or the `ollama serve` daemon on a cold start), otherwise null. Calling it again for a llama.cpp / mlx model that is already running returns that server with \"reused\": true (its actual ctx and port win; stop it first to change them). Never installs a runtime: a no_runtime error carries the command for the user."
     )]
     async fn serve(&self, Parameters(input): Parameters<ServeInput>) -> CallToolResult {
         let app = self.app.clone();
@@ -427,12 +429,13 @@ impl PaddockMcp {
                     &outcome.plan,
                     outcome.pid,
                     outcome.log_path,
+                    outcome.reused,
                 )),
                 Err(LifecycleError::NotReady {
                     pid,
                     log_path,
                     plan,
-                }) => Ok(serve_result("starting", &plan, pid, log_path)),
+                }) => Ok(serve_result("starting", &plan, pid, log_path, false)),
                 Err(e) => Err(e),
             }
         })
@@ -724,6 +727,7 @@ mod tests {
             &plan,
             Some(42),
             Some(std::path::PathBuf::from("/tmp/42.log")),
+            false,
         );
         assert_eq!(v["status"], "starting");
         assert_eq!(v["endpoint"], "http://127.0.0.1:8081");
@@ -754,7 +758,7 @@ mod tests {
                 ctx,
                 port: None,
             };
-            let v = serve_result("ready", &plan, None, None);
+            let v = serve_result("ready", &plan, None, None, false);
             assert!(
                 v["ctx"].is_null(),
                 "{runtime:?}: ctx must be null, got {}",

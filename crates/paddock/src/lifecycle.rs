@@ -12,7 +12,7 @@ use paddock_core::estimate::{MemoryBudget, ModelVariant};
 use paddock_core::hardware::{RealSystemProbe, SystemProbe};
 use paddock_core::runtime::{InstallPlan, ServePlan};
 use paddock_core::score::best_variant;
-use paddock_core::serving::{History, Registry, ServingRecord};
+use paddock_core::serving::{History, LiveRecord, Registry, ServingRecord};
 
 use crate::app::App;
 
@@ -152,6 +152,9 @@ pub struct ServeOutcome {
     pub log_path: Option<PathBuf>,
     /// Foreground only: the child handle for the caller to wait on.
     pub child: Option<std::process::Child>,
+    /// True when an already-running server for the same model was returned
+    /// instead of spawning a second copy.
+    pub reused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -608,6 +611,19 @@ pub fn serve(
         }
     }
 
+    // A detached llama.cpp/mlx serve of a model that already runs returns
+    // that server instead of spawning a second copy on the next free port.
+    if mode == ServeMode::Detached && plan.server_argv.is_some() {
+        let alive = Registry::open_default().list_alive(&RealSystemProbe);
+        if let Some(live) = find_reusable(&alive, &plan) {
+            progress.note(&format!(
+                "{} is already serving on {} - reusing it",
+                live.record.model_ref, live.record.endpoint
+            ));
+            return reuse(live, plan, ready_timeout);
+        }
+    }
+
     // Spawned servers (llama.cpp/mlx) default to 8080; pick a free port so
     // concurrent servers don't collide (and so the readiness probe can't be
     // answered by a different process already on the port). The Ollama daemon
@@ -733,6 +749,7 @@ pub fn serve(
             pid,
             log_path: None,
             child,
+            reused: false,
         }),
         ServeMode::Detached => {
             // Register WITHOUT the drop-guard so the child outlives us. A
@@ -747,9 +764,74 @@ pub fn serve(
                 pid,
                 log_path,
                 child: None,
+                reused: false,
             })
         }
     }
+}
+
+/// The alive record serving the same model with the same runtime, if any.
+/// A different requested ctx or port does not count: the running server wins.
+pub(crate) fn find_reusable<'a>(
+    alive: &'a [LiveRecord],
+    plan: &ServePlan,
+) -> Option<&'a LiveRecord> {
+    alive
+        .iter()
+        .find(|l| l.record.runtime == plan.runtime && l.record.model_ref == plan.model_ref)
+}
+
+/// `plan` rebound to a running server's port and ctx.
+pub(crate) fn plan_for_record(plan: ServePlan, record: &ServingRecord) -> ServePlan {
+    let mut plan = match record.port {
+        Some(port) if Some(port) != plan.port => plan.with_port(port),
+        _ => plan,
+    };
+    plan.ctx = record.ctx;
+    plan
+}
+
+/// Return a running server as the serve outcome. A server still loading is
+/// awaited up to `ready_timeout` (600 s when None): `NotReady` for its pid on
+/// timeout, `ServerExited` if it dies meanwhile.
+fn reuse(
+    live: &LiveRecord,
+    plan: ServePlan,
+    ready_timeout: Option<Duration>,
+) -> Result<ServeOutcome, LifecycleError> {
+    let record = &live.record;
+    let plan = plan_for_record(plan, record);
+    if !live.ready {
+        let url = format!("{}{}", record.endpoint, record.ready_path);
+        let deadline = Instant::now() + ready_timeout.unwrap_or(Duration::from_secs(600));
+        loop {
+            if RealSystemProbe.http_get_local(&url).is_some() {
+                break;
+            }
+            if !paddock_core::serving::pid_alive(record.pid) {
+                return Err(LifecycleError::ServerExited {
+                    status: "exited while loading".into(),
+                    argv: plan.server_argv.clone().unwrap_or_default(),
+                    log_path: record.log_path.clone(),
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(LifecycleError::NotReady {
+                    pid: Some(record.pid),
+                    log_path: record.log_path.clone(),
+                    plan: Box::new(plan),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    Ok(ServeOutcome {
+        plan,
+        pid: Some(record.pid),
+        log_path: record.log_path.clone(),
+        child: None,
+        reused: true,
+    })
 }
 
 /// Warm-up step of `serve`, after readiness and pre-steps. Ollama and mlx
@@ -1170,6 +1252,46 @@ mod tests {
             ctx: 4096,
             port: Some(8080),
         }
+    }
+
+    fn live(model_ref: &str, runtime: RuntimeKind, port: u16, ready: bool) -> LiveRecord {
+        LiveRecord {
+            record: ServingRecord {
+                pid: 4242,
+                runtime,
+                endpoint: format!("http://127.0.0.1:{port}"),
+                openai_url: format!("http://127.0.0.1:{port}/v1/chat/completions"),
+                model_ref: model_ref.into(),
+                ready_path: "/health".into(),
+                started_at: 1,
+                ctx: 16384,
+                log_path: None,
+                port: Some(port),
+            },
+            ready,
+        }
+    }
+
+    #[test]
+    fn find_reusable_matches_same_model_and_runtime_only() {
+        let alive = vec![
+            live("other", RuntimeKind::LlamaCpp, 8081, true),
+            live("x", RuntimeKind::MlxLm, 8082, true),
+            live("x", RuntimeKind::LlamaCpp, 8083, false),
+        ];
+        let hit = find_reusable(&alive, &spawned_plan()).expect("same model+runtime");
+        assert_eq!(hit.record.port, Some(8083));
+        assert!(find_reusable(&alive[..2], &spawned_plan()).is_none());
+    }
+
+    #[test]
+    fn plan_for_record_takes_running_port_and_ctx() {
+        let rec = live("x", RuntimeKind::LlamaCpp, 8083, true).record;
+        let plan = plan_for_record(spawned_plan(), &rec);
+        assert_eq!(plan.port, Some(8083));
+        assert_eq!(plan.endpoint, "http://127.0.0.1:8083");
+        assert_eq!(plan.openai_url, "http://127.0.0.1:8083/v1/chat/completions");
+        assert_eq!(plan.ctx, 16384);
     }
 
     #[test]
