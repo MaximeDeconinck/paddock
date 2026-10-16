@@ -7,14 +7,13 @@ Require claude
 Require paddock
 
 Set Shell zsh
-Set FontSize 17
-Set Width 1400
-Set Height 860
-Set Padding 24
+Set FontSize 18
+# Window content size from demo/frame.py (render.sh draws the window around it).
+Set Width 1620
+Set Height 888
+Set Padding 22
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 35ms
-Set WindowBar Colorful
-Set WindowBarSize 36
 
 # Setup, off camera: isolated Claude Code (project settings only, paddock as the sole MCP server).
 Hide
@@ -47,7 +46,8 @@ Sleep 400ms
 Enter
 Sleep 6s
 
-Type "Utilise paddock pour analyser mes relevés de septembre (data/carte.csv, data/compte-courant.csv, data/compte-joint.csv) avec le petit modèle local Qwen3 4B : un sous-agent par fichier, en parallèle, sans jamais lire les fichiers toi-même. Vas-y directement, puis fais-moi le bilan : où part mon argent et ce qui cloche."
+# Pasted, not typed.
+Type@1ms "Utilise paddock pour analyser mes relevés de septembre (data/carte.csv, data/compte-courant.csv, data/compte-joint.csv) avec le petit modèle local Qwen3 4B : un sous-agent par fichier, en parallèle, sans jamais lire les fichiers toi-même. Vas-y directement, puis fais-moi le bilan : où part mon argent et ce qui cloche."
 Sleep 800ms
 Enter
 
@@ -55,6 +55,8 @@ Enter
 # render.sh compresses the idle stretches.
 Sleep 7m
 
+# Quit off camera: the last recorded frame is the final answer.
+Hide
 Ctrl+C
 Sleep 300ms
 Ctrl+C
