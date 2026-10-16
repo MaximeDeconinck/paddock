@@ -208,7 +208,7 @@ fn initialize_advertises_tools_and_instructions() {
 }
 
 #[test]
-fn tools_list_has_six_tools_with_object_schemas() {
+fn tools_list_has_seven_tools_with_object_schemas() {
     let (mut cmd, _dir) = paddock();
     let r = session(
         &mut cmd,
@@ -220,6 +220,7 @@ fn tools_list_has_six_tools_with_object_schemas() {
     assert_eq!(
         names,
         [
+            "paddock_chat",
             "paddock_fit",
             "paddock_ps",
             "paddock_recommend",
@@ -388,4 +389,21 @@ fn unknown_tool_does_not_kill_session() {
     let text = r[&3]["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("missing field `target`"), "{text}");
     assert_eq!(structured(&r[&4])["running"], json!([]));
+}
+
+#[test]
+fn chat_with_no_matching_server_is_not_serving() {
+    let (mut cmd, _dir) = paddock();
+    let r = session(
+        &mut cmd,
+        vec![call(
+            2,
+            "paddock_chat",
+            json!({"model": "zz-no-such-model", "prompt": "hi"}),
+        )],
+    );
+    assert_eq!(r[&2]["result"]["isError"], true);
+    let v = structured(&r[&2]);
+    assert_eq!(v["code"], "not_serving");
+    assert!(v["running"].is_array());
 }
