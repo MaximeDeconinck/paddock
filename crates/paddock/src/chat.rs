@@ -239,10 +239,17 @@ pub(crate) fn request_body(model_ref: &str, req: &ChatRequest) -> Value {
 
 /// The tool result from a chat-completions answer.
 pub(crate) fn chat_result(server: &ServerRow, answer: &Value, elapsed: Duration) -> Value {
-    let text = answer["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or_default();
+    let message = &answer["choices"][0]["message"];
     let finish_reason = answer["choices"][0]["finish_reason"].as_str();
+    let mut text = message["content"].as_str().unwrap_or_default();
+    // Some GGUF chat templates make Ollama / llama.cpp file the whole answer
+    // as reasoning. A finished generation with no content: that is the answer.
+    if text.trim().is_empty() && finish_reason != Some("length") {
+        text = message["reasoning"]
+            .as_str()
+            .or_else(|| message["reasoning_content"].as_str())
+            .unwrap_or_default();
+    }
     let prompt_tokens = answer["usage"]["prompt_tokens"].as_u64();
     let completion_tokens = answer["usage"]["completion_tokens"].as_u64();
     let secs = elapsed.as_secs_f64();
@@ -470,6 +477,13 @@ mod tests {
         assert_eq!(v["tok_per_s"], 25.0);
         assert_eq!(v["elapsed_ms"], 2000);
         assert_eq!(v["runtime"], "llama_cpp");
+        let misfiled = json!({
+            "choices": [{ "message": { "content": "", "reasoning": "1;loisirs;-12,00" }, "finish_reason": "stop" }],
+        });
+        assert_eq!(
+            chat_result(&server, &misfiled, Duration::from_secs(1))["text"],
+            "1;loisirs;-12,00"
+        );
         let bare = chat_result(
             &server,
             &json!({ "choices": [{ "message": { "content": "ok" } }] }),
