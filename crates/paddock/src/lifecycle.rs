@@ -620,7 +620,7 @@ pub fn serve(
                 "{} is already serving on {} - reusing it",
                 live.record.model_ref, live.record.endpoint
             ));
-            return reuse(live, plan, ready_timeout);
+            return reuse(live, plan, ready_timeout, progress);
         }
     }
 
@@ -669,6 +669,9 @@ pub fn serve(
                         Err(_) => tmp_log, // rename failed: the data is still at the pending path
                     };
                     log_path = Some(actual);
+                    // Register now, not once ready: a loading server must be
+                    // visible to ps / stop and reusable by a concurrent serve.
+                    register_detached(&plan, c.id(), log_path.clone());
                     Some(c)
                 }
             }
@@ -706,14 +709,9 @@ pub fn serve(
     match prepared {
         Ok(()) => {}
         Err(LifecycleError::NotReady { pid, .. }) if mode == ServeMode::Detached => {
-            // Register the spawned server (if any), left running. `pid` is
-            // that server (readiness or warm-up timeout; None for the Ollama
-            // daemon) or a still-running pre-step.
-            if plan.runtime != RuntimeKind::Ollama
-                && let Some(server_pid) = server_pid
-            {
-                register_detached(&plan, server_pid, log_path.clone());
-            }
+            // The spawned server (if any) is left running, already registered.
+            // `pid` is that server (readiness or warm-up timeout; None for the
+            // Ollama daemon) or a still-running pre-step.
             let log_path = if pid == server_pid { log_path } else { None };
             return Err(LifecycleError::NotReady {
                 pid,
@@ -725,6 +723,9 @@ pub fn serve(
             if let Some(c) = child.as_mut() {
                 let _ = c.kill();
                 let _ = c.wait();
+                if mode == ServeMode::Detached {
+                    let _ = Registry::open_default().unregister(c.id());
+                }
             }
             // `wait_ready` has no log path; point the caller at the detached log.
             return Err(match e {
@@ -752,13 +753,8 @@ pub fn serve(
             reused: false,
         }),
         ServeMode::Detached => {
-            // Register WITHOUT the drop-guard so the child outlives us. A
-            // cold-started Ollama daemon is managed by ollama itself.
-            if let Some(pid) = pid
-                && plan.runtime != RuntimeKind::Ollama
-            {
-                register_detached(&plan, pid, log_path.clone());
-            }
+            // Registered at spawn, without the drop-guard so the child
+            // outlives us. A cold-started Ollama daemon is managed by ollama.
             Ok(ServeOutcome {
                 plan,
                 pid,
@@ -791,19 +787,22 @@ pub(crate) fn plan_for_record(plan: ServePlan, record: &ServingRecord) -> ServeP
     plan
 }
 
-/// Return a running server as the serve outcome. A server still loading is
-/// awaited up to `ready_timeout` (600 s when None): `NotReady` for its pid on
-/// timeout, `ServerExited` if it dies meanwhile.
+/// Return a running server as the serve outcome, with the same contract as
+/// a fresh detached serve: a server still loading is awaited (within
+/// `ready_timeout`, without a deadline when None), then warmed up when its
+/// runtime loads lazily (mlx). `NotReady` for its pid on timeout,
+/// `ServerExited` if it dies meanwhile.
 fn reuse(
     live: &LiveRecord,
     plan: ServePlan,
     ready_timeout: Option<Duration>,
+    progress: &dyn Progress,
 ) -> Result<ServeOutcome, LifecycleError> {
     let record = &live.record;
     let plan = plan_for_record(plan, record);
+    let deadline = ready_timeout.and_then(|t| deadline_after(Instant::now(), t));
     if !live.ready {
         let url = format!("{}{}", record.endpoint, record.ready_path);
-        let deadline = Instant::now() + ready_timeout.unwrap_or(Duration::from_secs(600));
         loop {
             if RealSystemProbe.http_get_local(&url).is_some() {
                 break;
@@ -815,7 +814,7 @@ fn reuse(
                     log_path: record.log_path.clone(),
                 });
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Err(LifecycleError::NotReady {
                     pid: Some(record.pid),
                     log_path: record.log_path.clone(),
@@ -825,6 +824,16 @@ fn reuse(
             std::thread::sleep(Duration::from_millis(500));
         }
     }
+    // A loaded model answers the warm-up at once; a lazily loading one (mlx
+    // whose first serve timed out) loads now, so "ready" still means loaded.
+    warm_up_until(&plan, Some(record.pid), deadline, progress).map_err(|e| match e {
+        LifecycleError::NotReady { pid, plan, .. } => LifecycleError::NotReady {
+            pid,
+            log_path: record.log_path.clone(),
+            plan,
+        },
+        e => e,
+    })?;
     Ok(ServeOutcome {
         plan,
         pid: Some(record.pid),

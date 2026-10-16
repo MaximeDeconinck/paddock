@@ -2,6 +2,7 @@
 //! model and return only its answer. File contents never leave this process
 //! except through the model's own output.
 
+use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -76,15 +77,25 @@ impl ChatError {
     }
 }
 
-/// Pick the ready server `target` designates among `rows`.
+/// Pick the ready server `target` designates among `rows`. Loading servers
+/// never make a ready match ambiguous; they only explain a miss (`not_ready`).
 pub(crate) fn resolve_target(rows: &[ServerRow], target: &str) -> Result<ServerRow, ChatError> {
-    match match_server_rows(rows, Some(target)) {
-        ServerRowMatch::Matched(r) if r.status == ServerStatus::Starting => {
+    let (ready, starting): (Vec<ServerRow>, Vec<ServerRow>) = rows
+        .iter()
+        .cloned()
+        .partition(|r| r.status == ServerStatus::Ready);
+    match match_server_rows(&ready, Some(target)) {
+        ServerRowMatch::Matched(r) => Ok(r.clone()),
+        ServerRowMatch::NotFound
+            if !matches!(
+                match_server_rows(&starting, Some(target)),
+                ServerRowMatch::NotFound
+            ) =>
+        {
             Err(ChatError::NotReady {
-                model: r.model.clone(),
+                model: target.to_string(),
             })
         }
-        ServerRowMatch::Matched(r) => Ok(r.clone()),
         ServerRowMatch::Ambiguous(c) => Err(ChatError::Ambiguous {
             target: target.to_string(),
             candidates: c.iter().map(|r| r.model.clone()).collect(),
@@ -121,7 +132,18 @@ pub(crate) fn read_files(paths: &[String]) -> Result<Vec<(String, String)>, Chat
                 MAX_FILES_BYTES / 1024
             )));
         }
-        let bytes = std::fs::read(path).map_err(|e| err(e.to_string()))?;
+        // Bounded read: the file may have grown since the size check.
+        let budget = MAX_FILES_BYTES - (total - meta.len());
+        let mut bytes = Vec::with_capacity(meta.len() as usize);
+        std::fs::File::open(path)
+            .and_then(|f| f.take(budget + 1).read_to_end(&mut bytes))
+            .map_err(|e| err(e.to_string()))?;
+        if bytes.len() as u64 > budget {
+            return Err(err(format!(
+                "files exceed {} KiB in total",
+                MAX_FILES_BYTES / 1024
+            )));
+        }
         let text = String::from_utf8(bytes).map_err(|_| err("not UTF-8 text".into()))?;
         let name = path
             .file_name()
@@ -309,6 +331,15 @@ mod tests {
             resolve_target(&rows, "gemma"),
             Err(ChatError::NotReady { .. })
         ));
+        // A loading namesake does not make the ready server ambiguous.
+        let mut both = rows.clone();
+        both.push(row(
+            "qwen3-4b-2",
+            RuntimeKind::LlamaCpp,
+            Some(8192),
+            ServerStatus::Starting,
+        ));
+        assert_eq!(resolve_target(&both, "qwen3-4b").unwrap().model, "qwen3-4b");
         let err = resolve_target(&rows, "llama").unwrap_err();
         assert_eq!(err.body()["code"], "not_serving");
         assert_eq!(err.body()["running"][1], "gemma3:12b");
