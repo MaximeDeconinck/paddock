@@ -2,7 +2,7 @@
 
 use paddock_core::estimate::FitVerdict;
 use paddock_core::hardware::HardwareProfile;
-use paddock_core::serving::{AvailableRow, ServerRow, StopHandle};
+use paddock_core::serving::{AvailableRow, ServerRow, ServerStatus, StopHandle};
 
 use crate::app::ScoredModel;
 
@@ -254,10 +254,13 @@ pub fn servers_view(running: &[ServerRow], available: &[AvailableRow], now: i64)
         ));
         for r in running {
             let ctx = r.ctx.map(|c| c.to_string()).unwrap_or_else(|| "-".into());
-            let uptime = r
-                .started_at
-                .map(|t| humanize_since(now - t))
-                .unwrap_or_else(|| "-".into());
+            let uptime = if r.status == ServerStatus::Starting {
+                "starting".to_string()
+            } else {
+                r.started_at
+                    .map(|t| humanize_since(now - t))
+                    .unwrap_or_else(|| "-".into())
+            };
             let pid = match &r.stop {
                 StopHandle::Pid(p) => p.to_string(),
                 _ => "-".into(),
@@ -362,6 +365,7 @@ pub(crate) mod tests {
             ctx: None,
             started_at: None,
             stop: StopHandle::OllamaModel("qwen3:8b".into()),
+            status: paddock_core::serving::ServerStatus::Ready,
         }];
         let available = vec![AvailableRow {
             model: "llama3".into(),

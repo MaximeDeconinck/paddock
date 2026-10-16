@@ -637,6 +637,7 @@ mod tests {
             ctx: Some(8192),
             started_at: Some(0),
             stop: StopHandle::Pid(pid),
+            status: paddock_core::serving::ServerStatus::Ready,
         }
     }
 

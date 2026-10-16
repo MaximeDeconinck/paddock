@@ -790,7 +790,12 @@ fn warm_up_until(
 pub fn resolve_servers(target: &str) -> Result<Vec<ServingRecord>, LifecycleError> {
     use paddock_core::serving::{RecordMatch, match_records};
 
-    let records = Registry::open_default().list_live(&RealSystemProbe);
+    // Alive, not just ready: a server still loading must be stoppable.
+    let records: Vec<ServingRecord> = Registry::open_default()
+        .list_alive(&RealSystemProbe)
+        .into_iter()
+        .map(|l| l.record)
+        .collect();
     match match_records(&records, target) {
         RecordMatch::Matched(v) => Ok(v.into_iter().cloned().collect()),
         RecordMatch::Ambiguous(cands) => Err(LifecycleError::AmbiguousServer {
