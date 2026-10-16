@@ -36,7 +36,9 @@ Workflow: paddock_scan (hardware) -> paddock_fit or paddock_recommend (ranked mo
 paddock_serve (start one, get an endpoint) -> paddock_chat (delegate a task to it) -> \
 paddock_ps / paddock_stop (manage).
 paddock_chat reads `files` locally and returns only the local model's answer: use it to process \
-private data without reading it yourself, and call it several times in parallel to fan work out.
+private data without reading it yourself, and call it several times in parallel to fan work out. \
+Local models classify and extract well but add up badly: ask for one short numbered line per \
+item with only the fields you need (e.g. `n;category;amount`), and compute totals yourself.
 paddock_serve blocks until the model is loaded, up to timeout_secs (default 600); a first \
 run may download a multi-GB model. status \"ready\" means the model is loaded, unless the \
 warm-up request failed, in which case it loads on the first request. status \"starting\" \
