@@ -222,6 +222,10 @@ Some Hugging Face repos ship their vision projector as a separate `mmproj-*.gguf
 
 `paddock mcp` exposes paddock over the [Model Context Protocol](https://modelcontextprotocol.io) on stdio, so an agent (Claude Code, Claude Desktop, Cursor, anything that can spawn a process) can ask "what can this machine run?", start a model, get an OpenAI-compatible endpoint back, and hand sub-tasks to that local model the way it hands them to its own subagents, without parsing tables or driving a terminal.
 
+![Claude Code delegating private work to a local model through paddock_chat](docs/delegation-demo.gif)
+
+Above: Claude Code (frontier model) orchestrates, a local Qwen3 4B does the reading. Claude is denied access to the statements; it fans out one `paddock_chat` per file and only sees what the local model sends back. Reproduce it with `demo/record.sh`.
+
 ```text
 $ claude mcp add -s user paddock -- paddock mcp
 ```
