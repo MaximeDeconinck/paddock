@@ -2520,6 +2520,7 @@ dependencies = [
  "paddock-core",
  "predicates",
  "ratatui",
+ "reqwest",
  "rmcp",
  "schemars",
  "serde",

@@ -33,7 +33,12 @@ const DEFAULT_SERVE_TIMEOUT_SECS: u64 = 600;
 pub(crate) const INSTRUCTIONS: &str = "\
 paddock knows which LLMs fit this Apple Silicon Mac, how fast they run, and how to serve them.
 Workflow: paddock_scan (hardware) -> paddock_fit or paddock_recommend (ranked models) -> \
-paddock_serve (start one, get an endpoint) -> paddock_ps / paddock_stop (manage).
+paddock_serve (start one, get an endpoint) -> paddock_chat (delegate a task to it) -> \
+paddock_ps / paddock_stop (manage).
+paddock_chat reads `files` locally and returns only the local model's answer: use it to process \
+private data without reading it yourself, and call it several times in parallel to fan work out. \
+Local models classify and extract well but add up badly: ask for one short numbered line per \
+item with only the fields you need (e.g. `n;category;amount`), and compute totals yourself.
 paddock_serve blocks until the model is loaded, up to timeout_secs (default 600); a first \
 run may download a multi-GB model. status \"ready\" means the model is loaded, unless the \
 warm-up request failed, in which case it loads on the first request. status \"starting\" \
@@ -44,8 +49,8 @@ model has loaded. If it disappears from paddock_ps it exited: read log_path from
 starting result. With runtime \"ollama\" call paddock_serve again later with the same \
 arguments (it returns ready once done); pid and log_path are those of the process paddock \
 started (the `ollama pull`, or the `ollama serve` daemon on a cold start), otherwise null.
-Calling paddock_serve again for a llama.cpp / mlx model that is already running starts another \
-instance on the next free port: check paddock_ps first and reuse a listed endpoint.
+Calling paddock_serve again for a llama.cpp / mlx model that is already running returns that \
+server (\"reused\": true) with its actual ctx and port; stop it first to change them.
 openai_url speaks the OpenAI chat-completions protocol; put model_ref in the `model` field.
 An error with code \"no_runtime\" means a runtime (ollama, llama.cpp, mlx-lm) is not installed: \
 show install_command to the user and ask before anything is installed. paddock never installs \
@@ -109,6 +114,26 @@ pub struct ServeInput {
     /// Seconds to wait for the model to load before returning status "starting" (default 600).
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChatInput {
+    /// Model name substring or pid of a server listed by paddock_ps (must be ready).
+    pub model: String,
+    /// Instruction for the local model.
+    pub prompt: String,
+    /// Absolute paths of UTF-8 text files paddock reads locally and appends to the prompt (1 MiB total). Their content is never returned.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Optional system message.
+    #[serde(default)]
+    pub system: Option<String>,
+    /// Completion cap in tokens (default 2048).
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// Sampling temperature (default 0.2).
+    #[serde(default)]
+    pub temperature: Option<f32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -280,9 +305,11 @@ pub(crate) fn serve_result(
     plan: &ServePlan,
     pid: Option<u32>,
     log_path: Option<PathBuf>,
+    reused: bool,
 ) -> Value {
     json!({
         "status": status,
+        "reused": reused,
         "endpoint": plan.endpoint,
         "openai_url": plan.openai_url,
         "model_ref": plan.model_ref,
@@ -399,7 +426,7 @@ impl PaddockMcp {
 
     #[tool(
         name = "paddock_serve",
-        description = "Start serving a catalog model with the best available runtime and return an OpenAI-compatible endpoint. Picks the best fitting quant unless `quant` is given. Blocks until the model is loaded (up to timeout_secs, default 600; a first run may download the model): status \"ready\" means loaded, unless the warm-up request failed (then the model loads on the first request). status \"starting\" means the timeout elapsed first: with runtime \"llama_cpp\" or \"mlx_lm\" the server is registered and already listed in paddock_ps (listed = running, not necessarily loaded) and a request to openai_url waits until the model has loaded; if it disappears from paddock_ps it exited, read log_path. With \"ollama\" call paddock_serve again later with the same arguments; pid and log_path are those of the process paddock started (the `ollama pull`, or the `ollama serve` daemon on a cold start), otherwise null. Calling it again for a llama.cpp / mlx model that is already running starts another instance on the next free port, so check paddock_ps first. Never installs a runtime: a no_runtime error carries the command for the user."
+        description = "Start serving a catalog model with the best available runtime and return an OpenAI-compatible endpoint. Picks the best fitting quant unless `quant` is given. Blocks until the model is loaded (up to timeout_secs, default 600; a first run may download the model): status \"ready\" means loaded, unless the warm-up request failed (then the model loads on the first request). status \"starting\" means the timeout elapsed first: with runtime \"llama_cpp\" or \"mlx_lm\" the server is registered and already listed in paddock_ps (listed = running, not necessarily loaded) and a request to openai_url waits until the model has loaded; if it disappears from paddock_ps it exited, read log_path. With \"ollama\" call paddock_serve again later with the same arguments; pid and log_path are those of the process paddock started (the `ollama pull`, or the `ollama serve` daemon on a cold start), otherwise null. Calling it again for a llama.cpp / mlx model that is already running returns that server with \"reused\": true (its actual ctx and port win; stop it first to change them). Never installs a runtime: a no_runtime error carries the command for the user."
     )]
     async fn serve(&self, Parameters(input): Parameters<ServeInput>) -> CallToolResult {
         let app = self.app.clone();
@@ -427,12 +454,13 @@ impl PaddockMcp {
                     &outcome.plan,
                     outcome.pid,
                     outcome.log_path,
+                    outcome.reused,
                 )),
                 Err(LifecycleError::NotReady {
                     pid,
                     log_path,
                     plan,
-                }) => Ok(serve_result("starting", &plan, pid, log_path)),
+                }) => Ok(serve_result("starting", &plan, pid, log_path, false)),
                 Err(e) => Err(e),
             }
         })
@@ -454,6 +482,17 @@ impl PaddockMcp {
             Ok(json!({ "running": running, "available": available }))
         })
         .await
+    }
+
+    #[tool(
+        name = "paddock_chat",
+        description = "Delegate a task to a local model already served (see paddock_ps / paddock_serve): sends `prompt`, plus the `files` paddock reads locally, and returns { text, finish_reason, model_ref, runtime, usage, elapsed_ms, tok_per_s } (finish_reason \"length\" = cut at max_tokens). Privacy: file contents never appear in the result; only `text`, written by the local model, comes back. Ask the model for the aggregate you need, not for the raw rows. Issue several paddock_chat calls in parallel to fan work out like subagents; the server queues them. Errors: not_serving (start a model first), not_ready (still loading), file_error, context_overflow (split the files), chat_failed."
+    )]
+    async fn chat(&self, Parameters(input): Parameters<ChatInput>) -> CallToolResult {
+        match Self::chat_inner(input).await {
+            Ok(v) => ok(v),
+            Err(e) => CallToolResult::structured_error(e.body()),
+        }
     }
 
     #[tool(
@@ -481,6 +520,43 @@ impl PaddockMcp {
             Err(e) => fail(&e),
         })
         .await
+    }
+}
+
+impl PaddockMcp {
+    async fn chat_inner(input: ChatInput) -> Result<Value, crate::chat::ChatError> {
+        use crate::chat::{
+            ChatError, ChatRequest, DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE, check_context,
+            read_files, resolve_target, send, user_message,
+        };
+        let target = input.model.clone();
+        let paths = input.files.clone();
+        // Probe and file reads block: keep them off the async executor.
+        let (server, files) = tokio::task::spawn_blocking(move || {
+            let rows = paddock_core::serving::list_all_servers(
+                &Registry::open_default(),
+                &RealSystemProbe,
+            );
+            let server = resolve_target(&rows, &target)?;
+            let files = read_files(&paths)?;
+            Ok::<_, ChatError>((server, files))
+        })
+        .await
+        .map_err(|e| ChatError::Failed {
+            status: None,
+            message: format!("internal: {e}"),
+        })??;
+        let max_tokens = input.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        let user = user_message(&input.prompt, &files);
+        let system_len = input.system.as_ref().map_or(0, String::len);
+        check_context(&server, user.len() + system_len, max_tokens)?;
+        let request = ChatRequest {
+            system: input.system,
+            user,
+            max_tokens,
+            temperature: input.temperature.unwrap_or(DEFAULT_TEMPERATURE),
+        };
+        send(&server, &request).await
     }
 }
 
@@ -724,6 +800,7 @@ mod tests {
             &plan,
             Some(42),
             Some(std::path::PathBuf::from("/tmp/42.log")),
+            false,
         );
         assert_eq!(v["status"], "starting");
         assert_eq!(v["endpoint"], "http://127.0.0.1:8081");
@@ -754,7 +831,7 @@ mod tests {
                 ctx,
                 port: None,
             };
-            let v = serve_result("ready", &plan, None, None);
+            let v = serve_result("ready", &plan, None, None, false);
             assert!(
                 v["ctx"].is_null(),
                 "{runtime:?}: ctx must be null, got {}",
@@ -933,7 +1010,7 @@ model has loaded"
     }
 
     #[test]
-    fn tool_list_has_six_tools_with_spec_names_and_annotations() {
+    fn tool_list_has_seven_tools_with_spec_names_and_annotations() {
         let router = PaddockMcp::tool_router();
         let mut names: Vec<String> = router
             .list_all()
@@ -944,6 +1021,7 @@ model has loaded"
         assert_eq!(
             names,
             [
+                "paddock_chat",
                 "paddock_fit",
                 "paddock_ps",
                 "paddock_recommend",
@@ -955,7 +1033,9 @@ model has loaded"
         for t in router.list_all() {
             let ann = t.annotations.clone().unwrap_or_default();
             match t.name.as_ref() {
-                "paddock_serve" => assert_ne!(ann.read_only_hint, Some(true)),
+                "paddock_serve" | "paddock_chat" => {
+                    assert_ne!(ann.read_only_hint, Some(true))
+                }
                 "paddock_stop" => assert_eq!(ann.destructive_hint, Some(true)),
                 _ => assert_eq!(ann.read_only_hint, Some(true), "{}", t.name),
             }

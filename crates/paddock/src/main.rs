@@ -1,4 +1,5 @@
 mod app;
+mod chat;
 mod cli;
 mod clipboard;
 mod lifecycle;
@@ -310,7 +311,12 @@ fn stop_servers(target: &str, yes: bool) -> Result<()> {
 fn show_logs(target: &str, follow: bool) -> Result<()> {
     use paddock_core::serving::{RecordMatch, match_records};
 
-    let records = Registry::open_default().list_live(&RealSystemProbe);
+    // Alive, not just ready: a loading server's log is the one worth reading.
+    let records: Vec<_> = Registry::open_default()
+        .list_alive(&RealSystemProbe)
+        .into_iter()
+        .map(|l| l.record)
+        .collect();
     let chosen = match match_records(&records, target) {
         RecordMatch::Matched(v) if v.len() == 1 => v[0].clone(),
         RecordMatch::Matched(_) | RecordMatch::Ambiguous(_) => {
@@ -363,7 +369,10 @@ fn bench_server(app: &App, target: Option<&str>, tokens: u32, json: bool) -> Res
         bail!("--tokens must be at least 1");
     }
     let probe = RealSystemProbe;
-    let rows = list_all_servers(&Registry::open_default(), &probe);
+    let rows: Vec<_> = list_all_servers(&Registry::open_default(), &probe)
+        .into_iter()
+        .filter(|r| r.status == paddock_core::serving::ServerStatus::Ready)
+        .collect();
     let row = match match_server_rows(&rows, target) {
         ServerRowMatch::Matched(r) => r,
         ServerRowMatch::Ambiguous(cands) => {

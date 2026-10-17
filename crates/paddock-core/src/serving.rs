@@ -30,6 +30,14 @@ pub struct ServingRecord {
     pub port: Option<u16>,
 }
 
+/// A registry record whose PID is alive; `ready` is false while the server
+/// is still loading (its ready probe does not answer yet).
+#[derive(Debug, Clone)]
+pub struct LiveRecord {
+    pub record: ServingRecord,
+    pub ready: bool,
+}
+
 pub struct Registry {
     dir: PathBuf,
 }
@@ -78,15 +86,24 @@ impl Registry {
         }
     }
 
-    /// Live records only. Deletes a file only when its JSON is unparseable
-    /// (and its stem is a u32) or its PID is dead. An alive PID whose ready
-    /// probe fails is filtered from the result but the file is kept (transient
-    /// busy server). Files whose stem isn't a u32 are never touched.
+    /// Ready records only: `list_alive` filtered on `ready`.
     pub fn list_live(&self, probe: &dyn SystemProbe) -> Vec<ServingRecord> {
+        self.list_alive(probe)
+            .into_iter()
+            .filter(|l| l.ready)
+            .map(|l| l.record)
+            .collect()
+    }
+
+    /// Records whose PID is alive, each flagged with whether its ready probe
+    /// answers (a server still loading its model is alive but not ready).
+    /// Deletes a file only when its JSON is unparseable (and its stem is a
+    /// u32) or its PID is dead. Files whose stem isn't a u32 are never touched.
+    pub fn list_alive(&self, probe: &dyn SystemProbe) -> Vec<LiveRecord> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
         };
-        let mut live = Vec::new();
+        let mut alive = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -110,17 +127,15 @@ impl Registry {
                     let _ = std::fs::remove_file(&path);
                 }
                 Some(r) => {
-                    if probe
+                    let ready = probe
                         .http_get_local(&format!("{}{}", r.endpoint, r.ready_path))
-                        .is_some()
-                    {
-                        live.push(r);
-                    }
+                        .is_some();
+                    alive.push(LiveRecord { record: r, ready });
                 }
             }
         }
-        live.sort_by_key(|r| r.started_at);
-        live
+        alive.sort_by_key(|l| l.record.started_at);
+        alive
     }
 }
 
@@ -181,7 +196,7 @@ impl History {
 /// `kill(pid, 0)` liveness probe (signal 0 = existence check, no signal sent).
 /// kill→-1/EPERM (alive process owned by another user) reads as dead here -
 /// acceptable, we only track our own children.
-fn pid_alive(pid: u32) -> bool {
+pub fn pid_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }
@@ -315,6 +330,15 @@ pub enum StopHandle {
     OllamaModel(String),
 }
 
+/// Whether a running server answers requests yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerStatus {
+    Ready,
+    /// Process alive, model still loading.
+    Starting,
+}
+
 /// A unified "running server" row for UIs: paddock-spawned servers from the
 /// registry plus Ollama-loaded models from `/api/ps`. Fields that don't apply
 /// to a source are `None` (Ollama has no ctx/start-time/pid; paddock-spawned
@@ -328,15 +352,16 @@ pub struct ServerRow {
     pub ctx: Option<u32>,
     pub started_at: Option<i64>,
     pub stop: StopHandle,
+    pub status: ServerStatus,
 }
 
 /// All running servers a UI should show: paddock-spawned (llama.cpp/mlx) from
-/// `registry.list_live`, followed by Ollama-loaded models from `/api/ps`.
+/// `registry.list_alive` (loading ones included, as `starting`), followed by Ollama-loaded models from `/api/ps`.
 pub fn list_all_servers(registry: &Registry, probe: &dyn SystemProbe) -> Vec<ServerRow> {
     let mut rows: Vec<ServerRow> = registry
-        .list_live(probe)
+        .list_alive(probe)
         .into_iter()
-        .map(|r| ServerRow {
+        .map(|LiveRecord { record: r, ready }| ServerRow {
             model: r.model_ref,
             runtime: r.runtime,
             endpoint: r.endpoint,
@@ -346,6 +371,11 @@ pub fn list_all_servers(registry: &Registry, probe: &dyn SystemProbe) -> Vec<Ser
             ctx: (r.ctx != 0).then_some(r.ctx),
             started_at: Some(r.started_at),
             stop: StopHandle::Pid(r.pid),
+            status: if ready {
+                ServerStatus::Ready
+            } else {
+                ServerStatus::Starting
+            },
         })
         .collect();
     if let Some(models) = ollama_loaded_models(probe) {
@@ -358,6 +388,7 @@ pub fn list_all_servers(registry: &Registry, probe: &dyn SystemProbe) -> Vec<Ser
                 ctx: None,
                 started_at: None,
                 stop: StopHandle::OllamaModel(m.name),
+                status: ServerStatus::Ready,
             });
         }
     }
@@ -414,6 +445,7 @@ mod server_row_match_tests {
             ctx: None,
             started_at: None,
             stop,
+            status: ServerStatus::Ready,
         }
     }
 
@@ -650,6 +682,7 @@ mod tests {
             ctx: None,
             started_at: None,
             stop: StopHandle::OllamaModel("qwen3:8b".into()),
+            status: ServerStatus::Ready,
         };
         let j = serde_json::to_string(&row).unwrap();
         assert!(j.contains("qwen3:8b"));
@@ -752,6 +785,22 @@ mod tests {
     }
 
     #[test]
+    fn list_alive_flags_loading_server_as_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Registry::at(dir.path());
+        reg.register(&record(std::process::id())).unwrap();
+        // alive PID, ready probe silent: listed by list_alive, not ready
+        let alive = reg.list_alive(&MockProbe::default());
+        assert_eq!(alive.len(), 1);
+        assert!(!alive[0].ready);
+        let mut probe = MockProbe::default();
+        probe
+            .http
+            .insert("http://127.0.0.1:8080/health".into(), "ok".into());
+        assert!(reg.list_alive(&probe)[0].ready);
+    }
+
+    #[test]
     fn foreign_json_files_untouched() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("notes.json"), b"{not json").unwrap();
@@ -811,6 +860,33 @@ mod list_all_tests {
             StopHandle::OllamaModel("gemma:12b".to_string())
         );
         assert_eq!(rows[0].endpoint, "http://127.0.0.1:11434");
+    }
+
+    #[test]
+    fn loading_spawned_server_is_listed_as_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::at(dir.path());
+        registry
+            .register(&ServingRecord {
+                pid: std::process::id(),
+                runtime: RuntimeKind::LlamaCpp,
+                endpoint: "http://127.0.0.1:8080".into(),
+                openai_url: "http://127.0.0.1:8080/v1/chat/completions".into(),
+                model_ref: "repo:Q4_K_M".into(),
+                ready_path: "/health".into(),
+                started_at: 1,
+                ctx: 4096,
+                log_path: None,
+                port: Some(8080),
+            })
+            .unwrap();
+        let rows = list_all_servers(&registry, &MockProbe::default());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, ServerStatus::Starting);
+        assert_eq!(
+            serde_json::to_value(&rows[0]).unwrap()["status"],
+            "starting"
+        );
     }
 
     #[test]
@@ -984,6 +1060,7 @@ mod available_tests {
             ctx: None,
             started_at: None,
             stop: StopHandle::OllamaModel("gemma4:26b".into()),
+            status: ServerStatus::Ready,
         }];
         let avail = list_available(&history, &probe, &running);
         let names: Vec<&str> = avail.iter().map(|a| a.model.as_str()).collect();

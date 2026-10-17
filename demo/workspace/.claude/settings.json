@@ -1,0 +1,17 @@
+{
+  "language": "french",
+  "enabledPlugins": {},
+  "permissions": {
+    "allow": ["mcp__paddock"],
+    "deny": [
+      "Read(./data/**)",
+      "Grep",
+      "Bash",
+      "Edit",
+      "Write",
+      "NotebookEdit",
+      "WebFetch",
+      "WebSearch"
+    ]
+  }
+}

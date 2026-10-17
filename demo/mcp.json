@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "paddock": { "command": "paddock", "args": ["mcp"] }
+  }
+}

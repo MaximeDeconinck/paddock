@@ -245,9 +245,13 @@ fn draw_servers(frame: &mut Frame, area: Rect, state: &TuiState) {
                 Cell::from(crate::output::truncate(&r.endpoint, 26)),
                 Cell::from(r.ctx.map(|c| c.to_string()).unwrap_or_else(|| "-".into())),
                 Cell::from(
-                    r.started_at
-                        .map(crate::output::uptime_label)
-                        .unwrap_or_else(|| "-".into()),
+                    if r.status == paddock_core::serving::ServerStatus::Starting {
+                        "starting".to_string()
+                    } else {
+                        r.started_at
+                            .map(crate::output::uptime_label)
+                            .unwrap_or_else(|| "-".into())
+                    },
                 ),
                 Cell::from(pid),
             ])
